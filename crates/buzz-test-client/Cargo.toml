@@ -10,9 +10,10 @@ description = "Integration test client and E2E test suite for Buzz"
 [dependencies]
 anyhow = { workspace = true }
 buzz-core = { workspace = true }
+buzz-sdk = { workspace = true }
 buzz-ws-client = { workspace = true }
 nostr = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-std", "fs"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
@@ -23,13 +24,21 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 rustls = "0.23"
+reqwest = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
@@ -42,3 +51,7 @@ buzz-sdk = { workspace = true }
 [[bin]]
 name = "buzz-test-cli"
 path = "src/main.rs"
+
+[[bin]]
+name = "tenant_sim"
+path = "src/bin/tenant_sim.rs"

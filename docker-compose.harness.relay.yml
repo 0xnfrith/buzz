@@ -1,0 +1,67 @@
+# Relay-as-container overlay for the isolated `buzz-harness` compose project.
+#
+# Pins the relay to two CPUs so workstation numbers are comparable to a
+# 2-vCPU box. Backing services stay in docker-compose.harness.yml.
+#
+#   export BUZZ_IMAGE=ghcr.io/block/buzz:sha-6e5c462
+#   export SIM_OWNER_PUBKEY=$(./target/release/tenant_sim --print-owner --profile perf/profiles/10h-20a.toml)
+#   export SIM_RELAY_KEY=$(openssl rand -hex 32)
+#   export SIM_GIT_HMAC=$(openssl rand -hex 32)
+#   docker compose -p buzz-harness \
+#     -f docker-compose.harness.yml \
+#     -f docker-compose.harness.relay.yml up -d
+#
+# Ports: main 3030 · health 8088 · metrics 9202
+
+services:
+  relay:
+    image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
+    cpus: 2.0
+    mem_limit: 2g
+    environment:
+      BUZZ_BIND_ADDR: 0.0.0.0:3030
+      BUZZ_HEALTH_PORT: "8088"
+      BUZZ_METRICS_PORT: "9202"
+      RELAY_URL: ws://localhost:3030
+      DATABASE_URL: postgres://buzz:buzz_dev@postgres:5432/buzz
+      REDIS_URL: redis://redis:6379
+      BUZZ_S3_ENDPOINT: http://minio:9000
+      BUZZ_S3_ADDRESSING_STYLE: path
+      BUZZ_S3_ACCESS_KEY: buzz_dev
+      BUZZ_S3_SECRET_KEY: buzz_dev_secret
+      BUZZ_S3_BUCKET: buzz-media
+      BUZZ_GIT_REPO_PATH: /data/git
+      BUZZ_AUTO_MIGRATE: "true"
+      BUZZ_REQUIRE_AUTH_TOKEN: "true"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
+      RELAY_OWNER_PUBKEY: ${SIM_OWNER_PUBKEY:?missing_SIM_OWNER_PUBKEY}
+      BUZZ_ALLOW_NIP_OA_AUTH: "true"
+      BUZZ_RELAY_PRIVATE_KEY: ${SIM_RELAY_KEY:?missing_SIM_RELAY_KEY}
+      BUZZ_GIT_HOOK_HMAC_SECRET: ${SIM_GIT_HMAC:?missing_SIM_GIT_HMAC}
+      BUZZ_STORAGE_METRICS: "off"
+    ports:
+      - "3030:3030"
+      - "8088:8088"
+      - "9202:9202"
+    volumes:
+      - harness-git-data:/data/git
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8088; printf \"GET /_readiness HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 40s
+
+volumes:
+  harness-git-data:
