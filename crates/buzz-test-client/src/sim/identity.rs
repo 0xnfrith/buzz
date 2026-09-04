@@ -166,6 +166,31 @@ fn filter_p(pubkey: &str) -> Filter {
     Filter::new().custom_tags(SingleLetterTag::lowercase(Alphabet::P), [pubkey])
 }
 
+/// Warm-up must prove EOSE; reconnects may keep going if a later EOSE is late.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EosePolicy {
+    Required,
+    Tolerant,
+}
+
+fn apply_eose(
+    identity: &str,
+    label: &str,
+    policy: EosePolicy,
+    result: Result<Vec<nostr::Event>, TestClientError>,
+) -> Result<u64> {
+    match result {
+        Ok(events) => Ok(events.len() as u64),
+        Err(e) if policy == EosePolicy::Required => {
+            Err(anyhow!("{identity} warm-up EOSE failed on {label}: {e}"))
+        }
+        Err(e) => {
+            warn!("{identity} backfill {label}: {e}");
+            Ok(0)
+        }
+    }
+}
+
 fn tag_value(event: &nostr::Event, name: &str) -> Option<String> {
     event.tags.iter().find_map(|t| {
         let s = t.as_slice();
@@ -188,6 +213,7 @@ async fn subscribe_all(
     stats: &Stats,
     record_join: bool,
     since: Option<u64>,
+    eose: EosePolicy,
 ) -> Result<u64> {
     let mut returned = 0u64;
     for (i, ch) in channels.iter().enumerate() {
@@ -198,24 +224,26 @@ async fn subscribe_all(
         }
         client.subscribe(&sid, vec![filter]).await?;
         let start = Instant::now();
-        match client
+        let eose_result = client
             .collect_until_eose(&sid, Duration::from_secs(12))
-            .await
-        {
-            Ok(events) => {
-                returned += events.len() as u64;
-                if record_join {
-                    stats.record_join_backfill(start.elapsed().as_secs_f64() * 1e3);
-                }
-            }
-            Err(e) => warn!("{identity} backfill {ch}: {e}"),
+            .await;
+        let eose_ok = eose_result.is_ok();
+        let n = apply_eose(identity, ch, eose, eose_result)?;
+        returned += n;
+        if record_join && eose_ok {
+            stats.record_join_backfill(start.elapsed().as_secs_f64() * 1e3);
         }
     }
     let sid = format!("{identity}-p");
     client.subscribe(&sid, vec![filter_p(pubkey)]).await?;
-    let _ = client
-        .collect_until_eose(&sid, Duration::from_secs(8))
-        .await;
+    apply_eose(
+        identity,
+        "#p",
+        eose,
+        client
+            .collect_until_eose(&sid, Duration::from_secs(8))
+            .await,
+    )?;
     Ok(returned)
 }
 
@@ -337,8 +365,8 @@ impl Session {
     }
 
     /// Publish a channel-visible event and consume a sequence number only if
-    /// the relay accepted it. Presence, DMs, git, typing, and 44200 are not
-    /// subscriber-visible on the `#h` stream and must not open sequence gaps.
+    /// the relay accepted it. Presence, DMs, NIP-34 git, typing, and 44200 are
+    /// not subscriber-visible on the `#h` stream and must not open sequence gaps.
     async fn send_channel(
         &mut self,
         client: &mut BuzzTestClient,
@@ -347,6 +375,12 @@ impl Session {
     ) -> Result<bool> {
         let seq = self.seq + 1;
         let event = build(seq)?;
+        if kinds::is_global_git_kind(event.kind.as_u16(), &self.profile.kinds) {
+            return Err(anyhow!(
+                "refusing to sequence global git kind {}",
+                event.kind.as_u16()
+            ));
+        }
         let accepted = self.send(client, band, event).await;
         if accepted {
             self.seq = seq;
@@ -429,10 +463,9 @@ impl Session {
             }
             "issue" => {
                 if let Some(repo) = self.world.repos.first().cloned() {
-                    self.send_channel(client, band, |seq| {
-                        kinds::issue(&keys, &k, &repo.a_tag, &repo.owner_hex, &name, seq)
-                    })
-                    .await?;
+                    let n = self.seq.saturating_add(1);
+                    let ev = kinds::issue(&keys, &k, &repo.a_tag, &repo.owner_hex, &name, n)?;
+                    self.send(client, band, ev).await;
                 }
             }
             "pr" => {
@@ -440,20 +473,18 @@ impl Session {
                     let mut commit = [0u8; 20];
                     self.rng.fill(&mut commit);
                     let commit = hex::encode(commit);
-                    self.send_channel(client, band, |seq| {
-                        kinds::pull_request(
-                            &keys,
-                            &k,
-                            &repo.a_tag,
-                            &repo.owner_hex,
-                            &ch,
-                            &repo.clone_url,
-                            &commit,
-                            &name,
-                            seq,
-                        )
-                    })
-                    .await?;
+                    let n = self.seq.saturating_add(1);
+                    let ev = kinds::pull_request(
+                        &keys,
+                        &k,
+                        &repo.a_tag,
+                        &repo.owner_hex,
+                        &repo.clone_url,
+                        &commit,
+                        &name,
+                        n,
+                    )?;
+                    self.send(client, band, ev).await;
                 }
             }
             "media" => {
@@ -560,6 +591,7 @@ impl Session {
                         &self.stats,
                         record_join,
                         since,
+                        EosePolicy::Tolerant,
                     )
                     .await
                     .unwrap_or(0);
@@ -643,6 +675,7 @@ pub async fn run_identity(
         &sess.stats,
         true,
         None,
+        EosePolicy::Required,
     )
     .await
     {
@@ -780,4 +813,63 @@ pub fn uuid_v4(rng: &mut StdRng) -> uuid::Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     uuid::Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warmup_eose_timeout_propagates() {
+        let err = apply_eose(
+            "h0",
+            "ch0",
+            EosePolicy::Required,
+            Err(TestClientError::Timeout),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("warm-up EOSE failed"), "{msg}");
+        assert!(msg.contains("h0"), "{msg}");
+        assert!(msg.contains("ch0"), "{msg}");
+    }
+
+    #[test]
+    fn warmup_eose_error_on_p_filter_propagates() {
+        let err = apply_eose(
+            "a3",
+            "#p",
+            EosePolicy::Required,
+            Err(TestClientError::Timeout),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("#p"), "{msg}");
+    }
+
+    #[test]
+    fn reconnect_eose_timeout_is_tolerant() {
+        let n = apply_eose(
+            "h0",
+            "ch0",
+            EosePolicy::Tolerant,
+            Err(TestClientError::Timeout),
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn successful_eose_counts_events() {
+        let n = apply_eose("h0", "ch0", EosePolicy::Required, Ok(vec![])).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn global_git_kinds_must_not_consume_channel_seq() {
+        let k = kinds::sample_kinds();
+        assert!(kinds::is_global_git_kind(k.issue, &k));
+        assert!(kinds::is_global_git_kind(k.pr, &k));
+        assert!(!kinds::is_global_git_kind(k.msg, &k));
+    }
 }

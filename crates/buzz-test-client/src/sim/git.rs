@@ -1,10 +1,14 @@
 //! Real git clone/push through the relay using git-credential-nostr.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+
+const GIT_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct GitRepo {
     pub name: String,
@@ -26,9 +30,25 @@ fn abs_helper(helper: &Path) -> PathBuf {
     })
 }
 
-fn git_cmd(args: &[&str], cwd: &Path, helper: &Path, nsec: &str) -> Result<std::process::Output> {
+fn wait_child_deadline(child: std::process::Child, timeout: Duration) -> Result<Output> {
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(out) => out.context("wait child"),
+        Err(_) => {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+            Err(anyhow!("command pid {pid} timed out after {timeout:?}"))
+        }
+    }
+}
+
+fn git_cmd(args: &[&str], cwd: &Path, helper: &Path, nsec: &str) -> Result<Output> {
     let helper = abs_helper(helper);
-    Command::new("git")
+    let child = Command::new("git")
         .args([
             "-c",
             "credential.useHttpPath=true",
@@ -49,8 +69,11 @@ fn git_cmd(args: &[&str], cwd: &Path, helper: &Path, nsec: &str) -> Result<std::
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("GIT_CONFIG_COUNT")
         .env("NOSTR_PRIVATE_KEY", nsec)
-        .output()
-        .with_context(|| format!("spawn git {args:?}"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn git {args:?}"))?;
+    wait_child_deadline(child, GIT_TIMEOUT).with_context(|| format!("git {args:?}"))
 }
 
 fn git_ok(args: &[&str], cwd: &Path, helper: &Path, nsec: &str) -> Result<String> {
@@ -119,4 +142,32 @@ pub fn push_blob(repo: &GitRepo, helper: &Path, bytes: &[u8], seq: u64) -> Resul
         &repo.owner_nsec,
     )?;
     Ok((bytes.len() as u64, start.elapsed().as_secs_f64() * 1e3))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_child_deadline_kills_silent_child() {
+        let child = Command::new("sleep").arg("2").spawn().expect("spawn sleep");
+        let start = Instant::now();
+        let err = wait_child_deadline(child, Duration::from_millis(100)).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "timeout took {elapsed:?}, expected << 2s"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn wait_child_deadline_allows_fast_child() {
+        let child = Command::new("true").spawn().expect("spawn true");
+        let out = wait_child_deadline(child, Duration::from_secs(2)).expect("true");
+        assert!(out.status.success());
+    }
 }

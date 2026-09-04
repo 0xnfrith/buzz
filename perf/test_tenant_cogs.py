@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -49,7 +51,7 @@ buzz_db_pool_acquire_duration_seconds_sum 0.2
         self.assertEqual(parsed["events_rejected_total"], 0.0)
         self.assertIsNotNone(parsed["db_pool_acquire_p95_s"])
 
-    def test_fanout_histogram_sum_count(self) -> None:
+    def test_fanout_histogram_buckets(self) -> None:
         text = """
 buzz_fanout_recipients_sum 120
 buzz_fanout_recipients_count 30
@@ -60,11 +62,15 @@ buzz_fanout_recipients_bucket{le="+Inf"} 30
         self.assertEqual(parsed["fanout_recipients_sum"], 120.0)
         self.assertEqual(parsed["fanout_recipients_count"], 30.0)
         self.assertEqual(
-            tenant_cogs.histogram_p50_from_sum_count(
-                parsed["fanout_recipients_sum"], parsed["fanout_recipients_count"]
-            ),
-            4.0,
+            parsed["fanout_recipients_buckets"],
+            [{"le": 10.0, "c": 20.0}, {"le": "+Inf", "c": 30.0}],
         )
+        p50 = tenant_cogs.histogram_quantile(
+            tenant_cogs.histogram_buckets_from_json(parsed["fanout_recipients_buckets"]),
+            0.50,
+        )
+        # count=30, target=15, crosses le=10 (c=20) from prev 0 → 7.5
+        self.assertAlmostEqual(p50 or 0.0, 7.5, places=6)
 
 
 class CpuStatTests(unittest.TestCase):
@@ -266,6 +272,160 @@ class SchemaTests(unittest.TestCase):
         bad["bands"]["steady"]["relay_metrics"]["events_rejected"] = 27
         errs = tenant_cogs.acceptance_errors(bad, summary, 0)
         self.assertTrue(any("events_rejected" in e for e in errs))
+
+
+class HistogramQuantileTests(unittest.TestCase):
+    def test_band_local_p50_ignores_prior_lifetime(self) -> None:
+        # Warmup: 100 observations all ≤ 1. Floor adds 100 observations all > 10.
+        warmup = [{"le": 1.0, "c": 100.0}, {"le": 10.0, "c": 100.0}, {"le": "+Inf", "c": 100.0}]
+        floor_end = [{"le": 1.0, "c": 100.0}, {"le": 10.0, "c": 100.0}, {"le": "+Inf", "c": 200.0}]
+        samples = [
+            {
+                "band": "warmup",
+                "sampled": False,
+                "t_unix": 1,
+                "metrics": {"fanout_recipients_buckets": warmup},
+            },
+            {
+                "band": "floor",
+                "sampled": True,
+                "t_unix": 2,
+                "metrics": {"fanout_recipients_buckets": floor_end},
+                "relay": {"rss": 10, "usage_usec": 10},
+                "postgres": {"rss": 10, "usage_usec": 10},
+                "redis": {"rss": 1, "usage_usec": 1},
+                "minio": {"rss": 1, "usage_usec": 1},
+            },
+            {
+                "band": "floor",
+                "sampled": True,
+                "t_unix": 12,
+                "metrics": {"fanout_recipients_buckets": floor_end},
+                "relay": {"rss": 10, "usage_usec": 20},
+                "postgres": {"rss": 10, "usage_usec": 20},
+                "redis": {"rss": 1, "usage_usec": 2},
+                "minio": {"rss": 1, "usage_usec": 2},
+            },
+        ]
+        lifetime = tenant_cogs.histogram_quantile(
+            tenant_cogs.histogram_buckets_from_json(floor_end), 0.50
+        )
+        self.assertAlmostEqual(lifetime or -1.0, 1.0, places=6)
+        delta = tenant_cogs.band_histogram_delta(samples, "floor")
+        band_p50 = tenant_cogs.histogram_quantile(delta, 0.50)
+        self.assertIsNotNone(band_p50)
+        self.assertAlmostEqual(band_p50 or 0.0, 10.0, places=6)
+        stats = tenant_cogs.band_stats(samples, "floor", None)
+        self.assertAlmostEqual(stats["relay_metrics"]["fanout_recipients_p50"], 10.0, places=6)
+
+
+class TimeoutTests(unittest.TestCase):
+    def _silent(self, sleep_s: float) -> subprocess.Popen:
+        return subprocess.Popen(
+            [sys.executable, "-c", f"import time; time.sleep({sleep_s})"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+
+    def test_wait_ready_honors_short_timeout(self) -> None:
+        proc = self._silent(2.0)
+        t0 = time.monotonic()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                tenant_cogs.wait_ready_line(proc, timeout_s=0.1)
+            self.assertIn("timed out", str(ctx.exception))
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 0.8, f"timeout took {elapsed:.3f}s")
+        finally:
+            proc.kill()
+            proc.wait(timeout=2)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+
+    def test_collect_summary_honors_short_timeout(self) -> None:
+        proc = self._silent(2.0)
+        t0 = time.monotonic()
+        try:
+            out = tenant_cogs.collect_summary(proc, timeout_s=0.1)
+            elapsed = time.monotonic() - t0
+            self.assertEqual(out, {})
+            self.assertLess(elapsed, 0.8, f"timeout took {elapsed:.3f}s")
+        finally:
+            proc.kill()
+            proc.wait(timeout=2)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+
+    def test_wait_ready_accepts_ready_line(self) -> None:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "import json,sys,time; print(json.dumps({'phase':'ready'}), flush=True); time.sleep(2)",
+            ],
+            stdout=subprocess.PIPE,
+            bufsize=0,
+        )
+        try:
+            tenant_cogs.wait_ready_line(proc, timeout_s=1.0)
+        finally:
+            proc.kill()
+            proc.wait(timeout=2)
+            if proc.stdout:
+                proc.stdout.close()
+
+
+class TeardownTests(unittest.TestCase):
+    def test_run_session_tears_down_on_exception(self) -> None:
+        class Adapter:
+            def __init__(self) -> None:
+                self.torn = 0
+
+            def teardown(self) -> None:
+                self.torn += 1
+
+        class Proc:
+            def __init__(self) -> None:
+                self.killed = False
+                self._code = None
+
+            def poll(self):
+                return self._code
+
+            def kill(self) -> None:
+                self.killed = True
+                self._code = -9
+
+            def wait(self, timeout=None):
+                return self._code
+
+        adapter = Adapter()
+        proc = Proc()
+        with self.assertRaises(RuntimeError):
+            with tenant_cogs.RunSession(adapter, keep=False) as session:
+                session.proc = proc  # type: ignore[assignment]
+                raise RuntimeError("ready failed")
+        self.assertTrue(proc.killed)
+        self.assertEqual(adapter.torn, 1)
+
+    def test_run_session_keep_skips_teardown(self) -> None:
+        class Adapter:
+            def __init__(self) -> None:
+                self.torn = 0
+
+            def teardown(self) -> None:
+                self.torn += 1
+
+        adapter = Adapter()
+        with tenant_cogs.RunSession(adapter, keep=True):
+            pass
+        self.assertEqual(adapter.torn, 0)
 
 
 def argparse_ns(**kwargs):

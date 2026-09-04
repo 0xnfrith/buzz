@@ -160,25 +160,27 @@ pub fn gift_wrap(keys: &Keys, kinds: &KindTable, recipient: &str, content: &str)
         .sign_with_keys(keys)?)
 }
 
+/// NIP-34 git kinds are globally addressed. Buzz ignores `h` for routing, so
+/// they must never consume the per-identity channel sequence.
+pub fn is_global_git_kind(kind: u16, kinds: &KindTable) -> bool {
+    kind == kinds.issue || kind == kinds.pr
+}
+
 pub fn issue(
     keys: &Keys,
     kinds: &KindTable,
     repo_a: &str,
     repo_owner: &str,
     identity: &str,
-    seq: u64,
+    n: u64,
 ) -> Result<Event> {
-    let subject = format!("{identity} issue {seq}");
-    let content = lorem(seq, 180);
-    let tags = seq_tags(
-        identity,
-        seq,
-        vec![
-            tag(&["a", repo_a])?,
-            tag(&["p", repo_owner])?,
-            tag(&["subject", &subject])?,
-        ],
-    )?;
+    let subject = format!("{identity} issue {n}");
+    let content = lorem(n, 180);
+    let tags = vec![
+        tag(&["a", repo_a])?,
+        tag(&["p", repo_owner])?,
+        tag(&["subject", &subject])?,
+    ];
     Ok(EventBuilder::new(kind(kinds.issue), &content)
         .tags(tags)
         .sign_with_keys(keys)?)
@@ -190,26 +192,20 @@ pub fn pull_request(
     kinds: &KindTable,
     repo_a: &str,
     repo_owner: &str,
-    channel: &str,
     clone_url: &str,
     commit: &str,
     identity: &str,
-    seq: u64,
+    n: u64,
 ) -> Result<Event> {
-    let subject = format!("{identity} pr {seq}");
-    let content = lorem(seq, 180);
-    let tags = seq_tags(
-        identity,
-        seq,
-        vec![
-            tag(&["a", repo_a])?,
-            tag(&["p", repo_owner])?,
-            tag(&["subject", &subject])?,
-            tag(&["c", commit])?,
-            tag(&["clone", clone_url])?,
-            tag(&["h", channel])?,
-        ],
-    )?;
+    let subject = format!("{identity} pr {n}");
+    let content = lorem(n, 180);
+    let tags = vec![
+        tag(&["a", repo_a])?,
+        tag(&["p", repo_owner])?,
+        tag(&["subject", &subject])?,
+        tag(&["c", commit])?,
+        tag(&["clone", clone_url])?,
+    ];
     Ok(EventBuilder::new(kind(kinds.pr), &content)
         .tags(tags)
         .sign_with_keys(keys)?)
@@ -261,4 +257,87 @@ pub fn repo_announce(
 
 pub fn timestamp_now() -> Timestamp {
     Timestamp::now()
+}
+
+#[cfg(test)]
+pub(crate) fn sample_kinds() -> KindTable {
+    KindTable {
+        msg: 9,
+        reaction: 7,
+        edit: 40003,
+        canvas: 40100,
+        issue: 1621,
+        pr: 1618,
+        repo_announce: 30617,
+        turn_metric: 44200,
+        presence: 20001,
+        typing: 20002,
+        dm: 1059,
+        member_add: 9000,
+        channel_create: 9007,
+        relay_member_add: 9030,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag_named(event: &Event, name: &str) -> bool {
+        event
+            .tags
+            .iter()
+            .any(|t| t.as_slice().first().map(String::as_str) == Some(name))
+    }
+
+    #[test]
+    fn git_kinds_are_global() {
+        let k = sample_kinds();
+        assert!(is_global_git_kind(k.issue, &k));
+        assert!(is_global_git_kind(k.pr, &k));
+        assert!(!is_global_git_kind(k.msg, &k));
+        assert!(!is_global_git_kind(k.canvas, &k));
+    }
+
+    #[test]
+    fn git_events_do_not_carry_channel_seq() {
+        let keys = Keys::generate();
+        let k = sample_kinds();
+        let issue = issue(
+            &keys,
+            &k,
+            "30617:abc:repo",
+            &keys.public_key().to_hex(),
+            "a0",
+            7,
+        )
+        .expect("issue");
+        assert_eq!(issue.kind.as_u16(), 1621);
+        assert!(!tag_named(&issue, "seq"));
+        assert!(!tag_named(&issue, "h"));
+
+        let pr = pull_request(
+            &keys,
+            &k,
+            "30617:abc:repo",
+            &keys.public_key().to_hex(),
+            "http://localhost/git/x/y",
+            "deadbeef",
+            "a0",
+            7,
+        )
+        .expect("pr");
+        assert_eq!(pr.kind.as_u16(), 1618);
+        assert!(!tag_named(&pr, "seq"));
+        assert!(!tag_named(&pr, "h"));
+    }
+
+    #[test]
+    fn channel_messages_still_carry_seq() {
+        let keys = Keys::generate();
+        let k = sample_kinds();
+        let ev = stream_message(&keys, &k, "chan", "h0", 3, "hello").expect("msg");
+        assert!(tag_named(&ev, "seq"));
+        assert!(tag_named(&ev, "h"));
+    }
 }

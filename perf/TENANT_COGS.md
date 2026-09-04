@@ -119,6 +119,11 @@ rejects, git pushed with zero failures, the three bands are distinct, and
 `lost_after_backfill` is 0. A results line is still appended for diagnosis;
 the process exit is the weekly-job gate.
 
+`fanout_recipients_p50` is a true histogram percentile of the observations
+that landed in that band (end-minus-start bucket counts), not a lifetime
+`sum/count` mean. Ready/summary reads time out against a silent child, and
+`cmd_run` always tears the stack down unless `--keep` is set.
+
 ## What is not in this tree
 
 Run outputs, identities, kubeconfigs, and `.env` files. `runs/` and

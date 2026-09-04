@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import statistics
 import subprocess
@@ -119,6 +120,92 @@ def lsn_to_bytes(lsn: str) -> int | None:
     return (int(hi, 16) << 32) + int(lo, 16)
 
 
+def histogram_buckets_to_json(buckets: list[tuple[float, float]]) -> list[dict[str, Any]]:
+    merged: dict[float, float] = {}
+    for le, c in buckets:
+        merged[le] = c
+    out: list[dict[str, Any]] = []
+    for le, c in sorted(merged.items()):
+        out.append({"le": "+Inf" if le == float("inf") else le, "c": c})
+    return out
+
+
+def histogram_buckets_from_json(raw: Any) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    if not raw:
+        return out
+    for item in raw:
+        if isinstance(item, dict):
+            le, c = item.get("le"), item.get("c")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            le, c = item[0], item[1]
+        else:
+            continue
+        if le is None or c is None:
+            continue
+        le_v = float("inf") if le in ("+Inf", "+inf", "Inf") else float(le)
+        out.append((le_v, float(c)))
+    return out
+
+
+def histogram_bucket_delta(
+    start: list[tuple[float, float]] | None,
+    end: list[tuple[float, float]] | None,
+) -> list[tuple[float, float]]:
+    if not end:
+        return []
+    start_map = {le: c for le, c in (start or [])}
+    return [(le, max(float(c) - float(start_map.get(le, 0.0)), 0.0)) for le, c in end]
+
+
+def histogram_quantile(buckets: list[tuple[float, float]], q: float) -> float | None:
+    """Prometheus-style linear interpolation inside the bucket that crosses q."""
+    if not buckets:
+        return None
+    merged: dict[float, float] = {}
+    for le, c in buckets:
+        merged[le] = c
+    ordered = sorted(merged.items())
+    count = ordered[-1][1]
+    if count <= 0:
+        return None
+    target = q * count
+    prev_le, prev_c = 0.0, 0.0
+    for le, c in ordered:
+        if c >= target:
+            if le == float("inf"):
+                return prev_le
+            span = max(le - prev_le, 1e-12)
+            frac = (target - prev_c) / max(c - prev_c, 1e-12)
+            return prev_le + span * frac
+        prev_le, prev_c = le, c
+    return ordered[-1][0]
+
+
+def band_histogram_delta(
+    samples: list[dict[str, Any]],
+    name: str,
+    key: str = "fanout_recipients_buckets",
+) -> list[tuple[float, float]]:
+    start_raw = None
+    end_raw = None
+    seen = False
+    for s in samples:
+        if s.get("band") == name:
+            seen = True
+            metrics = s.get("metrics") or {}
+            if metrics.get(key) is not None:
+                end_raw = metrics.get(key)
+        elif not seen:
+            metrics = s.get("metrics") or {}
+            if metrics.get(key) is not None:
+                start_raw = metrics.get(key)
+    return histogram_bucket_delta(
+        histogram_buckets_from_json(start_raw),
+        histogram_buckets_from_json(end_raw),
+    )
+
+
 def parse_prometheus(text: str) -> dict[str, Any]:
     """Parse a Prometheus text exposition into a nested dict of useful signals."""
     gauges: dict[str, float] = {}
@@ -168,24 +255,7 @@ def parse_prometheus(text: str) -> dict[str, Any]:
             gauges[name] = value_s
             counters[name] = value_s
 
-    def hist_p95(name: str) -> float | None:
-        buckets = hist_buckets.get(name)
-        count = hist_count.get(name)
-        if not buckets or not count:
-            return None
-        buckets = sorted(buckets)
-        target = 0.95 * count
-        prev_le, prev_c = 0.0, 0.0
-        for le, c in buckets:
-            if c >= target:
-                if le == float("inf"):
-                    return prev_le
-                span = max(le - prev_le, 1e-12)
-                frac = (target - prev_c) / max(c - prev_c, 1e-12)
-                return prev_le + span * frac
-            prev_le, prev_c = le, c
-        return buckets[-1][0]
-
+    fanout_buckets = hist_buckets.get("buzz_fanout_recipients")
     events_received = labeled.get("buzz_events_received_total", {})
     events_stored = labeled.get("buzz_events_stored_total", {})
     return {
@@ -199,7 +269,9 @@ def parse_prometheus(text: str) -> dict[str, Any]:
         else counters.get("buzz_events_stored_total"),
         "events_rejected_total": counters.get("buzz_events_rejected_total", 0.0),
         "db_pool_waiters": gauges.get("buzz_db_pool_waiters"),
-        "db_pool_acquire_p95_s": hist_p95("buzz_db_pool_acquire_duration_seconds"),
+        "db_pool_acquire_p95_s": histogram_quantile(
+            hist_buckets.get("buzz_db_pool_acquire_duration_seconds") or [], 0.95
+        ),
         "backpressure_disconnects": counters.get(
             "buzz_ws_backpressure_disconnects_total", 0.0
         ),
@@ -209,16 +281,13 @@ def parse_prometheus(text: str) -> dict[str, Any]:
         ),
         "fanout_recipients_sum": hist_sum.get("buzz_fanout_recipients"),
         "fanout_recipients_count": hist_count.get("buzz_fanout_recipients"),
+        "fanout_recipients_buckets": (
+            histogram_buckets_to_json(fanout_buckets) if fanout_buckets else None
+        ),
         "multinode_fanout_total": counters.get("buzz_multinode_fanout_total"),
         "raw_gauges": gauges,
         "raw_counters": counters,
     }
-
-
-def histogram_p50_from_sum_count(total_sum: float | None, count: float | None) -> float | None:
-    if total_sum is None or not count:
-        return None
-    return total_sum / count
 
 
 @dataclass
@@ -587,11 +656,57 @@ def load_profile_meta(path: Path) -> tuple[str, str, dict[str, int]]:
     return name, sha256_file(path), bands
 
 
-def wait_ready_line(proc: subprocess.Popen[str], timeout_s: int = 300) -> None:
-    deadline = time.time() + timeout_s
-    assert proc.stdout is not None
-    while time.time() < deadline:
-        line = proc.stdout.readline()
+def _stdout_buf(proc: subprocess.Popen[Any]) -> list[bytes]:
+    buf = getattr(proc, "_harness_stdout_buf", None)
+    if buf is None:
+        buf = [b""]
+        setattr(proc, "_harness_stdout_buf", buf)
+    return buf
+
+
+def read_stdout_line(proc: subprocess.Popen[Any], timeout_s: float) -> str:
+    """Read one stdout line without letting a silent child outlive the deadline.
+
+    `proc.stdout` must be a binary pipe. Leftover bytes are kept on the process.
+    """
+    if timeout_s <= 0:
+        raise TimeoutError("stdout read timed out")
+    stdout = proc.stdout
+    if stdout is None:
+        raise RuntimeError("process has no stdout")
+    leftover = _stdout_buf(proc)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        nl = leftover[0].find(b"\n")
+        if nl >= 0:
+            raw, leftover[0] = leftover[0][: nl + 1], leftover[0][nl + 1 :]
+            return raw.decode("utf-8", errors="replace")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("stdout read timed out")
+        fd = stdout.fileno()
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            raise TimeoutError("stdout read timed out")
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            if leftover[0]:
+                raw, leftover[0] = leftover[0], b""
+                return raw.decode("utf-8", errors="replace")
+            return ""
+        leftover[0] += chunk
+
+
+def wait_ready_line(proc: subprocess.Popen[Any], timeout_s: float = 300) -> None:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("timed out waiting for tenant_sim ready")
+        try:
+            line = read_stdout_line(proc, remaining)
+        except TimeoutError as exc:
+            raise RuntimeError("timed out waiting for tenant_sim ready") from exc
         if not line:
             if proc.poll() is not None:
                 raise RuntimeError(f"tenant_sim exited {proc.returncode} before ready")
@@ -603,15 +718,19 @@ def wait_ready_line(proc: subprocess.Popen[str], timeout_s: int = 300) -> None:
             continue
         if obj.get("phase") == "ready":
             return
-    raise RuntimeError("timed out waiting for tenant_sim ready")
 
 
-def collect_summary(proc: subprocess.Popen[str], timeout_s: int = 120) -> dict[str, Any]:
-    assert proc.stdout is not None
+def collect_summary(proc: subprocess.Popen[Any], timeout_s: float = 120) -> dict[str, Any]:
     buf: list[str] = []
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        line = proc.stdout.readline()
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            line = read_stdout_line(proc, remaining)
+        except TimeoutError:
+            break
         if not line:
             if proc.poll() is not None:
                 break
@@ -628,6 +747,35 @@ def collect_summary(proc: subprocess.Popen[str], timeout_s: int = 120) -> dict[s
         if start >= 0 and end > start:
             return json.loads(blob[start : end + 1])
         return {}
+
+
+class RunSession:
+    """Kill the sim process and tear the substrate down on every exit path."""
+
+    def __init__(self, adapter: Any, keep: bool) -> None:
+        self.adapter = adapter
+        self.keep = keep
+        self.proc: subprocess.Popen[Any] | None = None
+
+    def __enter__(self) -> "RunSession":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        if self.adapter is not None and not self.keep:
+            try:
+                self.adapter.teardown()
+            except Exception as exc:
+                print(f"teardown failed: {exc}", file=sys.stderr)
 
 
 def band_stats(samples: list[dict[str, Any]], name: str, client: dict[str, Any] | None) -> dict[str, Any]:
@@ -710,13 +858,7 @@ def band_stats(samples: list[dict[str, Any]], name: str, client: dict[str, Any] 
         if ok:
             stack_rss.append(float(total))
 
-    fanout_p50 = None
-    for m in reversed(relay_m):
-        fanout_p50 = histogram_p50_from_sum_count(
-            m.get("fanout_recipients_sum"), m.get("fanout_recipients_count")
-        )
-        if fanout_p50 is not None:
-            break
+    fanout_p50 = histogram_quantile(band_histogram_delta(samples, name), 0.50)
 
     out: dict[str, Any] = {
         "seconds": seconds,
@@ -1017,125 +1159,123 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         substrate_label = args.substrate_label or "k3s"
 
-    if not args.skip_reset:
-        adapter.reset()
-        adapter.up()
-    adapter.wait_ready(args.health_url)
+    with RunSession(adapter, keep=args.keep) as session:
+        if not args.skip_reset:
+            adapter.reset()
+            adapter.up()
+        adapter.wait_ready(args.health_url)
 
-    sim_cmd = [
-        tenant_sim,
-        "--profile",
-        str(profile_path),
-        "--relay-url",
-        args.relay_url,
-        "--http-url",
-        args.http_url,
-        "--out-dir",
-        str(out_dir),
-        "--git-credential-helper",
-        str(Path(args.git_credential_helper).resolve()),
-        "--band-signal",
-        "stdin",
-        "--log-level",
-        "info",
-    ]
-    if args.blink:
-        sim_cmd.append("--blink")
-    proc = subprocess.Popen(
-        sim_cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=sys.stderr,
-        text=True,
-        bufsize=1,
-    )
-    try:
-        wait_ready_line(proc)
-    except Exception:
-        proc.kill()
-        raise
-
-    sampler = Sampler(execs, args.metrics_url, services)
-    samples: list[dict[str, Any]] = []
-
-    def run_band(band: str, seconds: int, sampled: bool) -> None:
-        assert proc.stdin is not None
-        proc.stdin.write(f"band {band}\n")
-        proc.stdin.flush()
-        end = time.time() + seconds
-        while time.time() < end:
-            if proc.poll() is not None:
-                raise RuntimeError(f"tenant_sim exited {proc.returncode} during {band}")
-            row = sampler.sample(band, sampled)
-            samples.append(row)
-            with samples_path.open("a") as fh:
-                fh.write(json.dumps(row) + "\n")
-            if sampler.fail_streak >= 3:
-                raise SystemExit(4)
-            time.sleep(args.cadence)
-
-    run_band("warmup", bands["warmup"], False)
-    run_band("floor", bands["floor"], True)
-    run_band("steady", bands["steady"], True)
-    run_band("peak", bands["peak"], True)
-    run_band("cooldown", bands["cooldown"], False)
-    assert proc.stdin is not None
-    proc.stdin.write("stop\n")
-    proc.stdin.flush()
-    proc.stdin.close()
-    summary = collect_summary(proc, timeout_s=180)
-    proc.wait(timeout=60)
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    (out_dir / "fingerprint.json").write_text(json.dumps(fp, indent=2))
-
-    # Community bootstrap note: if AUTH/EVENT failed with community-not-found,
-    # tenant_sim rejects show up in summary.rejects_by_message.
-    rejects = (summary.get("rejects_by_message") or {})
-    for msg, n in rejects.items():
-        if "community" in msg.lower():
-            notes.append(f"community bootstrap: {msg} x{n}")
-
-    run_id = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}-{args.substrate[0]}-{name}"
-    buzz_commit, buzz_image = resolve_buzz_identity(image)
-    line = write_results_line(
-        Path(args.results),
-        run_id=run_id,
-        substrate=substrate_label,
-        buzz_commit=buzz_commit,
-        buzz_image=buzz_image,
-        harness_commit=git_head(),
-        profile=name,
-        profile_sha=profile_sha,
-        fingerprint=fp,
-        samples=samples,
-        summary=summary,
-        notes="; ".join(notes),
-    )
-    errors = acceptance_errors(line, summary, proc.returncode)
-    print(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "results": args.results,
-                "buzz_commit": buzz_commit,
-                "buzz_image": buzz_image,
-                "summary_rejected": (summary.get("bands") or {})
-                .get("steady", {})
-                .get("rejected"),
-                "acceptance_errors": errors,
-            }
+        sim_cmd = [
+            tenant_sim,
+            "--profile",
+            str(profile_path),
+            "--relay-url",
+            args.relay_url,
+            "--http-url",
+            args.http_url,
+            "--out-dir",
+            str(out_dir),
+            "--git-credential-helper",
+            str(Path(args.git_credential_helper).resolve()),
+            "--band-signal",
+            "stdin",
+            "--log-level",
+            "info",
+        ]
+        if args.blink:
+            sim_cmd.append("--blink")
+        proc = subprocess.Popen(
+            sim_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            bufsize=0,
         )
-    )
-    if not args.keep:
-        adapter.teardown()
-    if errors:
-        print("acceptance failed:", file=sys.stderr)
-        for err in errors:
-            print(f"  - {err}", file=sys.stderr)
-        return 1
-    if proc.returncode not in (0, None):
-        return proc.returncode
-    return 0
+        session.proc = proc
+        wait_ready_line(proc)
+
+        sampler = Sampler(execs, args.metrics_url, services)
+        samples: list[dict[str, Any]] = []
+
+        def run_band(band: str, seconds: int, sampled: bool) -> None:
+            assert proc.stdin is not None
+            proc.stdin.write(f"band {band}\n".encode())
+            proc.stdin.flush()
+            end = time.time() + seconds
+            while time.time() < end:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"tenant_sim exited {proc.returncode} during {band}")
+                row = sampler.sample(band, sampled)
+                samples.append(row)
+                with samples_path.open("a") as fh:
+                    fh.write(json.dumps(row) + "\n")
+                if sampler.fail_streak >= 3:
+                    raise SystemExit(4)
+                time.sleep(args.cadence)
+
+        run_band("warmup", bands["warmup"], False)
+        run_band("floor", bands["floor"], True)
+        run_band("steady", bands["steady"], True)
+        run_band("peak", bands["peak"], True)
+        run_band("cooldown", bands["cooldown"], False)
+        assert proc.stdin is not None
+        proc.stdin.write(b"stop\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+        summary = collect_summary(proc, timeout_s=180)
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("tenant_sim did not exit after stop") from exc
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        (out_dir / "fingerprint.json").write_text(json.dumps(fp, indent=2))
+
+        # Community bootstrap note: if AUTH/EVENT failed with community-not-found,
+        # tenant_sim rejects show up in summary.rejects_by_message.
+        rejects = (summary.get("rejects_by_message") or {})
+        for msg, n in rejects.items():
+            if "community" in msg.lower():
+                notes.append(f"community bootstrap: {msg} x{n}")
+
+        run_id = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}-{args.substrate[0]}-{name}"
+        buzz_commit, buzz_image = resolve_buzz_identity(image)
+        line = write_results_line(
+            Path(args.results),
+            run_id=run_id,
+            substrate=substrate_label,
+            buzz_commit=buzz_commit,
+            buzz_image=buzz_image,
+            harness_commit=git_head(),
+            profile=name,
+            profile_sha=profile_sha,
+            fingerprint=fp,
+            samples=samples,
+            summary=summary,
+            notes="; ".join(notes),
+        )
+        errors = acceptance_errors(line, summary, proc.returncode)
+        print(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "results": args.results,
+                    "buzz_commit": buzz_commit,
+                    "buzz_image": buzz_image,
+                    "summary_rejected": (summary.get("bands") or {})
+                    .get("steady", {})
+                    .get("rejected"),
+                    "acceptance_errors": errors,
+                }
+            )
+        )
+        if errors:
+            print("acceptance failed:", file=sys.stderr)
+            for err in errors:
+                print(f"  - {err}", file=sys.stderr)
+            return 1
+        if proc.returncode not in (0, None):
+            return proc.returncode
+        return 0
 
 
 def acceptance_errors(
