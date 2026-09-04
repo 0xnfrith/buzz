@@ -108,6 +108,7 @@ struct Inner {
     git_push_ms: Vec<f64>,
     gaps_detected: u64,
     lost_after_backfill: u64,
+    blink_closes: Vec<u64>,
     blink: Option<serde_json::Value>,
 }
 
@@ -205,6 +206,10 @@ impl Stats {
         self.with(|s| s.blink = Some(value));
     }
 
+    pub fn record_blink_closes(&self, closes: &[u64]) {
+        self.with(|s| s.blink_closes.extend_from_slice(closes));
+    }
+
     pub fn lost_after_backfill(&self) -> u64 {
         self.with(|s| s.lost_after_backfill)
     }
@@ -265,7 +270,18 @@ impl Stats {
                 gaps_detected: s.gaps_detected,
                 lost_after_backfill: s.lost_after_backfill,
                 rejects_by_message: s.rejects_by_message.clone(),
-                blink: s.blink.clone(),
+                blink: s.blink.clone().or_else(|| {
+                    if s.blink_closes.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::json!({
+                            "closes": s.blink_closes.len(),
+                            "first_unix": s.blink_closes.iter().min(),
+                            "last_unix": s.blink_closes.iter().max(),
+                            "note": "client-side reconnect timestamps only; rollout is not implemented in this PR",
+                        }))
+                    }
+                }),
             }
         })
     }

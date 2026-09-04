@@ -23,7 +23,8 @@ use sim::kinds;
 use sim::profile::{load_profile, Profile};
 use sim::roles::{Band, Role};
 use sim::stats::Stats;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tokio::time::timeout;
 use tracing::warn;
 
 #[derive(Parser, Debug)]
@@ -229,14 +230,9 @@ async fn provision(
             let agent = &pop.agents[i % pop.agents.len()];
             let agent_keys = pop.keys_of(agent)?;
             let name = format!("sim-repo-{i}");
-            let ev = kinds::repo_announce(
-                &agent_keys,
-                &profile.kinds,
-                &name,
-                &name,
-                &channels[0],
-            )?;
-            let mut agent_client = connect_identity(&args.relay_url, agent, &agent_keys, None).await?;
+            let ev = kinds::repo_announce(&agent_keys, &profile.kinds, &name, &name, &channels[0])?;
+            let mut agent_client =
+                connect_identity(&args.relay_url, agent, &agent_keys, None).await?;
             let ok = agent_client.send_event(ev).await?;
             if !ok.accepted {
                 warn!("30617 {name} rejected: {}", ok.message);
@@ -352,6 +348,8 @@ async fn run(args: Args) -> Result<i32> {
     spawn_band_reader(&args.band_signal, &out_dir, band_tx)?;
 
     let profile = Arc::new(profile);
+    let expected = profile.identity_count() as usize;
+    let (ready_tx, mut ready_rx) = mpsc::channel::<Result<(), String>>(expected);
     let mut tasks = Vec::new();
     let mut salt = 10u32;
     for rec in pop.humans.iter().cloned() {
@@ -361,6 +359,7 @@ async fn run(args: Args) -> Result<i32> {
         let world = world.clone();
         let stats = stats.clone();
         let band_rx = band_rx.clone();
+        let ready_tx = ready_tx.clone();
         tasks.push(tokio::spawn(async move {
             sim::identity::run_identity(
                 rec,
@@ -373,6 +372,7 @@ async fn run(args: Args) -> Result<i32> {
                 band_rx,
                 None,
                 salt,
+                ready_tx,
             )
             .await
         }));
@@ -385,19 +385,22 @@ async fn run(args: Args) -> Result<i32> {
             .as_ref()
             .and_then(|n| pop.humans.iter().find(|h| h.name == *n))
             .and_then(|h| pop.keys_of(h).ok());
-        let git_repo = world.repos.iter().find(|r| r.owner_hex == rec.pubkey).map(|r| {
-            git::GitRepo {
+        let git_repo = world
+            .repos
+            .iter()
+            .find(|r| r.owner_hex == rec.pubkey)
+            .map(|r| git::GitRepo {
                 name: r.name.clone(),
                 owner_hex: r.owner_hex.clone(),
                 owner_nsec: r.owner_nsec.clone(),
                 worktree: r.worktree.clone(),
                 url: r.clone_url.clone(),
-            }
-        });
+            });
         let profile = profile.clone();
         let world = world.clone();
         let stats = stats.clone();
         let band_rx = band_rx.clone();
+        let ready_tx = ready_tx.clone();
         tasks.push(tokio::spawn(async move {
             sim::identity::run_identity(
                 rec,
@@ -410,12 +413,47 @@ async fn run(args: Args) -> Result<i32> {
                 band_rx,
                 git_repo,
                 salt,
+                ready_tx,
             )
             .await
         }));
     }
+    drop(ready_tx);
 
-    println!("{}", serde_json::json!({"phase": "ready"}));
+    let mut ready = 0usize;
+    let wait = timeout(Duration::from_secs(180), async {
+        while ready < expected {
+            match ready_rx.recv().await {
+                Some(Ok(())) => ready += 1,
+                Some(Err(e)) => return Err(e),
+                None => {
+                    return Err(format!(
+                        "identity tasks ended after {ready}/{expected} ready"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match wait {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("warm-up identities: {e}");
+            warn!("warm-up identities: {e}");
+            return Ok(3);
+        }
+        Err(_) => {
+            eprintln!("warm-up timed out with {ready}/{expected} identities ready");
+            warn!("warm-up timed out with {ready}/{expected} identities ready");
+            return Ok(3);
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({"phase": "ready", "identities": expected})
+    );
     let _ = std::io::stdout().flush();
 
     let mut join_err = false;
@@ -449,10 +487,11 @@ async fn run(args: Args) -> Result<i32> {
     std::fs::write(out_dir.join("summary.json"), &json)?;
     println!("{json}");
 
+    let rejected: u64 = summary.bands.values().map(|b| b.rejected).sum();
     if summary.lost_after_backfill > 0 {
         Ok(2)
-    } else if join_err {
-        Ok(0)
+    } else if join_err || rejected > 0 || summary.media.rejected > 0 || summary.git.failed > 0 {
+        Ok(1)
     } else {
         Ok(0)
     }

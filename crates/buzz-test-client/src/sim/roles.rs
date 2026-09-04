@@ -123,7 +123,12 @@ pub fn scaled_rates(profile: &Profile, role: Role, band: Band) -> Rates {
 }
 
 /// Whether the identity should emit traffic besides presence.
-pub fn in_active_window(role: Role, band: Band, elapsed_in_band: Duration, profile: &Profile) -> bool {
+pub fn in_active_window(
+    role: Role,
+    band: Band,
+    elapsed_in_band: Duration,
+    profile: &Profile,
+) -> bool {
     match (role, band) {
         (_, Band::Floor | Band::Warmup | Band::Cooldown | Band::Stop) => false,
         (Role::Human, Band::Peak) => true,

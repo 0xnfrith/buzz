@@ -1,7 +1,10 @@
 //! Event builders for the kinds the population emits.
 
-use anyhow::{Context, Result};
-use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
+use anyhow::{anyhow, Context, Result};
+use buzz_core::agent_turn_metric::{
+    encrypt_agent_turn_metric, AgentTurnMetricPayload, StopReason, TokenCounts,
+};
+use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, Tag, Timestamp};
 
 use super::profile::KindTable;
 
@@ -60,8 +63,7 @@ pub fn typing(keys: &Keys, kinds: &KindTable, channel: &str) -> Result<Event> {
 }
 
 pub fn presence(keys: &Keys, kinds: &KindTable) -> Result<Event> {
-    Ok(EventBuilder::new(kind(kinds.presence), "{\"status\":\"online\"}")
-        .sign_with_keys(keys)?)
+    Ok(EventBuilder::new(kind(kinds.presence), "{\"status\":\"online\"}").sign_with_keys(keys)?)
 }
 
 pub fn reaction(
@@ -118,14 +120,37 @@ pub fn canvas(
 pub fn turn_metric(
     keys: &Keys,
     kinds: &KindTable,
+    owner_hex: &str,
     channel: &str,
-    identity: &str,
-    seq: u64,
+    turn_seq: u64,
 ) -> Result<Event> {
-    let content = format!("{{\"identity\":\"{identity}\",\"seq\":{seq},\"tokens\":32}}");
-    let tags = seq_tags(identity, seq, vec![tag(&["h", channel])?])?;
-    Ok(EventBuilder::new(kind(kinds.turn_metric), &content)
-        .tags(tags)
+    let owner = PublicKey::from_hex(owner_hex).context("owner pubkey")?;
+    let payload = AgentTurnMetricPayload {
+        harness: "tenant-sim".to_string(),
+        model: Some("sim".to_string()),
+        channel_id: Some(channel.to_string()),
+        session_id: None,
+        turn_id: Some(format!("t-{turn_seq}")),
+        turn_seq: Some(turn_seq),
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        turn: Some(TokenCounts {
+            input_tokens: Some(32),
+            output_tokens: Some(8),
+            total_tokens: Some(40),
+            cost_usd: Some(0.0),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        }),
+        cumulative: None,
+        delta_reliable: true,
+        stop_reason: Some(StopReason::EndTurn),
+        pricing_identity: None,
+    };
+    let ciphertext = encrypt_agent_turn_metric(keys, &owner, &payload)
+        .map_err(|e| anyhow!("encrypt kind 44200: {e}"))?;
+    let agent_hex = keys.public_key().to_hex();
+    Ok(EventBuilder::new(kind(kinds.turn_metric), ciphertext)
+        .tags([tag(&["p", owner_hex])?, tag(&["agent", &agent_hex])?])
         .sign_with_keys(keys)?)
 }
 
@@ -159,6 +184,7 @@ pub fn issue(
         .sign_with_keys(keys)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn pull_request(
     keys: &Keys,
     kinds: &KindTable,
@@ -189,7 +215,12 @@ pub fn pull_request(
         .sign_with_keys(keys)?)
 }
 
-pub fn channel_create(keys: &Keys, kinds: &KindTable, channel_id: &str, name: &str) -> Result<Event> {
+pub fn channel_create(
+    keys: &Keys,
+    kinds: &KindTable,
+    channel_id: &str,
+    name: &str,
+) -> Result<Event> {
     Ok(EventBuilder::new(kind(kinds.channel_create), "")
         .tags([
             tag(&["h", channel_id])?,

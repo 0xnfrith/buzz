@@ -49,6 +49,23 @@ buzz_db_pool_acquire_duration_seconds_sum 0.2
         self.assertEqual(parsed["events_rejected_total"], 0.0)
         self.assertIsNotNone(parsed["db_pool_acquire_p95_s"])
 
+    def test_fanout_histogram_sum_count(self) -> None:
+        text = """
+buzz_fanout_recipients_sum 120
+buzz_fanout_recipients_count 30
+buzz_fanout_recipients_bucket{le="10"} 20
+buzz_fanout_recipients_bucket{le="+Inf"} 30
+"""
+        parsed = tenant_cogs.parse_prometheus(text)
+        self.assertEqual(parsed["fanout_recipients_sum"], 120.0)
+        self.assertEqual(parsed["fanout_recipients_count"], 30.0)
+        self.assertEqual(
+            tenant_cogs.histogram_p50_from_sum_count(
+                parsed["fanout_recipients_sum"], parsed["fanout_recipients_count"]
+            ),
+            4.0,
+        )
+
 
 class CpuStatTests(unittest.TestCase):
     def test_parse_cpu_and_lsn(self) -> None:
@@ -113,8 +130,16 @@ class SchemaTests(unittest.TestCase):
             "samples": 12,
             "relay": comp(),
             "postgres": comp(),
-            "redis": {"cpu_s": 0.1, "rss_bytes": {"p50": 1, "p95": 1, "max": 1}},
-            "minio": {"cpu_s": 0.1, "rss_bytes": {"p50": 1, "p95": 1, "max": 1}},
+            "redis": {
+                "cpu_s": 0.1,
+                "cpu_s_per_tenant_hour": 0.4,
+                "rss_bytes": {"p50": 1, "p95": 1, "max": 1},
+            },
+            "minio": {
+                "cpu_s": 0.1,
+                "cpu_s_per_tenant_hour": 0.4,
+                "rss_bytes": {"p50": 1, "p95": 1, "max": 1},
+            },
             "stack": {"cpu_s": 1.2, "rss_bytes": {"p50": 20, "p95": 24, "max": 30}},
             "db": {
                 "size_bytes": {"start": 1000, "end": 2000, "max": 2000},
@@ -142,7 +167,7 @@ class SchemaTests(unittest.TestCase):
                 "fanout_ms": {"p50": 1, "p95": 2, "p99": 3, "max": 4},
             },
         }
-        return {
+        out = {
             "schema": 1,
             "run_id": "test-a",
             "substrate": "workstation-orbstack",
@@ -173,12 +198,13 @@ class SchemaTests(unittest.TestCase):
             "cost_usd": 0.0,
             "notes": "",
         }
+        out["bands"]["floor"]["relay"]["rss_bytes"]["p50"] = 5_000_000
+        out["bands"]["steady"]["relay"]["rss_bytes"]["p50"] = 10_000_000
+        out["bands"]["peak"]["relay"]["rss_bytes"]["max"] = 20_000_000
+        return out
 
     def test_validate_ok(self) -> None:
         line = self.fixture()
-        line["bands"]["floor"]["relay"]["rss_bytes"]["p50"] = 5_000_000
-        line["bands"]["steady"]["relay"]["rss_bytes"]["p50"] = 10_000_000
-        line["bands"]["peak"]["relay"]["rss_bytes"]["max"] = 20_000_000
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "results.jsonl"
             path.write_text(json.dumps(line) + "\n")
@@ -196,6 +222,50 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("relay.resources.requests.cpu", text)
         self.assertIn("declared_density", text)
         self.assertIn("4-vs-8", text)
+
+    def test_density_includes_redis_minio(self) -> None:
+        line = self.fixture()
+        trial = cogs_report.proposed_values(line, "trial")
+        self.assertIn("minio.resources.requests.memory", trial)
+        self.assertIn("redis.resources.requests.cpu", trial)
+        self.assertIn("minio.resources.requests.cpu", trial)
+        dens = cogs_report.density(line, trial)
+        self.assertIsInstance(dens["declared_density"], int)
+
+    def test_image_commit_never_main(self) -> None:
+        self.assertEqual(
+            tenant_cogs.image_commit("ghcr.io/block/buzz:sha-6e5c462", inspect={}),
+            "6e5c462",
+        )
+        commit, ref = tenant_cogs.resolve_buzz_identity(
+            "ghcr.io/block/buzz:main", inspect={}
+        )
+        self.assertNotEqual(commit, "main")
+        self.assertTrue(commit.startswith("unresolved-"))
+        self.assertEqual(ref, "ghcr.io/block/buzz:main")
+        digest_commit, digest_ref = tenant_cogs.resolve_buzz_identity(
+            "ghcr.io/block/buzz:main",
+            inspect={
+                "RepoDigests": ["ghcr.io/block/buzz@sha256:abcd1234eeeeffff"],
+                "Config": {"Labels": {"org.opencontainers.image.revision": "abcdef1deadbeef"}},
+            },
+        )
+        self.assertEqual(digest_commit, "abcdef1")
+        self.assertEqual(digest_ref, "ghcr.io/block/buzz@sha256:abcd1234eeeeffff")
+
+    def test_acceptance_errors_on_rejects(self) -> None:
+        line = self.fixture()
+        summary = {
+            "identities": {"humans": 10, "agents": 20},
+            "lost_after_backfill": 0,
+            "media": {"uploads": 3, "rejected": 0},
+            "git": {"pushes": 1, "failed": 0},
+        }
+        self.assertEqual(tenant_cogs.acceptance_errors(line, summary, 0), [])
+        bad = json.loads(json.dumps(line))
+        bad["bands"]["steady"]["relay_metrics"]["events_rejected"] = 27
+        errs = tenant_cogs.acceptance_errors(bad, summary, 0)
+        self.assertTrue(any("events_rejected" in e for e in errs))
 
 
 def argparse_ns(**kwargs):

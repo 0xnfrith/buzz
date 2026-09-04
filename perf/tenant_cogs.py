@@ -33,6 +33,12 @@ COMPOSE_FILES = (
     "docker-compose.harness.yml",
     "docker-compose.harness.relay.yml",
 )
+HISTOGRAM_BASES = (
+    "buzz_db_pool_acquire_duration_seconds",
+    "buzz_event_processing_seconds",
+    "http_request_latency_ms",
+    "buzz_fanout_recipients",
+)
 
 
 def utc_now() -> str:
@@ -144,17 +150,9 @@ def parse_prometheus(text: str) -> dict[str, Any]:
             if le is not None:
                 le_v = float("inf") if le == "+Inf" else float(le)
                 hist_buckets.setdefault(base, []).append((le_v, value_s))
-        elif name.endswith("_sum") and name[: -len("_sum")] in (
-            "buzz_db_pool_acquire_duration_seconds",
-            "buzz_event_processing_seconds",
-            "http_request_latency_ms",
-        ):
+        elif name.endswith("_sum") and name[: -len("_sum")] in HISTOGRAM_BASES:
             hist_sum[name[: -len("_sum")]] = value_s
-        elif name.endswith("_count") and name[: -len("_count")] in (
-            "buzz_db_pool_acquire_duration_seconds",
-            "buzz_event_processing_seconds",
-            "http_request_latency_ms",
-        ):
+        elif name.endswith("_count") and name[: -len("_count")] in HISTOGRAM_BASES:
             hist_count[name[: -len("_count")]] = value_s
         elif label_map:
             key = name
@@ -659,7 +657,7 @@ def band_stats(samples: list[dict[str, Any]], name: str, client: dict[str, Any] 
             "cpu_s": cpu,
             "rss_bytes": pct_block(rss),
         }
-        if comp in {"relay", "postgres"}:
+        if comp in {"relay", "postgres", "redis", "minio"}:
             block["cpu_s_per_tenant_hour"] = cpu * 3600.0 / seconds if seconds else 0.0
         if comp == "relay":
             ev = []
@@ -890,13 +888,56 @@ def git_head() -> str:
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
 
 
-def image_commit(image: str) -> str:
+def inspect_docker_image(image: str) -> dict[str, Any]:
+    proc = run(
+        ["docker", "image", "inspect", image, "--format", "{{json .}}"],
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def resolve_buzz_identity(
+    image: str, inspect: dict[str, Any] | None = None
+) -> tuple[str, str]:
+    """Return (buzz_commit, buzz_image) that can distinguish two Monday runs.
+
+    Never records the moving tag `main`. Prefer the image's immutable digest
+    plus `org.opencontainers.image.revision` / `sha-<hex>` source commit.
+    """
+    info = inspect if inspect is not None else inspect_docker_image(image)
+    repo_digests = info.get("RepoDigests") or []
+    digest_ref = repo_digests[0] if repo_digests else None
+    labels = (info.get("Config") or {}).get("Labels") or {}
+    revision = labels.get("org.opencontainers.image.revision") or labels.get(
+        "org.opencontainers.image.base.digest"
+    )
+    tag_sha = None
     m = re.search(r"sha-([0-9a-f]{7,})", image)
     if m:
-        return m.group(1)[:7]
-    if image.endswith(":main"):
-        return "main"
-    return image.split(":")[-1][:12]
+        tag_sha = m.group(1)[:7]
+    commit = None
+    if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{7,40}", revision):
+        commit = revision[:7]
+    elif tag_sha:
+        commit = tag_sha
+    elif digest_ref and "@sha256:" in digest_ref:
+        commit = "sha256:" + digest_ref.split("@sha256:", 1)[1][:12]
+    else:
+        slug = image.rsplit(":", 1)[-1] if ":" in image else image
+        if slug in {"main", "latest"}:
+            commit = f"unresolved-{slug}"
+        else:
+            commit = slug[:12]
+    return commit, digest_ref or image
+
+
+def image_commit(image: str, inspect: dict[str, Any] | None = None) -> str:
+    return resolve_buzz_identity(image, inspect)[0]
 
 
 def cmd_fingerprint(args: argparse.Namespace) -> int:
@@ -1054,15 +1095,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         if "community" in msg.lower():
             notes.append(f"community bootstrap: {msg} x{n}")
 
-    run_id = f"{utc_now().replace(':', '')}-{substrate_label[:1]}-{name}"
-    # more readable
     run_id = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}-{args.substrate[0]}-{name}"
+    buzz_commit, buzz_image = resolve_buzz_identity(image)
     line = write_results_line(
         Path(args.results),
         run_id=run_id,
         substrate=substrate_label,
-        buzz_commit=image_commit(image),
-        buzz_image=image,
+        buzz_commit=buzz_commit,
+        buzz_image=buzz_image,
         harness_commit=git_head(),
         profile=name,
         profile_sha=profile_sha,
@@ -1071,21 +1111,97 @@ def cmd_run(args: argparse.Namespace) -> int:
         summary=summary,
         notes="; ".join(notes),
     )
-    print(json.dumps({"run_id": run_id, "results": args.results, "summary_rejected": (summary.get("bands") or {}).get("steady", {}).get("rejected")}))
+    errors = acceptance_errors(line, summary, proc.returncode)
+    print(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "results": args.results,
+                "buzz_commit": buzz_commit,
+                "buzz_image": buzz_image,
+                "summary_rejected": (summary.get("bands") or {})
+                .get("steady", {})
+                .get("rejected"),
+                "acceptance_errors": errors,
+            }
+        )
+    )
     if not args.keep:
         adapter.teardown()
-    return 0 if proc.returncode in (0, None) else proc.returncode or 0
+    if errors:
+        print("acceptance failed:", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
+        return 1
+    if proc.returncode not in (0, None):
+        return proc.returncode
+    return 0
+
+
+def acceptance_errors(
+    line: dict[str, Any], summary: dict[str, Any], proc_code: int | None
+) -> list[str]:
+    """Hard gates so a weekly job cannot publish a broken run as authoritative."""
+    errs: list[str] = []
+    expected = int(
+        (summary.get("identities") or {}).get("humans", 0)
+        + (summary.get("identities") or {}).get("agents", 0)
+    )
+    if expected <= 0:
+        expected = 30
+    bands = line.get("bands") or {}
+    floor = bands.get("floor") or {}
+    ws = (floor.get("relay_metrics") or {}).get("ws_connections_active")
+    if ws is None:
+        errs.append("floor ws_connections_active missing")
+    elif int(ws) != expected:
+        errs.append(f"floor ws_connections_active={ws} != {expected}")
+    for name in ("floor", "steady", "peak"):
+        band = bands.get(name) or {}
+        rejected = int((band.get("relay_metrics") or {}).get("events_rejected") or 0)
+        client_rej = int((band.get("client") or {}).get("rejected") or 0)
+        if rejected:
+            errs.append(f"{name} relay events_rejected={rejected}")
+        if client_rej:
+            errs.append(f"{name} client rejected={client_rej}")
+    lost = int(summary.get("lost_after_backfill") or line.get("totals", {}).get("lost_after_backfill") or 0)
+    if lost:
+        errs.append(f"lost_after_backfill={lost}")
+    media = summary.get("media") or {}
+    if int(media.get("rejected") or 0):
+        errs.append(f"media.rejected={media.get('rejected')}")
+    if int(media.get("uploads") or 0) <= 0:
+        errs.append("media.uploads == 0")
+    git = summary.get("git") or {}
+    if int(git.get("failed") or 0):
+        errs.append(f"git.failed={git.get('failed')}")
+    if int(git.get("pushes") or 0) <= 0:
+        errs.append("git.pushes == 0")
+    try:
+        floor_rss = bands["floor"]["relay"]["rss_bytes"]["p50"]
+        steady_rss = bands["steady"]["relay"]["rss_bytes"]["p50"]
+        peak_rss = bands["peak"]["relay"]["rss_bytes"]["max"]
+        if not (floor_rss < steady_rss < peak_rss):
+            errs.append(
+                f"bands not distinct: floor p50={floor_rss} steady p50={steady_rss} peak max={peak_rss}"
+            )
+    except (KeyError, TypeError) as exc:
+        errs.append(f"band rss missing: {exc}")
+    if proc_code not in (0, None):
+        errs.append(f"tenant_sim exit {proc_code}")
+    return errs
 
 
 def cmd_blink(args: argparse.Namespace) -> int:
     print(
-        "blink: start tenant_sim --blink against replicaCount=2, then run the "
-        "rollout command after 3 minutes of the steady band. Use the private "
-        "wrapper to supply the rollout invocation.",
+        "T7 blink/rollout is not implemented in this PR. --rollout is "
+        "ignored; do not treat a compose run with tenant_sim --blink as a "
+        "rolling-update result.",
         file=sys.stderr,
     )
-    args.blink = True
-    return cmd_run(args)
+    if getattr(args, "rollout", ""):
+        print(f"--rollout was supplied and not executed: {args.rollout!r}", file=sys.stderr)
+    return 2
 
 
 def build_parser() -> argparse.ArgumentParser:

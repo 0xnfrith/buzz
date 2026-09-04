@@ -26,12 +26,7 @@ fn abs_helper(helper: &Path) -> PathBuf {
     })
 }
 
-fn git_cmd(
-    args: &[&str],
-    cwd: &Path,
-    helper: &Path,
-    nsec: &str,
-) -> Result<std::process::Output> {
+fn git_cmd(args: &[&str], cwd: &Path, helper: &Path, nsec: &str) -> Result<std::process::Output> {
     let helper = abs_helper(helper);
     Command::new("git")
         .args([

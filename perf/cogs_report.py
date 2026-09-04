@@ -21,7 +21,32 @@ REQUIRED_TOP = (
     "bands",
     "totals",
 )
-REQUIRED_BAND = ("seconds", "samples", "relay", "postgres", "redis", "minio", "stack", "db")
+REQUIRED_BAND = (
+    "seconds",
+    "samples",
+    "relay",
+    "postgres",
+    "redis",
+    "minio",
+    "stack",
+    "db",
+    "objects",
+    "relay_metrics",
+    "client",
+)
+REQUIRED_COMPONENT = ("cpu_s", "rss_bytes")
+REQUIRED_RSS = ("p50", "p95", "max")
+REQUIRED_RELAY_METRICS = (
+    "events_received",
+    "events_stored",
+    "events_rejected",
+    "ws_connections_active",
+    "subscriptions_active",
+    "db_pool_waiters_max",
+    "fanout_recipients_p50",
+)
+REQUIRED_CLIENT = ("sent", "accepted", "rejected", "received", "ok_ms", "fanout_ms")
+REQUIRED_DB = ("size_bytes", "wal_bytes", "wal_gen_bytes_per_s")
 
 # Idle RSS fallbacks (bytes) used when no second-substrate run exists.
 IDLE_RSS = {
@@ -46,6 +71,20 @@ def load_lines(path: Path) -> list[dict[str, Any]]:
     return lines
 
 
+def _missing_rss(node: Any, prefix: str) -> list[str]:
+    errs = []
+    if not isinstance(node, dict):
+        return [f"{prefix} missing"]
+    rss = node.get("rss_bytes")
+    if not isinstance(rss, dict):
+        errs.append(f"{prefix}.rss_bytes missing")
+        return errs
+    for key in REQUIRED_RSS:
+        if key not in rss:
+            errs.append(f"{prefix}.rss_bytes.{key} missing")
+    return errs
+
+
 def validate_line(obj: dict[str, Any], idx: int) -> list[str]:
     errs = []
     if obj.get("schema") != SCHEMA:
@@ -62,6 +101,31 @@ def validate_line(obj: dict[str, Any], idx: int) -> list[str]:
         for key in REQUIRED_BAND:
             if key not in b:
                 errs.append(f"line {idx}: bands.{band}.{key} missing")
+        for comp in ("relay", "postgres", "redis", "minio", "stack"):
+            node = b.get(comp)
+            prefix = f"line {idx}: bands.{band}.{comp}"
+            if not isinstance(node, dict):
+                errs.append(f"{prefix} missing")
+                continue
+            for field in REQUIRED_COMPONENT:
+                if field not in node:
+                    errs.append(f"{prefix}.{field} missing")
+            errs.extend(_missing_rss(node, prefix))
+        db = b.get("db")
+        if isinstance(db, dict):
+            for key in REQUIRED_DB:
+                if key not in db:
+                    errs.append(f"line {idx}: bands.{band}.db.{key} missing")
+        metrics = b.get("relay_metrics")
+        if isinstance(metrics, dict):
+            for key in REQUIRED_RELAY_METRICS:
+                if key not in metrics:
+                    errs.append(f"line {idx}: bands.{band}.relay_metrics.{key} missing")
+        client = b.get("client")
+        if isinstance(client, dict):
+            for key in REQUIRED_CLIENT:
+                if key not in client:
+                    errs.append(f"line {idx}: bands.{band}.client.{key} missing")
     return errs
 
 
@@ -166,6 +230,9 @@ def proposed_values(line: dict[str, Any], tier: str) -> dict[str, Any]:
     minio_pvc = max(ceil1gi(obj_end * retention_factor * 1.2), 3)
 
     redis_mem = max(ceil32mi((steady["redis"]["rss_bytes"]["p95"] or 1) * 1.2), 32)
+    minio_mem = max(ceil32mi((steady["minio"]["rss_bytes"]["p95"] or 1) * 1.2), 32)
+    redis_req_cpu = millicores(steady["redis"].get("cpu_s_per_tenant_hour") or 0)
+    minio_req_cpu = millicores(steady["minio"].get("cpu_s_per_tenant_hour") or 0)
 
     return {
         "tier": tier,
@@ -179,6 +246,9 @@ def proposed_values(line: dict[str, Any], tier: str) -> dict[str, Any]:
         "postgresql.persistence.size": f"{pg_pvc}Gi",
         "postgresql.config.extraConfig max_wal_size": f"{wal_cfg // (1024 * 1024)}MB",
         "minio.persistence.size": f"{minio_pvc}Gi",
+        "minio.resources.requests.cpu": fmt_cpu(minio_req_cpu),
+        "minio.resources.requests.memory": fmt_mi(minio_mem),
+        "redis.resources.requests.cpu": fmt_cpu(redis_req_cpu),
         "redis.resources.requests.memory": fmt_mi(redis_mem),
         "redis.persistence.size": "1Gi",
         "raw": {
@@ -210,12 +280,18 @@ def density(line: dict[str, Any], trial: dict[str, Any]) -> dict[str, Any]:
             return int(s[:-2]) * 1024 * 1024
         return int(s)
 
-    req_cpu = parse_cpu(trial["relay.resources.requests.cpu"]) + parse_cpu(
-        trial["postgresql.resources.requests.cpu"]
+    req_cpu = (
+        parse_cpu(trial["relay.resources.requests.cpu"])
+        + parse_cpu(trial["postgresql.resources.requests.cpu"])
+        + parse_cpu(trial["redis.resources.requests.cpu"])
+        + parse_cpu(trial["minio.resources.requests.cpu"])
     )
-    req_mem = parse_mem(trial["relay.resources.requests.memory"]) + parse_mem(
-        trial["postgresql.resources.requests.memory"]
-    ) + parse_mem(trial["redis.resources.requests.memory"])
+    req_mem = (
+        parse_mem(trial["relay.resources.requests.memory"])
+        + parse_mem(trial["postgresql.resources.requests.memory"])
+        + parse_mem(trial["redis.resources.requests.memory"])
+        + parse_mem(trial["minio.resources.requests.memory"])
+    )
     pvc = parse_mem(trial["postgresql.persistence.size"]) + parse_mem(
         trial["minio.persistence.size"]
     ) + parse_mem(trial["redis.persistence.size"])

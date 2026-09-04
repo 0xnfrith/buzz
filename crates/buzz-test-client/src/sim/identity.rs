@@ -12,7 +12,7 @@ use nostr::{Alphabet, Filter, Keys, Kind, SingleLetterTag, Tag, Timestamp, ToBec
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use super::git::{self, GitRepo};
@@ -177,6 +177,7 @@ fn tag_value(event: &nostr::Event, name: &str) -> Option<String> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn subscribe_all(
     client: &mut BuzzTestClient,
     identity: &str,
@@ -186,13 +187,16 @@ async fn subscribe_all(
     limit: u32,
     stats: &Stats,
     record_join: bool,
+    since: Option<u64>,
 ) -> Result<u64> {
     let mut returned = 0u64;
     for (i, ch) in channels.iter().enumerate() {
         let sid = format!("{identity}-ch{i}");
-        client
-            .subscribe(&sid, vec![filter_channel(kinds, ch, limit)])
-            .await?;
+        let mut filter = filter_channel(kinds, ch, limit);
+        if let Some(ts) = since {
+            filter = filter.since(Timestamp::from(ts));
+        }
+        client.subscribe(&sid, vec![filter]).await?;
         let start = Instant::now();
         match client
             .collect_until_eose(&sid, Duration::from_secs(12))
@@ -303,7 +307,7 @@ impl Session {
         }
     }
 
-    async fn send(&mut self, client: &mut BuzzTestClient, band: Band, event: nostr::Event) {
+    async fn send(&mut self, client: &mut BuzzTestClient, band: Band, event: nostr::Event) -> bool {
         let kind = event.kind.as_u16();
         let start = Instant::now();
         match client.send_event(event.clone()).await {
@@ -320,31 +324,41 @@ impl Session {
                         self.own.pop_front();
                     }
                 }
+                ok.accepted
             }
             Err(e) => {
                 if band.sampled() {
                     self.stats
                         .record_send(band.as_str(), kind, false, &e.to_string(), 0.0);
                 }
+                false
             }
         }
     }
 
+    /// Publish a channel-visible event and consume a sequence number only if
+    /// the relay accepted it. Presence, DMs, git, typing, and 44200 are not
+    /// subscriber-visible on the `#h` stream and must not open sequence gaps.
+    async fn send_channel(
+        &mut self,
+        client: &mut BuzzTestClient,
+        band: Band,
+        build: impl FnOnce(u64) -> Result<nostr::Event>,
+    ) -> Result<bool> {
+        let seq = self.seq + 1;
+        let event = build(seq)?;
+        let accepted = self.send(client, band, event).await;
+        if accepted {
+            self.seq = seq;
+        }
+        Ok(accepted)
+    }
+
     async fn act(&mut self, client: &mut BuzzTestClient, band: Band) -> Result<()> {
         let rates = scaled_rates(&self.profile, self.role, band);
-        let elapsed = Duration::from_secs(0); // replaced by caller via in_active_window
-        let _ = elapsed;
         let Some(action) = pick_action(&rates, &mut self.rng) else {
             return Ok(());
         };
-        if action != "presence"
-            && !matches!(band, Band::Peak)
-            && action != "presence"
-        {
-            // activity gated by caller
-        }
-        self.seq += 1;
-        let seq = self.seq;
         let name = self.rec.name.clone();
         let k = self.profile.kinds;
         let keys = self.keys.clone();
@@ -361,29 +375,44 @@ impl Session {
                     let ev = kinds::typing(&keys, &k, &ch)?;
                     self.send(client, band, ev).await;
                 }
-                let content = kinds::lorem(seq, 200);
-                let ev = kinds::stream_message(&keys, &k, &ch, &name, seq, &content)?;
-                self.send(client, band, ev).await;
+                let name = name.clone();
+                let ch = ch.clone();
+                self.send_channel(client, band, |seq| {
+                    let content = kinds::lorem(seq, 200);
+                    kinds::stream_message(&keys, &k, &ch, &name, seq, &content)
+                })
+                .await?;
             }
             "reaction" => {
                 if let Some((id, target_ch)) = self.seen.back().cloned() {
-                    let ev = kinds::reaction(&keys, &k, &target_ch, &id, &name, seq)?;
-                    self.send(client, band, ev).await;
+                    self.send_channel(client, band, |seq| {
+                        kinds::reaction(&keys, &k, &target_ch, &id, &name, seq)
+                    })
+                    .await?;
                 }
             }
             "edit" => {
                 if let Some((id, target_ch)) = self.own.back().cloned() {
-                    let content = kinds::lorem(seq, 180);
-                    let ev = kinds::edit(&keys, &k, &target_ch, &id, &name, seq, &content)?;
-                    self.send(client, band, ev).await;
+                    self.send_channel(client, band, |seq| {
+                        let content = kinds::lorem(seq, 180);
+                        kinds::edit(&keys, &k, &target_ch, &id, &name, seq, &content)
+                    })
+                    .await?;
                 }
             }
             "canvas" => {
-                let ev = kinds::canvas(&keys, &k, &ch, &name, seq)?;
-                self.send(client, band, ev).await;
+                self.send_channel(client, band, |seq| {
+                    kinds::canvas(&keys, &k, &ch, &name, seq)
+                })
+                .await?;
             }
             "turn_metric" => {
-                let ev = kinds::turn_metric(&keys, &k, &ch, &name, seq)?;
+                let Some(owner) = self.oa_owner.as_ref() else {
+                    return Ok(());
+                };
+                let owner_hex = owner.public_key().to_hex();
+                let turn_seq = self.seq + 1;
+                let ev = kinds::turn_metric(&keys, &k, &owner_hex, &ch, turn_seq)?;
                 self.send(client, band, ev).await;
             }
             "dm" => {
@@ -394,32 +423,37 @@ impl Session {
                     .find(|p| *p != &self.rec.pubkey)
                     .cloned()
                 {
-                    let ev = kinds::gift_wrap(&keys, &k, &pk, &kinds::lorem(seq, 80))?;
+                    let ev = kinds::gift_wrap(&keys, &k, &pk, &kinds::lorem(self.seq + 1, 80))?;
                     self.send(client, band, ev).await;
                 }
             }
             "issue" => {
-                if let Some(repo) = self.world.repos.first() {
-                    let ev = kinds::issue(&keys, &k, &repo.a_tag, &repo.owner_hex, &name, seq)?;
-                    self.send(client, band, ev).await;
+                if let Some(repo) = self.world.repos.first().cloned() {
+                    self.send_channel(client, band, |seq| {
+                        kinds::issue(&keys, &k, &repo.a_tag, &repo.owner_hex, &name, seq)
+                    })
+                    .await?;
                 }
             }
             "pr" => {
-                if let Some(repo) = self.world.repos.first() {
+                if let Some(repo) = self.world.repos.first().cloned() {
                     let mut commit = [0u8; 20];
                     self.rng.fill(&mut commit);
-                    let ev = kinds::pull_request(
-                        &keys,
-                        &k,
-                        &repo.a_tag,
-                        &repo.owner_hex,
-                        &ch,
-                        &repo.clone_url,
-                        &hex::encode(commit),
-                        &name,
-                        seq,
-                    )?;
-                    self.send(client, band, ev).await;
+                    let commit = hex::encode(commit);
+                    self.send_channel(client, band, |seq| {
+                        kinds::pull_request(
+                            &keys,
+                            &k,
+                            &repo.a_tag,
+                            &repo.owner_hex,
+                            &ch,
+                            &repo.clone_url,
+                            &commit,
+                            &name,
+                            seq,
+                        )
+                    })
+                    .await?;
                 }
             }
             "media" => {
@@ -432,8 +466,10 @@ impl Session {
                     Ok(up) => {
                         self.stats.record_media(true, up.bytes, up.put_ms);
                         let content = format!("media {}", up.url);
-                        let ev = kinds::stream_message(&keys, &k, &ch, &name, seq, &content)?;
-                        self.send(client, band, ev).await;
+                        self.send_channel(client, band, |seq| {
+                            kinds::stream_message(&keys, &k, &ch, &name, seq, &content)
+                        })
+                        .await?;
                     }
                     Err(e) => {
                         warn!("{} media: {e}", self.rec.name);
@@ -448,7 +484,8 @@ impl Session {
                     let kb = lo + (rng_f64(&mut self.rng) * (hi.saturating_sub(lo) as f64)) as u64;
                     let mut blob = vec![0u8; (kb * 1024).max(1) as usize];
                     self.rng.fill(blob.as_mut_slice());
-                    match git::push_blob(repo, &self.world.git_helper, &blob, seq) {
+                    let git_seq = self.seq + 1;
+                    match git::push_blob(repo, &self.world.git_helper, &blob, git_seq) {
                         Ok((bytes, ms)) => self.stats.record_git(true, bytes, ms),
                         Err(e) => {
                             warn!("{} git push: {e}", self.rec.name);
@@ -497,6 +534,7 @@ impl Session {
         limit: u32,
         record_join: bool,
         storm_ms: bool,
+        since: Option<u64>,
     ) -> Result<BuzzTestClient> {
         info!("{} reconnect ({reason})", self.rec.name);
         let mut delay = Duration::from_millis(250);
@@ -521,6 +559,7 @@ impl Session {
                         limit,
                         &self.stats,
                         record_join,
+                        since,
                     )
                     .await
                     .unwrap_or(0);
@@ -543,6 +582,7 @@ impl Session {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_identity(
     rec: IdentityRecord,
     keys: Keys,
@@ -554,6 +594,7 @@ pub async fn run_identity(
     mut band_rx: watch::Receiver<Band>,
     git_repo: Option<GitRepo>,
     rng_salt: u32,
+    ready: mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
     let mut sess = Session {
         rng: std_rng(profile.seed, rng_salt),
@@ -577,28 +618,41 @@ pub async fn run_identity(
             .build()?,
     };
 
-    let mut client = connect_identity(
+    let mut client = match connect_identity(
         &sess.world.relay_url,
         &sess.rec,
         &sess.keys,
         sess.oa_owner.as_ref(),
     )
     .await
-    .with_context(|| format!("{} connect", sess.rec.name))?;
-    subscribe_all(
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("{} connect: {e:#}", sess.rec.name);
+            let _ = ready.send(Err(msg.clone())).await;
+            return Err(anyhow!(msg));
+        }
+    };
+    if let Err(e) = subscribe_all(
         &mut client,
         &sess.rec.name,
         &sess.rec.pubkey,
         &sess.world.channels,
         &sess.sub_kinds(),
-        match sess.role {
-            Role::Human => sess.profile.human.backfill_limit,
-            Role::Agent => sess.profile.human.backfill_limit,
-        },
+        sess.profile.human.backfill_limit,
         &sess.stats,
         true,
+        None,
     )
-    .await?;
+    .await
+    {
+        let msg = format!("{} subscribe: {e:#}", sess.rec.name);
+        let _ = ready.send(Err(msg.clone())).await;
+        return Err(anyhow!(msg));
+    }
+    if ready.send(Ok(())).await.is_err() {
+        return Ok(());
+    }
 
     let mut band = *band_rx.borrow();
     let mut band_started = Instant::now();
@@ -643,6 +697,7 @@ pub async fn run_identity(
                     sess.profile.storm.backfill_limit,
                     false,
                     true,
+                    None,
                 )
                 .await?;
         }
@@ -662,7 +717,8 @@ pub async fn run_identity(
                 } else if rates.presence > 0.0 {
                     let ev = kinds::presence(&sess.keys, &sess.profile.kinds)?;
                     sess.send(&mut client, band, ev).await;
-                    next_action = Instant::now() + super::roles::poisson_wait(rates.presence, &mut sess.rng);
+                    next_action =
+                        Instant::now() + super::roles::poisson_wait(rates.presence, &mut sess.rng);
                 } else {
                     next_action = Instant::now() + Duration::from_millis(200);
                 }
@@ -684,14 +740,25 @@ pub async fn run_identity(
                 if is_closed && sess.world.blink {
                     blink_closes.push(unix_now());
                     let since = sess.last_seen_created_at.saturating_sub(5);
-                    let _ = since;
                     client = sess
-                        .reconnect("blink", sess.profile.human.backfill_limit, false, false)
+                        .reconnect(
+                            "blink",
+                            sess.profile.human.backfill_limit,
+                            false,
+                            false,
+                            Some(since),
+                        )
                         .await?;
                 } else if is_closed {
                     warn!("{} connection dropped: {s}", sess.rec.name);
                     client = sess
-                        .reconnect("drop", sess.profile.human.backfill_limit, false, false)
+                        .reconnect(
+                            "drop",
+                            sess.profile.human.backfill_limit,
+                            false,
+                            false,
+                            None,
+                        )
                         .await?;
                 } else {
                     warn!("{} recv: {s}", sess.rec.name);
@@ -700,6 +767,9 @@ pub async fn run_identity(
         }
     }
 
+    if sess.world.blink && !blink_closes.is_empty() {
+        sess.stats.record_blink_closes(&blink_closes);
+    }
     let _ = client.disconnect().await;
     Ok(())
 }

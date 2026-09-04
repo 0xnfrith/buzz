@@ -336,8 +336,8 @@ struct RawKinds {
 
 /// Load and validate a profile TOML file.
 pub fn load_profile(path: &Path) -> Result<Profile> {
-    let source = fs::read_to_string(path)
-        .with_context(|| format!("reading profile {}", path.display()))?;
+    let source =
+        fs::read_to_string(path).with_context(|| format!("reading profile {}", path.display()))?;
     parse_profile(path, &source)
 }
 
@@ -478,8 +478,7 @@ fn validate_raw(raw: &Raw, source: &str) -> Result<()> {
             );
         }
     }
-    if raw.roles.human.typing_before_msg_prob < 0.0
-        || raw.roles.human.typing_before_msg_prob > 1.0
+    if raw.roles.human.typing_before_msg_prob < 0.0 || raw.roles.human.typing_before_msg_prob > 1.0
     {
         bail!(
             "profile validation error at line {}: typing_before_msg_prob must be in [0, 1]",

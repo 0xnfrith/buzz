@@ -74,8 +74,11 @@ python3 perf/tenant_cogs.py run \
   --skip-reset
 ```
 
-Rolling-update reconnect tracking: `tenant_sim --blink` plus
-`python3 perf/tenant_cogs.py blink --substrate k3s ... --rollout 'kubectl -n buzz-loadtest rollout restart deploy/buzz'`.
+Rolling-update reconnect tracking (`tenant_sim --blink` plus
+`python3 perf/tenant_cogs.py blink --substrate k3s ... --rollout '...'`)
+is **not implemented** in this tree. `blink` exits 2 and does not run a
+rollout. `tenant_sim --blink` only records client-side close timestamps.
+Do not treat those paths as a completed two-replica rolling-update result.
 
 ## Report
 
@@ -88,7 +91,9 @@ python3 perf/cogs_report.py anchor   --results ./runs/all.jsonl --a <run-a> --b 
 
 `diff` compares the two most recent lines of the same `(profile, substrate)`
 that have **different** `buzz_commit` values and flags anything that moved
-more than 15%.
+more than 15%. `buzz_commit` is the relay image's source revision (or an
+immutable digest prefix). A moving tag such as `:main` is resolved at run
+time; it is never recorded as the literal string `main`.
 
 ## Profile check (no relay)
 
@@ -108,7 +113,17 @@ python3 -m unittest perf/test_tenant_cogs.py
 cd perf && python3 -m unittest test_tenant_cogs.py
 ```
 
+A successful `run` exits 0 only when the floor shows 30 connections, sampled
+bands have zero unexpected rejects, media uploads succeeded with zero
+rejects, git pushed with zero failures, the three bands are distinct, and
+`lost_after_backfill` is 0. A results line is still appended for diagnosis;
+the process exit is the weekly-job gate.
+
 ## What is not in this tree
 
 Run outputs, identities, kubeconfigs, and `.env` files. `runs/` and
 `identities.json` are gitignored. Do not commit them.
+
+k3s bring-up, chart/server fingerprint, replica config, Postgres secret
+handling, box cost, and the rolling-update blink test are out of scope
+here. Those live in the private wrapper, which is not part of this PR.
