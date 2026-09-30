@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Orchestrator + sampler for the tenant_sim population generator.
 
-Stdlib only. Drives a compose or k3s substrate, samples cgroup/Postgres/MinIO
+Stdlib only. Drives a compose substrate, samples cgroup/Postgres/MinIO
 and relay /metrics during floor/steady/peak bands, and appends one JSONL line
 per run.
 """
@@ -443,7 +443,8 @@ class ComposeAdapter:
         return out
 
     def reset(self) -> None:
-        run(self.cmd("down", "-v"), check=False, env=self.env, capture=True)
+        """Start from nothing: the same verified removal as teardown."""
+        self.teardown()
 
     def up(self, extra_env: dict[str, str] | None = None) -> None:
         env = {**self.env, **(extra_env or {})}
@@ -487,83 +488,24 @@ class ComposeAdapter:
             time.sleep(2)
         raise RuntimeError(f"relay not ready at {health_url}: {last}")
 
-    def teardown(self) -> None:
-        run(self.cmd("down", "-v"), check=False, env=self.env, capture=True)
-
-
-class K3sAdapter:
-    """Generic k3s adapter. Hosts, kubeconfig and namespace come from flags."""
-
-    def __init__(
-        self,
-        kubeconfig: str,
-        namespace: str,
-        release: str = "buzz",
-        ssh: str | None = None,
-        ssh_key: str | None = None,
-    ) -> None:
-        self.kubeconfig = kubeconfig
-        self.namespace = namespace
-        self.release = release
-        self.ssh = ssh
-        self.ssh_key = ssh_key
-
-    def kubectl(self, *args: str) -> list[str]:
-        cmd = ["kubectl", "--kubeconfig", self.kubeconfig, "-n", self.namespace]
-        cmd.extend(args)
-        return cmd
-
-    def reset(self) -> None:
-        run(
-            [
-                "helm",
-                "uninstall",
-                self.release,
-                "-n",
-                self.namespace,
-                "--kubeconfig",
-                self.kubeconfig,
-                "--wait",
-                "--timeout",
-                "5m",
-            ],
-            check=False,
-        )
-        run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                self.kubeconfig,
-                "delete",
-                "namespace",
-                self.namespace,
-                "--wait",
-            ],
-            check=False,
-        )
-
-    def up(self) -> None:
-        raise RuntimeError(
-            "k3s up is performed by the private wrapper (helm install); "
-            "pass --skip-reset after the release is already running"
-        )
-
-    def wait_ready(self, health_url: str, timeout_s: int = 180) -> None:
-        deadline = time.time() + timeout_s
-        last = ""
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(health_url, timeout=2) as resp:
-                    if resp.status == 200:
-                        return
-                    last = f"status {resp.status}"
-            except Exception as exc:  # noqa: BLE001
-                last = str(exc)
-            time.sleep(2)
-        raise RuntimeError(f"relay not ready at {health_url}: {last}")
+    def remaining(self) -> dict[str, list[str]]:
+        """This project's containers, volumes and networks, by compose label."""
+        label = f"label=com.docker.compose.project={self.project}"
+        out: dict[str, list[str]] = {}
+        for kind, cmd in (
+            ("containers", ["docker", "ps", "-a", "-q", "--filter", label]),
+            ("volumes", ["docker", "volume", "ls", "-q", "--filter", label]),
+            ("networks", ["docker", "network", "ls", "-q", "--filter", label]),
+        ):
+            out[kind] = run(cmd, check=True, env=self.env).stdout.split()
+        return out
 
     def teardown(self) -> None:
-        self.reset()
+        """Remove the project and prove nothing of it is left. Safe to repeat."""
+        run(self.cmd("down", "-v", "--remove-orphans"), check=True, env=self.env, capture=True)
+        left = {kind: ids for kind, ids in self.remaining().items() if ids}
+        if left:
+            raise RuntimeError(f"compose project {self.project} not empty after teardown: {left}")
 
 
 def fingerprint_compose(relay_cpu_pin: float = 2.0) -> dict[str, Any]:
@@ -861,9 +803,13 @@ class RunSession:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.close()
+        failed = self.close()
+        if failed and exc_type is None:
+            # A stack left behind fails the run, even after a clean result.
+            raise SystemExit(1)
 
-    def close(self) -> None:
+    def close(self) -> bool:
+        """Stop the sim and tear down. Returns True when teardown failed."""
         proc = self.proc
         if proc is not None and proc.poll() is None:
             proc.kill()
@@ -876,6 +822,8 @@ class RunSession:
                 self.adapter.teardown()
             except Exception as exc:
                 print(f"teardown failed: {exc}", file=sys.stderr)
+                return True
+        return False
 
 
 def band_stats(samples: list[dict[str, Any]], name: str, client: dict[str, Any] | None) -> dict[str, Any]:
@@ -1252,7 +1200,21 @@ def resolve_setup_rate_limit(args: argparse.Namespace) -> int:
     return limit
 
 
+def keeps_stack(args: argparse.Namespace) -> bool:
+    """A run tears down only a stack it brought up (not --skip-reset, not --keep)."""
+    return bool(args.keep or args.skip_reset)
+
+
+K3S_RUN_DISABLED = (
+    "run --substrate k3s is disabled: a k3s run needs a bounded, manifest-bound "
+    "install and teardown, which this tree does not have yet. Nothing was changed."
+)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    if args.substrate != "compose":
+        print(K3S_RUN_DISABLED, file=sys.stderr)
+        return 2
     profile_path = Path(args.profile)
     name, profile_sha, bands = load_profile_meta(profile_path)
     out_dir = Path(args.out_dir)
@@ -1264,40 +1226,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     tenant_sim = args.tenant_sim
 
     notes: list[str] = []
-    if args.substrate == "compose":
-        adapter: Any = ComposeAdapter(args.compose_project, tuple(args.compose_files.split(",")), env)
-        fp = fingerprint_compose()
-        services = {
-            "relay": "relay",
-            "postgres": "postgres",
-            "redis": "redis",
-            "minio": "minio",
-        }
-        execs = ExecAdapter(kind="compose", project=args.compose_project)
-        substrate_label = args.substrate_label or "workstation-orbstack"
-    else:
-        adapter = K3sAdapter(
-            kubeconfig=args.kubeconfig or "",
-            namespace=args.namespace,
-            release=args.release,
-            ssh=args.ssh,
-            ssh_key=args.ssh_key,
-        )
-        fp = fingerprint_k3s(args.ssh)
-        services = {
-            "relay": args.relay_target,
-            "postgres": args.postgres_target,
-            "redis": args.redis_target,
-            "minio": args.minio_target,
-        }
-        execs = ExecAdapter(
-            kind="k3s",
-            kubeconfig=args.kubeconfig,
-            namespace=args.namespace,
-        )
-        substrate_label = args.substrate_label or "k3s"
+    adapter: Any = ComposeAdapter(args.compose_project, tuple(args.compose_files.split(",")), env)
+    fp = fingerprint_compose()
+    services = {
+        "relay": "relay",
+        "postgres": "postgres",
+        "redis": "redis",
+        "minio": "minio",
+    }
+    execs = ExecAdapter(kind="compose", project=args.compose_project)
+    substrate_label = args.substrate_label or "workstation-orbstack"
 
-    with RunSession(adapter, keep=args.keep) as session:
+    with RunSession(adapter, keep=keeps_stack(args)) as session:
         if not args.skip_reset:
             adapter.reset()
             adapter.up(raised_limit_env(setup_limit))
@@ -1347,13 +1287,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 f"setup rate limits raised to {setup_limit}; relay restarted "
                 "with default limits before the population connected"
             )
-        if args.substrate == "compose":
-            overrides = adapter.relay_rate_limit_overrides()
-            if overrides:
-                raise RuntimeError(
-                    f"relay still has rate-limit overrides before the bands: {sorted(overrides)}"
-                )
-            setup["band_rate_limits"] = "relay-default"
+        overrides = adapter.relay_rate_limit_overrides()
+        if overrides:
+            raise RuntimeError(
+                f"relay still has rate-limit overrides before the bands: {sorted(overrides)}"
+            )
+        setup["band_rate_limits"] = "relay-default"
         if setup_limit:
             assert proc.stdin is not None
             proc.stdin.write(b"continue\n")
@@ -1565,6 +1504,28 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
         return 0 if code == 0 else 1
 
 
+# The only kinds an idle client sends: presence and typing, both ephemeral.
+FLOOR_KINDS = frozenset({"20001", "20002"})
+
+
+def floor_errors(floor: dict[str, Any]) -> list[str]:
+    """Floor is idle clients: heartbeats only, nothing stored."""
+    errs: list[str] = []
+    kinds = (floor.get("client") or {}).get("sent_by_kind")
+    if kinds is None:
+        errs.append("floor client.sent_by_kind missing")
+    else:
+        other = {k: v for k, v in sorted(kinds.items()) if k not in FLOOR_KINDS and int(v)}
+        if other:
+            errs.append(f"floor sent non-heartbeat kinds {other}")
+    stored = (floor.get("relay_metrics") or {}).get("events_stored")
+    if stored is None:
+        errs.append("floor relay events_stored missing")
+    elif int(stored):
+        errs.append(f"floor relay events_stored={stored}, expected 0")
+    return errs
+
+
 def acceptance_errors(
     line: dict[str, Any], summary: dict[str, Any], proc_code: int | None
 ) -> list[str]:
@@ -1583,6 +1544,7 @@ def acceptance_errors(
         errs.append("floor ws_connections_active missing")
     elif int(ws) != expected:
         errs.append(f"floor ws_connections_active={ws} != {expected}")
+    errs.extend(floor_errors(floor))
     for name in ("floor", "steady", "peak"):
         band = bands.get(name) or {}
         rejected = int((band.get("relay_metrics") or {}).get("events_rejected") or 0)

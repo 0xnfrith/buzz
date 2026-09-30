@@ -283,6 +283,9 @@ class SchemaTests(unittest.TestCase):
             "notes": "",
         }
         out["bands"]["floor"]["relay"]["rss_bytes"]["p50"] = 5_000_000
+        # Floor is idle clients: heartbeats only, nothing stored.
+        out["bands"]["floor"]["relay_metrics"]["events_stored"] = 0
+        out["bands"]["floor"]["client"]["sent_by_kind"] = {"20001": 9, "20002": 1}
         out["bands"]["steady"]["relay"]["rss_bytes"]["p50"] = 10_000_000
         out["bands"]["peak"]["relay"]["rss_bytes"]["max"] = 20_000_000
         return out
@@ -326,7 +329,7 @@ class SchemaTests(unittest.TestCase):
         line["bands"]["floor"]["relay"]["anon_bytes"] = {"p50": 2 * 1024 * 1024, "p95": 0, "max": 3 * 1024 * 1024}
         text = cogs_report.render_report(line)
         self.assertIn("memory.current − inactive_file", text)
-        self.assertIn("| floor | 5/11/14 Mi | 2/3 Mi |", text)
+        self.assertIn("| floor (idle, heartbeats only) | 5/11/14 Mi | 2/3 Mi |", text)
         self.assertIn("| steady | 10/11/14 Mi | n/a/n/a Mi |", text)
         self.assertIn("| measured from |", text)
         self.assertIn("steady relay CPU × 1.5", text)
@@ -377,6 +380,36 @@ class SchemaTests(unittest.TestCase):
         bad["bands"]["steady"]["relay_metrics"]["events_rejected"] = 27
         errs = tenant_cogs.acceptance_errors(bad, summary, 0)
         self.assertTrue(any("events_rejected" in e for e in errs))
+
+    def test_floor_must_be_idle(self) -> None:
+        summary = {
+            "identities": {"humans": 10, "agents": 20},
+            "media": {"uploads": 3, "rejected": 0},
+            "git": {"pushes": 1, "failed": 0},
+        }
+        line = self.fixture()
+        self.assertEqual(tenant_cogs.acceptance_errors(line, summary, 0), [])
+
+        chatty = json.loads(json.dumps(line))
+        chatty["bands"]["floor"]["client"]["sent_by_kind"]["9"] = 2
+        self.assertEqual(
+            tenant_cogs.acceptance_errors(chatty, summary, 0),
+            ["floor sent non-heartbeat kinds {'9': 2}"],
+        )
+
+        stored = json.loads(json.dumps(line))
+        stored["bands"]["floor"]["relay_metrics"]["events_stored"] = 3
+        self.assertEqual(
+            tenant_cogs.acceptance_errors(stored, summary, 0),
+            ["floor relay events_stored=3, expected 0"],
+        )
+
+        unknown = json.loads(json.dumps(line))
+        del unknown["bands"]["floor"]["client"]["sent_by_kind"]
+        self.assertEqual(
+            tenant_cogs.acceptance_errors(unknown, summary, 0),
+            ["floor client.sent_by_kind missing"],
+        )
 
 
 class HistogramQuantileTests(unittest.TestCase):
@@ -531,6 +564,96 @@ class TeardownTests(unittest.TestCase):
         with tenant_cogs.RunSession(adapter, keep=True):
             pass
         self.assertEqual(adapter.torn, 0)
+
+
+    def test_teardown_failure_fails_a_clean_run(self) -> None:
+        class Adapter:
+            def teardown(self) -> None:
+                raise RuntimeError("volume still in use")
+
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as cm:
+                with tenant_cogs.RunSession(Adapter(), keep=False):
+                    pass
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_teardown_failure_keeps_the_original_error(self) -> None:
+        class Adapter:
+            def teardown(self) -> None:
+                raise RuntimeError("volume still in use")
+
+        with mock.patch("sys.stderr"):
+            with self.assertRaisesRegex(RuntimeError, "ready failed"):
+                with tenant_cogs.RunSession(Adapter(), keep=False):
+                    raise RuntimeError("ready failed")
+
+    def test_only_a_stack_the_run_brought_up_is_torn_down(self) -> None:
+        ns = lambda keep, skip: tenant_cogs.argparse.Namespace(keep=keep, skip_reset=skip)
+        self.assertFalse(tenant_cogs.keeps_stack(ns(False, False)))
+        self.assertTrue(tenant_cogs.keeps_stack(ns(True, False)))
+        self.assertTrue(tenant_cogs.keeps_stack(ns(False, True)))
+
+
+class ComposeTeardownTests(unittest.TestCase):
+    def fake_run(self, leftovers: dict[str, str], calls: list):
+        def run(cmd, check=True, capture=True, env=None, timeout=None):
+            calls.append((cmd, check))
+            out = ""
+            for kind, ids in leftovers.items():
+                if kind in cmd:  # "ps", "volume" or "network"
+                    out = ids
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+        return run
+
+    def test_teardown_removes_and_verifies_the_project(self) -> None:
+        ad = tenant_cogs.ComposeAdapter("buzz-harness", ("a.yml",), env={})
+        calls: list = []
+        with mock.patch.object(tenant_cogs, "run", self.fake_run({}, calls)):
+            ad.teardown()
+            ad.reset()  # same verified removal; safe to repeat
+        down = ["docker", "compose", "-p", "buzz-harness", "-f", "a.yml", "down", "-v", "--remove-orphans"]
+        self.assertEqual(calls[0], (down, True))
+        label = "label=com.docker.compose.project=buzz-harness"
+        self.assertEqual(
+            [c[0] for c in calls[1:4]],
+            [
+                ["docker", "ps", "-a", "-q", "--filter", label],
+                ["docker", "volume", "ls", "-q", "--filter", label],
+                ["docker", "network", "ls", "-q", "--filter", label],
+            ],
+        )
+        self.assertTrue(all(check for _, check in calls))
+        self.assertEqual(len(calls), 8)
+
+    def test_leftovers_fail_teardown(self) -> None:
+        ad = tenant_cogs.ComposeAdapter("buzz-harness", ("a.yml",), env={})
+        with mock.patch.object(tenant_cogs, "run", self.fake_run({"volume": "vol1\n"}, [])):
+            with self.assertRaisesRegex(RuntimeError, r"not empty after teardown: \{'volumes': \['vol1'\]\}"):
+                ad.teardown()
+
+    def test_failed_down_fails_teardown(self) -> None:
+        ad = tenant_cogs.ComposeAdapter("buzz-harness", ("a.yml",), env={})
+
+        def run(cmd, check=True, capture=True, env=None, timeout=None):
+            raise subprocess.CalledProcessError(1, cmd)
+
+        with mock.patch.object(tenant_cogs, "run", run):
+            with self.assertRaises(subprocess.CalledProcessError):
+                ad.teardown()
+
+
+class K3sRunTests(unittest.TestCase):
+    def test_run_refuses_k3s_without_touching_anything(self) -> None:
+        def forbidden(*a, **k):
+            raise AssertionError("k3s run must not execute anything")
+
+        with mock.patch.object(tenant_cogs, "run", forbidden), mock.patch.object(
+            tenant_cogs.subprocess, "Popen", forbidden
+        ), mock.patch("sys.stderr"):
+            code = tenant_cogs.cmd_run(tenant_cogs.argparse.Namespace(substrate="k3s"))
+        self.assertEqual(code, 2)
+        self.assertFalse(hasattr(tenant_cogs, "K3sAdapter"))
 
 
 VARS = tenant_cogs.RATE_LIMIT_VARS

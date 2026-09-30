@@ -12,7 +12,7 @@ repos            = 2           # git repos announced by agents (kind 30617)
 
 [bands]                        # seconds
 warmup  = 120                  # connect + provision + first backfill; NOT sampled
-floor   = 600                  # everyone connected + subscribed, zero traffic
+floor   = 600                  # connected + subscribed + idle: presence heartbeats only, nothing stored
 steady  = 900                  # duty cycles below
 peak    = 300                  # storm + all agents active
 cooldown= 60                   # drain; NOT sampled

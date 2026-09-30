@@ -371,11 +371,12 @@ def render_report(line: dict[str, Any]) -> str:
         "| postgres working set p95 (anon) | db end | WAL max |"
     )
     out.append("|---|---|---|---|---|---|---|")
+    labels = {"floor": "floor (idle, heartbeats only)"}
     for name in ("floor", "steady", "peak"):
         b = bands[name]
         rss = b["relay"]["rss_bytes"]
         out.append(
-            f"| {name} | {bytes_to_mi(rss['p50'])}/{bytes_to_mi(rss['p95'])}/{bytes_to_mi(rss['max'])} Mi "
+            f"| {labels.get(name, name)} | {bytes_to_mi(rss['p50'])}/{bytes_to_mi(rss['p95'])}/{bytes_to_mi(rss['max'])} Mi "
             f"| {_anon(b['relay'], 'p50')}/{_anon(b['relay'], 'max')} Mi "
             f"| {b['relay']['cpu_s']:.2f} "
             f"| {bytes_to_mi(b['postgres']['rss_bytes']['p95'])} Mi ({_anon(b['postgres'], 'p95')} Mi) "

@@ -5,8 +5,8 @@ report (`cogs_report.py`). They measure what a 10-human / 20-agent team does
 to a Buzz relay so chart `requests`/`limits` and PVC sizes can be set from
 numbers instead of guesses.
 
-No CI. Run it by hand against an isolated compose project or a dedicated k3s
-namespace. Default hosts are `localhost`; default namespace is `buzz-loadtest`.
+No CI. Run it by hand against an isolated compose project. Default hosts are
+`localhost`. k3s runs are disabled for now (see "Substrate: k3s").
 
 ## Pieces
 
@@ -85,8 +85,8 @@ is a within-band delta, so nothing measured spans it.
 `--setup-rate-limit 0` keeps the relay's defaults throughout. `tenant_sim`
 then paces the owner itself: a rate-limit `NOTICE` waits out the window the
 relay names and resends the same event, instead of waiting 30 s for an `OK`
-that never comes. The same applies with `--skip-reset` and on k3s, where the
-harness cannot restart the relay.
+that never comes. The same applies with `--skip-reset`, where the harness did
+not start the relay and cannot restart it.
 
 ### Identities
 
@@ -131,26 +131,13 @@ and Postgres CPU in cores. If the relay is well under its CPU pin, the
 number is bounded by the client, not the relay. Postgres is not CPU-pinned on
 the workstation, so a raised-limit figure is an upper bound for a small box.
 
-## Substrate: k3s (absolute numbers)
+## Substrate: k3s (disabled)
 
-Same generator. Point `--kubeconfig`, `--namespace` (default `buzz-loadtest`),
-and `--substrate k3s` at a cluster you already installed the chart on. The
-harness does not mint machines and does not assume any hostnames.
-
-```bash
-python3 perf/tenant_cogs.py run \
-  --substrate k3s \
-  --kubeconfig ./kubeconfig \
-  --namespace buzz-loadtest \
-  --relay-url ws://127.0.0.1:30030 \
-  --http-url http://127.0.0.1:30030 \
-  --metrics-url http://127.0.0.1:9102/metrics \
-  --health-url http://127.0.0.1:30030/ \
-  --profile perf/profiles/10h-20a.toml \
-  --out-dir ./runs/k3s-1 \
-  --results ./runs/k3s-1/results.jsonl \
-  --skip-reset
-```
+`run --substrate k3s` refuses and exits 2 before it runs anything: no
+`helm`, no `kubectl`, no `tenant_sim`. A k3s run needs an install and a
+teardown bounded to the exact resources that run created, and this tree does
+not have that yet. `sample --substrate k3s` and `fingerprint --substrate k3s`
+still work; both only read.
 
 Rolling-update reconnect tracking (`tenant_sim --blink` plus
 `python3 perf/tenant_cogs.py blink --substrate k3s ... --rollout '...'`)
@@ -214,8 +201,9 @@ cd perf && python3 -m unittest test_tenant_cogs.py
 The profile is parsed as TOML by both `tenant_sim` and `tenant_cogs.py`, so
 band lengths in `[bands]` are the lengths the orchestrator runs.
 
-A successful `run` exits 0 only when the floor shows 30 connections, sampled
-bands have zero unexpected rejects, media uploads succeeded with zero
+A successful `run` exits 0 only when the floor shows 30 connections and is
+idle (every client send is presence or typing, kinds 20001/20002, and the
+relay stores nothing), sampled bands have zero unexpected rejects, media uploads succeeded with zero
 rejects, git pushed with zero failures, the three bands are distinct, and
 `lost_after_backfill` is 0. "Distinct" means the relay's working set rises:
 floor p50 < steady p50 < peak max. A results line is still appended for
@@ -223,8 +211,14 @@ diagnosis; the process exit is the weekly-job gate.
 
 `fanout_recipients_p50` is a true histogram percentile of the observations
 that landed in that band (end-minus-start bucket counts), not a lifetime
-`sum/count` mean. Ready/summary reads time out against a silent child, and
-`cmd_run` always tears the stack down unless `--keep` is set.
+`sum/count` mean. Ready/summary reads time out against a silent child.
+
+`run` tears down only a stack it brought up: never with `--keep` or
+`--skip-reset`. Teardown is `docker compose down -v --remove-orphans`,
+then a check that no container, volume or network with the project's compose
+label is left. If either step fails, the run exits nonzero, even after a
+passing result. The reset before `up` runs the same removal and check, so a
+run never starts on an old stack. Both are safe to repeat.
 
 ## What is not in this tree
 

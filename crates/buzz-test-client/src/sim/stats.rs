@@ -38,6 +38,8 @@ pub struct BandClient {
     pub accepted: u64,
     pub rejected: u64,
     pub received: u64,
+    /// Sends in this band by event kind; acceptance checks the floor with it.
+    pub sent_by_kind: BTreeMap<String, u64>,
     pub ok_ms: Percentiles,
     pub fanout_ms: Percentiles,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,6 +88,7 @@ struct BandAcc {
     accepted: u64,
     rejected: u64,
     received: u64,
+    sent_by_kind: BTreeMap<String, u64>,
     ok_ms: Vec<f64>,
     fanout_ms: Vec<f64>,
     storm_backfill_ms: Vec<f64>,
@@ -138,6 +141,7 @@ impl Stats {
             *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
             let b = s.bands.entry(band.to_string()).or_default();
             b.sent += 1;
+            *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
             if accepted {
                 b.accepted += 1;
                 b.ok_ms.push(ok_ms);
@@ -233,6 +237,7 @@ impl Stats {
                     accepted: acc.accepted,
                     rejected: acc.rejected,
                     received: acc.received,
+                    sent_by_kind: acc.sent_by_kind.clone(),
                     ok_ms: percentiles(acc.ok_ms.clone()),
                     fanout_ms: percentiles(acc.fanout_ms.clone()),
                     storm_backfill_ms: None,
@@ -284,5 +289,29 @@ impl Stats {
                 }),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sends_are_counted_by_kind_per_band() {
+        let stats = Stats::new();
+        stats.record_send("floor", 20001, true, "", 1.0);
+        stats.record_send("floor", 20001, true, "", 1.0);
+        stats.record_send("steady", 9, true, "", 1.0);
+        stats.record_send("steady", 20001, false, "blocked", 1.0);
+        let summary = stats.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
+        assert_eq!(
+            summary.bands["floor"].sent_by_kind,
+            BTreeMap::from([("20001".to_string(), 2)])
+        );
+        assert_eq!(
+            summary.bands["steady"].sent_by_kind,
+            BTreeMap::from([("9".to_string(), 1), ("20001".to_string(), 1)])
+        );
+        assert_eq!(summary.sent_by_kind["20001"], 3);
     }
 }
