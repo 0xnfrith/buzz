@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -426,6 +428,212 @@ class TeardownTests(unittest.TestCase):
         with tenant_cogs.RunSession(adapter, keep=True):
             pass
         self.assertEqual(adapter.torn, 0)
+
+
+VARS = tenant_cogs.RATE_LIMIT_VARS
+
+
+class SetupRateLimitTests(unittest.TestCase):
+    def test_tenant_sim_env_drops_caller_credentials(self) -> None:
+        env = {
+            "PATH": "/usr/bin",
+            "BUZZ_AUTH_TAG": '["auth","o","","s"]',
+            "BUZZ_PRIVATE_KEY": "k",
+            "NOSTR_PRIVATE_KEY": "n",
+            "BUZZ_IMAGE": "img",
+        }
+        out = tenant_cogs.child_env(env)
+        self.assertEqual(out, {"PATH": "/usr/bin"})
+        with mock.patch.dict(os.environ, {"BUZZ_AUTH_TAG": "x"}):
+            self.assertNotIn("BUZZ_AUTH_TAG", tenant_cogs.child_env())
+
+    def test_raised_env_covers_every_var(self) -> None:
+        env = tenant_cogs.raised_limit_env(500)
+        self.assertEqual(sorted(env), sorted(VARS))
+        self.assertTrue(all(v == "500" for v in env.values()))
+        self.assertEqual(tenant_cogs.raised_limit_env(0), {})
+
+    def test_adapter_never_inherits_shell_overrides(self) -> None:
+        with mock.patch.dict(os.environ, {VARS[0]: "7"}):
+            ad = tenant_cogs.ComposeAdapter(env={"BUZZ_IMAGE": "img"})
+        self.assertNotIn(VARS[0], ad.env)
+        self.assertEqual(ad.env["BUZZ_IMAGE"], "img")
+
+    def test_up_raises_then_recreate_restores_defaults(self) -> None:
+        calls: list[tuple[list[str], dict]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, dict(kw.get("env") or {})))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        ad = tenant_cogs.ComposeAdapter(env={"SIM_RELAY_KEY": "k"})
+        with mock.patch.object(tenant_cogs, "run", fake_run):
+            ad.up(tenant_cogs.raised_limit_env(1000))
+            ad.recreate_relay()
+        (up_cmd, up_env), (re_cmd, re_env) = calls
+        self.assertEqual(up_cmd[-2:], ["up", "-d"])
+        for name in VARS:
+            self.assertEqual(up_env[name], "1000")
+            self.assertNotIn(name, re_env)
+        self.assertEqual(re_cmd[-5:], ["up", "-d", "--no-deps", "--force-recreate", "relay"])
+        # Same per-run keys across the restart.
+        self.assertEqual(up_env["SIM_RELAY_KEY"], "k")
+        self.assertEqual(re_env["SIM_RELAY_KEY"], "k")
+
+    def test_overrides_read_from_container_env(self) -> None:
+        env = ["PATH=/usr/bin", f"{VARS[0]}=9", "BUZZ_BIND_ADDR=0.0.0.0:3030"]
+        self.assertEqual(tenant_cogs.rate_limit_overrides(env), {VARS[0]: "9"})
+        self.assertEqual(tenant_cogs.rate_limit_overrides([]), {})
+
+    def test_resolve_setup_rate_limit(self) -> None:
+        def ns(**kw):
+            base = {"substrate": "compose", "skip_reset": False, "setup_rate_limit": None}
+            base.update(kw)
+            return argparse_ns(**base)
+
+        resolve = tenant_cogs.resolve_setup_rate_limit
+        self.assertEqual(resolve(ns()), tenant_cogs.DEFAULT_SETUP_RATE_LIMIT)
+        self.assertEqual(resolve(ns(skip_reset=True)), 0)
+        self.assertEqual(resolve(ns(substrate="k3s")), 0)
+        self.assertEqual(resolve(ns(setup_rate_limit=0)), 0)
+        self.assertEqual(resolve(ns(setup_rate_limit=250)), 250)
+        for bad in (
+            ns(substrate="k3s", setup_rate_limit=5),
+            ns(skip_reset=True, setup_rate_limit=5),
+            ns(setup_rate_limit=-1),
+        ):
+            with self.assertRaises(SystemExit):
+                resolve(bad)
+
+    def test_results_line_records_setup_and_band_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            line = tenant_cogs.write_results_line(
+                Path(td) / "results.jsonl",
+                run_id="r",
+                substrate="workstation-orbstack",
+                buzz_commit="abc1234",
+                buzz_image="img@sha256:00",
+                harness_commit="def5678",
+                profile="p",
+                profile_sha="x",
+                fingerprint={},
+                samples=[],
+                summary={},
+                notes="",
+                setup={
+                    "rate_limit": 1000,
+                    "band_rate_limits": "relay-default",
+                    "provision": {"events": 216, "rate_limited": 0, "seconds": 3.0},
+                },
+            )
+        self.assertEqual(line["relay_config"]["setup_rate_limit"], 1000)
+        self.assertEqual(line["relay_config"]["band_rate_limits"], "relay-default")
+        self.assertEqual(line["setup"]["events"], 216)
+        self.assertEqual(cogs_report.validate_line(line, 1), [])
+
+
+class ProfileMetaTests(unittest.TestCase):
+    def test_bands_under_a_commented_section_header(self) -> None:
+        # The shipped profiles write `[bands]   # seconds`; a line parser that
+        # needs the header to end in `]` silently kept the defaults.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "p.toml"
+            path.write_text(
+                '[profile]   # who\nname = "short"\n\n'
+                "[bands]                        # seconds\n"
+                "warmup  = 30   # not sampled\nfloor = 60\nsteady = 120\n"
+                "peak = 45\ncooldown= 20\n"
+            )
+            name, sha, bands = tenant_cogs.load_profile_meta(path)
+        self.assertEqual(name, "short")
+        self.assertEqual(len(sha), 64)
+        self.assertEqual(
+            bands, {"warmup": 30, "floor": 60, "steady": 120, "peak": 45, "cooldown": 20}
+        )
+
+    def test_shipped_profile_parses(self) -> None:
+        path = Path(__file__).resolve().parent / "profiles" / "10h-20a.toml"
+        name, _, bands = tenant_cogs.load_profile_meta(path)
+        self.assertEqual(name, "10h-20a")
+        self.assertEqual(bands["floor"], 600)
+
+
+class PhaseLineTests(unittest.TestCase):
+    def _emit(self, objs: list[dict], then: str = "time.sleep(2)") -> subprocess.Popen:
+        body = "; ".join(f"print(json.dumps({o!r}), flush=True)" for o in objs)
+        return subprocess.Popen(
+            [sys.executable, "-u", "-c", f"import json, sys, time; {body}; {then}"],
+            stdout=subprocess.PIPE,
+            bufsize=0,
+        )
+
+    def _close(self, proc: subprocess.Popen) -> None:
+        proc.kill()
+        proc.wait(timeout=2)
+        if proc.stdout:
+            proc.stdout.close()
+
+    def test_setup_done_then_ready_in_order(self) -> None:
+        proc = self._emit(
+            [
+                {"phase": "seed-start"},
+                {"phase": "setup-done", "provision": {"events": 3}},
+                {"phase": "ready"},
+            ]
+        )
+        try:
+            got = tenant_cogs.wait_phase_line(proc, "setup-done", 2.0)
+            self.assertEqual(got["provision"]["events"], 3)
+            tenant_cogs.wait_ready_line(proc, 2.0)
+        finally:
+            self._close(proc)
+
+    def test_exit_before_phase_is_an_error(self) -> None:
+        proc = self._emit([{"phase": "setup-done"}], then="sys.exit(3)")
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                tenant_cogs.wait_phase_line(proc, "ready", 5.0)
+            self.assertIn("exited 3 before ready", str(ctx.exception))
+        finally:
+            self._close(proc)
+
+
+class SeedBenchTests(unittest.TestCase):
+    def test_rates_come_from_relay_side_deltas(self) -> None:
+        before = {
+            "t": 100.0,
+            "stored_rows": 1000,
+            "wal_lsn_bytes": 0,
+            "db_size_bytes": 10_000_000,
+            "relay_usage_usec": 0,
+            "postgres_usage_usec": 0,
+        }
+        after = {
+            "t": 110.0,
+            "stored_rows": 6000,
+            "wal_lsn_bytes": 5_000_000,
+            "db_size_bytes": 13_000_000,
+            "relay_usage_usec": 15_000_000,
+            "postgres_usage_usec": 5_000_000,
+        }
+        r = tenant_cogs.seed_bench_result(
+            "raised", {"acked": 5000, "acked_per_s": 480.0}, before, after
+        )
+        self.assertEqual(r["stored_rows"], 5000)
+        self.assertAlmostEqual(r["stored_per_s"], 500.0)
+        self.assertAlmostEqual(r["acked_per_s"], 480.0)
+        self.assertAlmostEqual(r["wal_bytes_per_stored"], 1000.0)
+        self.assertAlmostEqual(r["db_bytes_per_stored"], 600.0)
+        self.assertAlmostEqual(r["relay_cores"], 1.5)
+        self.assertAlmostEqual(r["postgres_cores"], 0.5)
+
+    def test_missing_counters_stay_null(self) -> None:
+        snap = {"t": 1.0, "stored_rows": None, "wal_lsn_bytes": None}
+        later = {"t": 2.0, "stored_rows": None, "wal_lsn_bytes": 10}
+        r = tenant_cogs.seed_bench_result("default", {}, snap, later)
+        self.assertIsNone(r["stored_per_s"])
+        self.assertIsNone(r["wal_bytes_per_stored"])
+        self.assertIsNone(r["relay_cores"])
 
 
 def argparse_ns(**kwargs):

@@ -7,25 +7,34 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use buzz_test_client::BuzzTestClient;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use sim::admission::{publish, Publish};
 use sim::git;
 use sim::identity::{
-    connect_identity, generate_population, load_population, save_population, uuid_v4, Population,
-    RepoRef, World,
+    connect_identity, generate_population, load_population, nip_oa_json, save_population, uuid_v4,
+    IdentityRecord, Population, RepoRef, World,
 };
 use sim::kinds;
 use sim::profile::{load_profile, Profile};
 use sim::roles::{Band, Role};
+use sim::seed;
 use sim::stats::Stats;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::warn;
+
+/// Same OK window as `buzz-ws-client`'s publish.
+const OK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Transport failures tolerated per owner event before provisioning fails.
+const SEND_ATTEMPTS: u32 = 4;
+/// Rate-limit waits tolerated per owner event (each waits out one window).
+const RATE_LIMIT_WAITS: u32 = 20;
 
 #[derive(Parser, Debug)]
 #[command(name = "tenant_sim", about = "Buzz relay population generator")]
@@ -77,6 +86,40 @@ struct Args {
     /// Parse and validate the profile, print the event budget, exit.
     #[arg(long)]
     check: bool,
+
+    /// After provisioning, write this many stored channel messages at
+    /// current timestamps before any identity subscribes (volume seed).
+    #[arg(long, default_value_t = 0)]
+    seed_events: u64,
+
+    /// Stop the seed after this many seconds even if it is short of
+    /// --seed-events.
+    #[arg(long, default_value_t = 1800)]
+    seed_max_seconds: u64,
+
+    /// After setup (provisioning and seed), print `{"phase":"setup-done"}`
+    /// and wait for a `continue` line on the band signal before the
+    /// population connects. Lets the orchestrator restart the relay between
+    /// setup and the measured run.
+    #[arg(long)]
+    pause_after_setup: bool,
+
+    /// Exit after setup (provisioning and seed); no population run.
+    #[arg(long)]
+    setup_only: bool,
+}
+
+/// What provisioning cost, for the `setup-done` line.
+#[derive(Debug, Default)]
+struct SetupStats {
+    events: u64,
+    rate_limited: u64,
+}
+
+/// One JSON phase line on stdout, flushed so the orchestrator sees it now.
+fn emit(line: &serde_json::Value) {
+    println!("{line}");
+    let _ = std::io::stdout().flush();
 }
 
 fn unix_now() -> u64 {
@@ -86,8 +129,15 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn spawn_band_reader(kind: &str, out_dir: &std::path::Path, tx: watch::Sender<Band>) -> Result<()> {
-    let source: Box<dyn BufRead + Send> = if kind == "fifo" {
+/// Read band signals (and the one-shot `continue` after setup) from stdin or
+/// a fifo. Started before provisioning so `continue` is never missed.
+fn spawn_band_reader(
+    kind: &str,
+    out_dir: &std::path::Path,
+    tx: watch::Sender<Band>,
+    go: oneshot::Sender<()>,
+) -> Result<()> {
+    let fifo = if kind == "fifo" {
         let path = out_dir.join("band.fifo");
         if path.exists() {
             let _ = std::fs::remove_file(&path);
@@ -96,16 +146,33 @@ fn spawn_band_reader(kind: &str, out_dir: &std::path::Path, tx: watch::Sender<Ba
         if !status.success() {
             bail!("mkfifo {} failed", path.display());
         }
-        let file = std::fs::File::open(&path)?;
-        Box::new(std::io::BufReader::new(file))
+        Some(path)
     } else {
-        Box::new(std::io::BufReader::new(std::io::stdin()))
+        None
     };
     std::thread::spawn(move || {
+        // Opening a fifo blocks until a writer appears; do it off the main task.
+        let source: Box<dyn BufRead + Send> = match fifo {
+            Some(path) => match std::fs::File::open(&path) {
+                Ok(file) => Box::new(std::io::BufReader::new(file)),
+                Err(e) => {
+                    eprintln!("tenant_sim: open {}: {e}", path.display());
+                    return;
+                }
+            },
+            None => Box::new(std::io::BufReader::new(std::io::stdin())),
+        };
+        let mut go = Some(go);
         for line in source.lines() {
             let Ok(line) = line else { break };
             let line = line.trim();
             if line.is_empty() {
+                continue;
+            }
+            if line == "continue" {
+                if let Some(go) = go.take() {
+                    let _ = go.send(());
+                }
                 continue;
             }
             let token = line.strip_prefix("band ").unwrap_or(line);
@@ -118,25 +185,63 @@ fn spawn_band_reader(kind: &str, out_dir: &std::path::Path, tx: watch::Sender<Ba
                 eprintln!("tenant_sim: unknown band signal {line:?}");
             }
         }
+        // End of input with no `stop` (the orchestrator went away) stops the
+        // run too. Identities read the last value of the closed channel.
+        let _ = tx.send(Band::Stop);
     });
     Ok(())
 }
 
+/// The human who attests for an agent (NIP-OA), if any.
+fn owner_of(pop: &Population, rec: &IdentityRecord) -> Option<nostr::Keys> {
+    rec.owner_name
+        .as_ref()
+        .and_then(|n| pop.humans.iter().find(|h| h.name == *n))
+        .and_then(|h| pop.keys_of(h).ok())
+}
+
+/// Identities added to the relay directly (kind 9030). With NIP-OA agents,
+/// only humans: a direct member is admitted as itself, so the relay never
+/// records its owner and treats it as a human (human limits, and every
+/// agent-only kind such as the 44200 turn metric is refused). Agents get in
+/// through their owner's attestation, as real agents on a closed relay do.
+fn direct_members<'a>(profile: &Profile, pop: &'a Population) -> Vec<&'a IdentityRecord> {
+    if profile.agent.nip_oa {
+        pop.humans.iter().collect()
+    } else {
+        pop.humans.iter().chain(pop.agents.iter()).collect()
+    }
+}
+
+/// Owner-socket publish. A relay rate-limit NOTICE waits out the window and
+/// resends the same event (the relay did not process it); a transport error
+/// reconnects. Both are bounded.
 async fn send_with_retry(
     client: &mut BuzzTestClient,
     keys: &nostr::Keys,
     relay_url: &str,
     event: nostr::Event,
     what: &str,
+    setup: &mut SetupStats,
 ) -> Result<buzz_test_client::OkResponse> {
     let mut last = anyhow::anyhow!("send failed");
-    for attempt in 0..4 {
-        match client.send_event(event.clone()).await {
-            Ok(ok) => return Ok(ok),
+    let mut attempt = 0u32;
+    let mut waits = 0u32;
+    setup.events += 1;
+    while attempt < SEND_ATTEMPTS && waits <= RATE_LIMIT_WAITS {
+        match publish(client, &event, OK_TIMEOUT).await {
+            Ok(Publish::Ok(ok)) => return Ok(ok),
+            Ok(Publish::RateLimited { retry_in }) => {
+                waits += 1;
+                setup.rate_limited += 1;
+                last = anyhow::anyhow!("{what}: still rate-limited after {waits} waits");
+                tokio::time::sleep(retry_in).await;
+            }
             Err(e) => {
                 last = anyhow::anyhow!("{what}: {e}");
                 warn!("{what} attempt {attempt}: {e}");
-                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1) as u64)).await;
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
                 match BuzzTestClient::connect(relay_url, keys).await {
                     Ok(c) => *client = c,
                     Err(ce) => warn!("reconnect after {what}: {ce}"),
@@ -152,13 +257,14 @@ async fn provision(
     pop: &Population,
     args: &Args,
     stats: &Stats,
+    setup: &mut SetupStats,
 ) -> Result<(Vec<String>, Vec<RepoRef>)> {
     let owner_keys = pop.owner_keys()?;
     let mut owner = BuzzTestClient::connect(&args.relay_url, &owner_keys)
         .await
         .context("owner connect")?;
     if args.require_membership {
-        for rec in pop.humans.iter().chain(pop.agents.iter()) {
+        for rec in direct_members(profile, pop) {
             let ev = kinds::relay_member_add(&owner_keys, &profile.kinds, &rec.pubkey)?;
             let ok = send_with_retry(
                 &mut owner,
@@ -166,6 +272,7 @@ async fn provision(
                 &args.relay_url,
                 ev,
                 &format!("9030 {}", rec.name),
+                setup,
             )
             .await?;
             if !ok.accepted {
@@ -195,6 +302,7 @@ async fn provision(
             &args.relay_url,
             ev,
             &format!("9007 {i}"),
+            setup,
         )
         .await?;
         if !ok.accepted {
@@ -211,6 +319,7 @@ async fn provision(
                 &args.relay_url,
                 ev,
                 &format!("9000 {} {ch}", rec.name),
+                setup,
             )
             .await
             {
@@ -229,10 +338,15 @@ async fn provision(
         for i in 0..profile.repos as usize {
             let agent = &pop.agents[i % pop.agents.len()];
             let agent_keys = pop.keys_of(agent)?;
+            let agent_owner = owner_of(pop, agent);
+            let auth_tag = agent_owner
+                .as_ref()
+                .map(|o| nip_oa_json(o, &agent_keys))
+                .transpose()?;
             let name = format!("sim-repo-{i}");
             let ev = kinds::repo_announce(&agent_keys, &profile.kinds, &name, &name, &channels[0])?;
             let mut agent_client =
-                connect_identity(&args.relay_url, agent, &agent_keys, None).await?;
+                connect_identity(&args.relay_url, agent, &agent_keys, agent_owner.as_ref()).await?;
             let ok = agent_client.send_event(ev).await?;
             if !ok.accepted {
                 warn!("30617 {name} rejected: {}", ok.message);
@@ -252,6 +366,7 @@ async fn provision(
                     &dest,
                     helper,
                     &agent.nsec,
+                    auth_tag.as_deref(),
                 ) {
                     Ok(repo) => {
                         repos.push(RepoRef {
@@ -323,8 +438,14 @@ async fn run(args: Args) -> Result<i32> {
     };
     save_population(&out_dir.join("identities.json"), &pop)?;
 
+    let (band_tx, band_rx) = watch::channel(Band::Warmup);
+    let (go_tx, go_rx) = oneshot::channel();
+    spawn_band_reader(&args.band_signal, &out_dir, band_tx, go_tx)?;
+
     let stats = Arc::new(Stats::new());
-    let (channels, repos) = match provision(&profile, &pop, &args, &stats).await {
+    let setup_started = Instant::now();
+    let mut setup = SetupStats::default();
+    let (channels, repos) = match provision(&profile, &pop, &args, &stats, &mut setup).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("warm-up failed: {e:#}");
@@ -332,6 +453,42 @@ async fn run(args: Args) -> Result<i32> {
             return Ok(3);
         }
     };
+    let provision_s = setup_started.elapsed().as_secs_f64();
+
+    let mut seed_failed = false;
+    if args.seed_events > 0 {
+        emit(&serde_json::json!({"phase": "seed-start", "t_unix_ms": kinds::now_ms()}));
+        let report = seed::seed(
+            &args.relay_url,
+            &pop,
+            &profile.kinds,
+            &channels,
+            args.seed_events,
+            Duration::from_secs(args.seed_max_seconds),
+        )
+        .await?;
+        seed_failed = report.rejected > 0 || report.errors > 0;
+        emit(&serde_json::json!({
+            "phase": "seed-done",
+            "t_unix_ms": kinds::now_ms(),
+            "seed": report,
+        }));
+    }
+    emit(&serde_json::json!({
+        "phase": "setup-done",
+        "provision": {
+            "events": setup.events,
+            "rate_limited": setup.rate_limited,
+            "seconds": provision_s,
+        },
+    }));
+    if args.setup_only {
+        return Ok(if seed_failed { 1 } else { 0 });
+    }
+    if args.pause_after_setup && go_rx.await.is_err() {
+        eprintln!("band signal closed before continue");
+        return Ok(3);
+    }
 
     let world = Arc::new(World {
         relay_url: args.relay_url.clone(),
@@ -343,9 +500,6 @@ async fn run(args: Args) -> Result<i32> {
         out_dir: out_dir.clone(),
         blink: args.blink,
     });
-
-    let (band_tx, band_rx) = watch::channel(Band::Warmup);
-    spawn_band_reader(&args.band_signal, &out_dir, band_tx)?;
 
     let profile = Arc::new(profile);
     let expected = profile.identity_count() as usize;
@@ -380,11 +534,11 @@ async fn run(args: Args) -> Result<i32> {
     for rec in pop.agents.iter().cloned() {
         salt += 1;
         let keys = pop.keys_of(&rec)?;
-        let owner_keys = rec
-            .owner_name
+        let owner_keys = owner_of(&pop, &rec);
+        let auth_tag = owner_keys
             .as_ref()
-            .and_then(|n| pop.humans.iter().find(|h| h.name == *n))
-            .and_then(|h| pop.keys_of(h).ok());
+            .map(|o| nip_oa_json(o, &keys))
+            .transpose()?;
         let git_repo = world
             .repos
             .iter()
@@ -393,6 +547,7 @@ async fn run(args: Args) -> Result<i32> {
                 name: r.name.clone(),
                 owner_hex: r.owner_hex.clone(),
                 owner_nsec: r.owner_nsec.clone(),
+                owner_auth_tag: auth_tag.clone(),
                 worktree: r.worktree.clone(),
                 url: r.clone_url.clone(),
             });
@@ -450,11 +605,7 @@ async fn run(args: Args) -> Result<i32> {
         }
     }
 
-    println!(
-        "{}",
-        serde_json::json!({"phase": "ready", "identities": expected})
-    );
-    let _ = std::io::stdout().flush();
+    emit(&serde_json::json!({"phase": "ready", "identities": expected}));
 
     let mut join_err = false;
     for t in tasks {
@@ -516,6 +667,48 @@ async fn main() {
         Err(e) => {
             eprintln!("tenant_sim: {e:#}");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shipped_profile() -> Profile {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../perf/profiles/10h-20a.toml");
+        load_profile(&path).expect("load 10h-20a")
+    }
+
+    #[test]
+    fn nip_oa_agents_are_not_direct_relay_members() {
+        let mut profile = shipped_profile();
+        assert!(profile.agent.nip_oa);
+        let pop = generate_population(&profile);
+        let direct: Vec<&str> = direct_members(&profile, &pop)
+            .iter()
+            .map(|r| r.role.as_str())
+            .collect();
+        assert_eq!(direct.len(), pop.humans.len());
+        assert!(direct.iter().all(|role| *role == "human"));
+
+        profile.agent.nip_oa = false;
+        assert_eq!(
+            direct_members(&profile, &pop).len(),
+            pop.humans.len() + pop.agents.len()
+        );
+    }
+
+    #[test]
+    fn every_agent_has_an_attesting_owner() {
+        let profile = shipped_profile();
+        let pop = generate_population(&profile);
+        for agent in &pop.agents {
+            let owner = owner_of(&pop, agent).expect("owner");
+            let keys = pop.keys_of(agent).expect("keys");
+            let tag = nip_oa_json(&owner, &keys).expect("tag");
+            buzz_sdk::nip_oa::verify_auth_tag(&tag, &keys.public_key()).expect("verifies");
         }
     }
 }

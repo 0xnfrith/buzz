@@ -160,11 +160,35 @@ fn auth_header(event: &nostr::Event) -> String {
     )
 }
 
+/// One Blossom `PUT`. An agent that is admitted through its owner (NIP-OA)
+/// rather than as a direct relay member must carry its credential in
+/// `x-auth-tag`, or the relay refuses the upload.
+fn upload_request(
+    http: &reqwest::Client,
+    url: &str,
+    authorization: &str,
+    sha: &str,
+    body: Vec<u8>,
+    auth_tag: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let req = http
+        .put(url)
+        .header("Authorization", authorization)
+        .header("Content-Type", "image/jpeg")
+        .header("X-SHA-256", sha)
+        .body(body);
+    match auth_tag {
+        Some(tag) => req.header("x-auth-tag", tag),
+        None => req,
+    }
+}
+
 pub async fn upload(
     http: &reqwest::Client,
     http_url: &str,
     keys: &Keys,
     body: Vec<u8>,
+    auth_tag: Option<&str>,
 ) -> Result<UploadResult> {
     // Fleet image rejects application/octet-stream, invalid JPEGs, and any
     // COM/APP metadata channel. Encode the incompressible payload as a
@@ -181,12 +205,7 @@ pub async fn upload(
     let mut last_err = anyhow!("media upload failed");
     for (i, url) in paths.iter().enumerate() {
         let start = Instant::now();
-        let resp = http
-            .put(url)
-            .header("Authorization", &header)
-            .header("Content-Type", "image/jpeg")
-            .header("X-SHA-256", &sha)
-            .body(body.clone())
+        let resp = upload_request(http, url, &header, &sha, body.clone(), auth_tag)
             .send()
             .await;
         match resp {
@@ -216,6 +235,40 @@ pub async fn upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_upload_carries_its_nip_oa_tag() {
+        let http = reqwest::Client::new();
+        let tag = "[\"auth\",\"owner\",\"\",\"sig\"]";
+        let agent = upload_request(
+            &http,
+            "http://127.0.0.1:9/media/upload",
+            "Nostr x",
+            "ab",
+            vec![1],
+            Some(tag),
+        )
+        .build()
+        .expect("request");
+        assert_eq!(
+            agent
+                .headers()
+                .get("x-auth-tag")
+                .and_then(|v| v.to_str().ok()),
+            Some(tag)
+        );
+        let human = upload_request(
+            &http,
+            "http://127.0.0.1:9/media/upload",
+            "Nostr x",
+            "ab",
+            vec![1],
+            None,
+        )
+        .build()
+        .expect("request");
+        assert!(human.headers().get("x-auth-tag").is_none());
+    }
 
     #[test]
     fn canonical_jpeg_is_jfif_without_com() {

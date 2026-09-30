@@ -20,6 +20,7 @@ import statistics
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -34,6 +35,15 @@ COMPOSE_FILES = (
     "docker-compose.harness.yml",
     "docker-compose.harness.relay.yml",
 )
+# Relay per-key limits raised for setup only (provisioning and seed). The
+# owner authenticates as a human, so setup hits the human limits first.
+# Measured bands always run with these unset: the relay's own defaults.
+RATE_LIMIT_VARS = (
+    "BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN",
+    "BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC",
+    "BUZZ_RATE_LIMIT_AGENT_STANDARD_MESSAGES_PER_MIN",
+)
+DEFAULT_SETUP_RATE_LIMIT = 1_000_000
 HISTOGRAM_BASES = (
     "buzz_db_pool_acquire_duration_seconds",
     "buzz_event_processing_seconds",
@@ -72,6 +82,41 @@ def run(
         env=env,
         timeout=timeout,
     )
+
+
+def child_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Env for tenant_sim: the caller's own Buzz/Nostr credentials removed.
+
+    tenant_sim authenticates only with the keys it generates. A `BUZZ_*` or
+    `NOSTR_*` value inherited from the operator's shell (for example an
+    agent's `BUZZ_AUTH_TAG`) would otherwise reach the git credential helper.
+    """
+    src = os.environ if env is None else env
+    return {
+        k: v for k, v in src.items() if not (k.startswith("BUZZ_") or k.startswith("NOSTR_"))
+    }
+
+
+def raised_limit_env(limit: int) -> dict[str, str]:
+    """Env that lifts the relay's per-key limits to `limit` for setup."""
+    if limit <= 0:
+        return {}
+    return {name: str(limit) for name in RATE_LIMIT_VARS}
+
+
+def without_limit_env(env: dict[str, str]) -> dict[str, str]:
+    """Copy of `env` with every rate-limit override removed (relay defaults)."""
+    return {k: v for k, v in env.items() if k not in RATE_LIMIT_VARS}
+
+
+def rate_limit_overrides(container_env: list[str]) -> dict[str, str]:
+    """Rate-limit overrides present in a container's `Config.Env` list."""
+    out: dict[str, str] = {}
+    for item in container_env:
+        name, sep, value = item.partition("=")
+        if sep and name in RATE_LIMIT_VARS:
+            out[name] = value
+    return out
 
 
 def percentile(xs: list[float], p: float) -> float:
@@ -359,7 +404,8 @@ class ComposeAdapter:
     ) -> None:
         self.project = project
         self.files = files
-        self.env = {**os.environ, **(env or {})}
+        # Never inherit rate-limit overrides from the caller's shell.
+        self.env = without_limit_env({**os.environ, **(env or {})})
 
     def cmd(self, *args: str) -> list[str]:
         out = ["docker", "compose", "-p", self.project]
@@ -371,8 +417,33 @@ class ComposeAdapter:
     def reset(self) -> None:
         run(self.cmd("down", "-v"), check=False, env=self.env, capture=True)
 
-    def up(self) -> None:
-        run(self.cmd("up", "-d"), check=True, env=self.env, capture=True)
+    def up(self, extra_env: dict[str, str] | None = None) -> None:
+        env = {**self.env, **(extra_env or {})}
+        run(self.cmd("up", "-d"), check=True, env=env, capture=True)
+
+    def recreate_relay_cmd(self) -> list[str]:
+        return self.cmd("up", "-d", "--no-deps", "--force-recreate", "relay")
+
+    def recreate_relay(self) -> None:
+        """Restart the relay alone with the relay's default rate limits.
+
+        Same keys and owner as setup (self.env); backing services and their
+        data are untouched.
+        """
+        run(self.recreate_relay_cmd(), check=True, env=self.env, capture=True)
+
+    def relay_rate_limit_overrides(self) -> dict[str, str]:
+        proc = run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .Config.Env}}",
+                f"{self.project}-relay-1",
+            ],
+            check=True,
+        )
+        return rate_limit_overrides(json.loads(proc.stdout or "[]") or [])
 
     def wait_ready(self, health_url: str, timeout_s: int = 180) -> None:
         deadline = time.time() + timeout_s
@@ -636,23 +707,17 @@ class Sampler:
 
 
 def load_profile_meta(path: Path) -> tuple[str, str, dict[str, int]]:
-    text = path.read_text()
-    name = "unknown"
+    """Profile name, file hash and band lengths, parsed as real TOML.
+
+    tenant_sim parses the same file with a TOML parser; any other reading
+    here would let the two disagree on how long each band lasts.
+    """
+    data = tomllib.loads(path.read_text())
+    name = str((data.get("profile") or {}).get("name", "unknown"))
     bands = {"warmup": 120, "floor": 600, "steady": 900, "peak": 300, "cooldown": 60}
-    section = None
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped.strip("[]")
-            continue
-        if "=" not in stripped or stripped.startswith("#"):
-            continue
-        key, _, val = stripped.partition("=")
-        key, val = key.strip(), val.strip().strip('"')
-        if section == "profile" and key == "name":
-            name = val
-        if section == "bands" and key in bands:
-            bands[key] = int(val.split()[0])
+    for key, val in (data.get("bands") or {}).items():
+        if key in bands:
+            bands[key] = int(val)
     return name, sha256_file(path), bands
 
 
@@ -697,27 +762,34 @@ def read_stdout_line(proc: subprocess.Popen[Any], timeout_s: float) -> str:
         leftover[0] += chunk
 
 
-def wait_ready_line(proc: subprocess.Popen[Any], timeout_s: float = 300) -> None:
+def wait_phase_line(
+    proc: subprocess.Popen[Any], phase: str, timeout_s: float
+) -> dict[str, Any]:
+    """Return tenant_sim's next `{"phase": <phase>, ...}` stdout line."""
     deadline = time.monotonic() + timeout_s
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError("timed out waiting for tenant_sim ready")
+            raise RuntimeError(f"timed out waiting for tenant_sim {phase}")
         try:
             line = read_stdout_line(proc, remaining)
         except TimeoutError as exc:
-            raise RuntimeError("timed out waiting for tenant_sim ready") from exc
+            raise RuntimeError(f"timed out waiting for tenant_sim {phase}") from exc
         if not line:
             if proc.poll() is not None:
-                raise RuntimeError(f"tenant_sim exited {proc.returncode} before ready")
+                raise RuntimeError(f"tenant_sim exited {proc.returncode} before {phase}")
             continue
         line = line.strip()
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if obj.get("phase") == "ready":
-            return
+        if isinstance(obj, dict) and obj.get("phase") == phase:
+            return obj
+
+
+def wait_ready_line(proc: subprocess.Popen[Any], timeout_s: float = 300) -> None:
+    wait_phase_line(proc, "ready", timeout_s)
 
 
 def collect_summary(proc: subprocess.Popen[Any], timeout_s: float = 120) -> dict[str, Any]:
@@ -959,7 +1031,9 @@ def write_results_line(
     samples: list[dict[str, Any]],
     summary: dict[str, Any],
     notes: str,
+    setup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    setup = setup or {}
     floor = band_stats(samples, "floor", client_from_summary(summary, "floor"))
     steady = band_stats(samples, "steady", client_from_summary(summary, "steady"))
     peak = band_stats(samples, "peak", client_from_summary(summary, "peak"))
@@ -999,7 +1073,12 @@ def write_results_line(
             "replica_count": 1,
             "drain_jitter_ms": 0,
             "max_wal_size_mb": 1024,
+            # Limits raised for provisioning/seed only; 0 = never raised.
+            "setup_rate_limit": setup.get("rate_limit", 0),
+            # What the measured bands ran under, read back from the relay.
+            "band_rate_limits": setup.get("band_rate_limits"),
         },
+        "setup": setup.get("provision"),
         "bands": {"floor": floor, "steady": steady, "peak": peak},
         "totals": {
             "events": totals_events,
@@ -1109,6 +1188,41 @@ def cmd_sample(args: argparse.Namespace) -> int:
     return 0
 
 
+def sim_env(args: argparse.Namespace, profile_path: Path) -> tuple[dict[str, str], str]:
+    """Env for the compose relay: image pin, seeded owner, fresh per-run keys."""
+    env = os.environ.copy()
+    image = args.buzz_image or env.get("BUZZ_IMAGE", "ghcr.io/block/buzz:sha-6e5c462")
+    env["BUZZ_IMAGE"] = image
+    print_owner = run(
+        [args.tenant_sim, "--print-owner", "--profile", str(profile_path)], env=child_env()
+    )
+    env["SIM_OWNER_PUBKEY"] = print_owner.stdout.strip()
+    env["SIM_RELAY_KEY"] = run(["openssl", "rand", "-hex", "32"]).stdout.strip()
+    env["SIM_GIT_HMAC"] = run(["openssl", "rand", "-hex", "32"]).stdout.strip()
+    return env, image
+
+
+def resolve_setup_rate_limit(args: argparse.Namespace) -> int:
+    """Setup-only rate limit: raised on compose runs that own the stack.
+
+    Raising needs a relay restart before the measured bands, which only the
+    compose adapter can do, and only when this run brought the stack up.
+    """
+    limit = args.setup_rate_limit
+    owns_stack = args.substrate == "compose" and not args.skip_reset
+    if limit is None:
+        return DEFAULT_SETUP_RATE_LIMIT if owns_stack else 0
+    if limit < 0:
+        raise SystemExit("--setup-rate-limit must be >= 0")
+    if limit and not owns_stack:
+        raise SystemExit(
+            "--setup-rate-limit needs --substrate compose without --skip-reset "
+            "(the relay is restarted with default limits before the bands); "
+            "pass --setup-rate-limit 0"
+        )
+    return limit
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     profile_path = Path(args.profile)
     name, profile_sha, bands = load_profile_meta(profile_path)
@@ -1116,14 +1230,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     samples_path = out_dir / "samples.jsonl"
 
-    env = os.environ.copy()
-    image = args.buzz_image or env.get("BUZZ_IMAGE", "ghcr.io/block/buzz:sha-6e5c462")
-    env["BUZZ_IMAGE"] = image
+    setup_limit = resolve_setup_rate_limit(args)
+    env, image = sim_env(args, profile_path)
     tenant_sim = args.tenant_sim
-    print_owner = run([tenant_sim, "--print-owner", "--profile", str(profile_path)])
-    env["SIM_OWNER_PUBKEY"] = print_owner.stdout.strip()
-    env["SIM_RELAY_KEY"] = run(["openssl", "rand", "-hex", "32"]).stdout.strip()
-    env["SIM_GIT_HMAC"] = run(["openssl", "rand", "-hex", "32"]).stdout.strip()
 
     notes: list[str] = []
     if args.substrate == "compose":
@@ -1162,7 +1271,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     with RunSession(adapter, keep=args.keep) as session:
         if not args.skip_reset:
             adapter.reset()
-            adapter.up()
+            adapter.up(raised_limit_env(setup_limit))
         adapter.wait_ready(args.health_url)
 
         sim_cmd = [
@@ -1184,15 +1293,43 @@ def cmd_run(args: argparse.Namespace) -> int:
         ]
         if args.blink:
             sim_cmd.append("--blink")
+        if setup_limit:
+            sim_cmd.append("--pause-after-setup")
         proc = subprocess.Popen(
             sim_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,
             bufsize=0,
+            env=child_env(),
         )
         session.proc = proc
-        wait_ready_line(proc)
+        setup_line = wait_phase_line(proc, "setup-done", args.setup_timeout)
+        setup: dict[str, Any] = {
+            "rate_limit": setup_limit,
+            "provision": setup_line.get("provision"),
+        }
+        if setup_limit:
+            # Measured bands run at the relay's default limits: restart the
+            # relay alone before any identity connects.
+            adapter.recreate_relay()
+            adapter.wait_ready(args.health_url)
+            notes.append(
+                f"setup rate limits raised to {setup_limit}; relay restarted "
+                "with default limits before the population connected"
+            )
+        if args.substrate == "compose":
+            overrides = adapter.relay_rate_limit_overrides()
+            if overrides:
+                raise RuntimeError(
+                    f"relay still has rate-limit overrides before the bands: {sorted(overrides)}"
+                )
+            setup["band_rate_limits"] = "relay-default"
+        if setup_limit:
+            assert proc.stdin is not None
+            proc.stdin.write(b"continue\n")
+            proc.stdin.flush()
+        wait_ready_line(proc, args.ready_timeout)
 
         sampler = Sampler(execs, args.metrics_url, services)
         samples: list[dict[str, Any]] = []
@@ -1252,6 +1389,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             samples=samples,
             summary=summary,
             notes="; ".join(notes),
+            setup=setup,
         )
         errors = acceptance_errors(line, summary, proc.returncode)
         print(
@@ -1276,6 +1414,126 @@ def cmd_run(args: argparse.Namespace) -> int:
         if proc.returncode not in (0, None):
             return proc.returncode
         return 0
+
+
+def seed_snapshot(sampler: "Sampler") -> dict[str, Any]:
+    """Relay-side counters bracketing a seed: stored rows, WAL and CPU."""
+    stored = sampler.psql("select count(*) from events;")
+    lsn = sampler.psql("select pg_current_wal_lsn();")
+    db = sampler.psql("select pg_database_size('buzz');")
+    metrics = fetch_metrics(sampler.metrics_url) or {}
+    return {
+        "t": time.time(),
+        "stored_rows": int(stored.strip()) if stored and stored.strip() else None,
+        "wal_lsn_bytes": lsn_to_bytes(lsn) if lsn else None,
+        "db_size_bytes": int(db.strip()) if db and db.strip() else None,
+        "events_stored_total": metrics.get("events_stored_total"),
+        "relay_usage_usec": sampler.execs.cgroup(sampler.services["relay"])["usage_usec"],
+        "postgres_usage_usec": sampler.execs.cgroup(sampler.services["postgres"])["usage_usec"],
+    }
+
+
+def seed_bench_result(
+    limits: str,
+    client: dict[str, Any],
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Acked rate from the client; stored rate, WAL and CPU from the relay."""
+    dt = max(float(after["t"]) - float(before["t"]), 1e-9)
+
+    def delta(key: str) -> float | None:
+        a, b = after.get(key), before.get(key)
+        if a is None or b is None:
+            return None
+        return float(a) - float(b)
+
+    stored = delta("stored_rows")
+    wal = delta("wal_lsn_bytes")
+    db = delta("db_size_bytes")
+    relay_cpu = delta("relay_usage_usec")
+    pg_cpu = delta("postgres_usage_usec")
+    return {
+        "limits": limits,
+        "client": client,
+        "acked_per_s": client.get("acked_per_s"),
+        "stored_rows": int(stored) if stored is not None else None,
+        "stored_per_s": (stored / dt) if stored is not None else None,
+        "window_s": dt,
+        "wal_bytes_per_stored": (wal / stored) if wal is not None and stored else None,
+        "db_bytes_per_stored": (db / stored) if db is not None and stored else None,
+        "relay_cores": (relay_cpu / 1e6 / dt) if relay_cpu is not None else None,
+        "postgres_cores": (pg_cpu / 1e6 / dt) if pg_cpu is not None else None,
+    }
+
+
+def cmd_seed_bench(args: argparse.Namespace) -> int:
+    """Measure seed throughput on a fresh compose stack: no bands, no results line."""
+    if args.substrate != "compose":
+        raise SystemExit("seed-bench supports --substrate compose only")
+    profile_path = Path(args.profile)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    env, image = sim_env(args, profile_path)
+    limit = DEFAULT_SETUP_RATE_LIMIT if args.limits == "raised" else 0
+    adapter = ComposeAdapter(args.compose_project, tuple(args.compose_files.split(",")), env)
+    execs = ExecAdapter(kind="compose", project=args.compose_project)
+    sampler = Sampler(
+        execs,
+        args.metrics_url,
+        {"relay": "relay", "postgres": "postgres", "redis": "redis", "minio": "minio"},
+    )
+    with RunSession(adapter, keep=args.keep) as session:
+        adapter.reset()
+        adapter.up(raised_limit_env(limit))
+        adapter.wait_ready(args.health_url)
+        overrides = adapter.relay_rate_limit_overrides()
+        expected = raised_limit_env(limit)
+        if overrides != expected:
+            raise RuntimeError(f"relay rate-limit env {overrides} != expected {expected}")
+        proc = subprocess.Popen(
+            [
+                args.tenant_sim,
+                "--profile",
+                str(profile_path),
+                "--relay-url",
+                args.relay_url,
+                "--http-url",
+                args.http_url,
+                "--out-dir",
+                str(out_dir),
+                "--git-credential-helper",
+                str(Path(args.git_credential_helper).resolve()),
+                "--seed-events",
+                str(args.seed_events),
+                "--seed-max-seconds",
+                str(args.seed_max_seconds),
+                "--setup-only",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            bufsize=0,
+            env=child_env(),
+        )
+        session.proc = proc
+        wait_phase_line(proc, "seed-start", args.setup_timeout)
+        before = seed_snapshot(sampler)
+        done = wait_phase_line(proc, "seed-done", args.seed_max_seconds + 120)
+        after = seed_snapshot(sampler)
+        setup_line = wait_phase_line(proc, "setup-done", 60)
+        try:
+            code = proc.wait(timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("tenant_sim did not exit after setup") from exc
+        result = seed_bench_result(args.limits, done.get("seed") or {}, before, after)
+        result["buzz_image"] = resolve_buzz_identity(image)[1]
+        result["relay_rate_limit_env"] = overrides
+        result["provision"] = setup_line.get("provision")
+        result["tenant_sim_exit"] = code
+        (out_dir / "seed_bench.json").write_text(json.dumps(result, indent=2))
+        print(json.dumps(result))
+        return 0 if code == 0 else 1
 
 
 def acceptance_errors(
@@ -1379,6 +1637,17 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--redis-target", default="sts/buzz-redis")
         sp.add_argument("--minio-target", default="deploy/buzz-minio")
         sp.add_argument("--blink", action="store_true")
+        sp.add_argument(
+            "--setup-rate-limit",
+            type=int,
+            default=None,
+            help=(
+                "per-key rate limit for provisioning/seed only (compose; default "
+                f"{DEFAULT_SETUP_RATE_LIMIT}, 0 = relay defaults throughout)"
+            ),
+        )
+        sp.add_argument("--setup-timeout", type=int, default=900)
+        sp.add_argument("--ready-timeout", type=int, default=300)
 
     run_p = sub.add_parser("run")
     add_common(run_p)
@@ -1390,6 +1659,11 @@ def build_parser() -> argparse.ArgumentParser:
     blink = sub.add_parser("blink")
     add_common(blink)
     blink.add_argument("--rollout", default="")
+    bench = sub.add_parser("seed-bench")
+    add_common(bench)
+    bench.add_argument("--limits", choices=("default", "raised"), required=True)
+    bench.add_argument("--seed-events", type=int, default=20000)
+    bench.add_argument("--seed-max-seconds", type=int, default=300)
     return p
 
 
@@ -1403,6 +1677,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_blink(args)
     if args.cmd == "run":
         return cmd_run(args)
+    if args.cmd == "seed-bench":
+        return cmd_seed_bench(args)
     raise SystemExit(f"unknown command {args.cmd}")
 
 

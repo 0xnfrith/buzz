@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use super::git::{self, GitRepo};
 use super::kinds;
 use super::media;
-use super::profile::Profile;
+use super::profile::{Profile, Rates};
 use super::roles::{
     in_active_window, next_any_wait, pick_action, rng_f64, rng_usize, scaled_rates, Band, Role,
 };
@@ -142,9 +142,48 @@ pub fn load_population(path: &Path) -> Result<Population> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+/// An agent's NIP-OA credential JSON (`["auth", owner, conditions, sig]`),
+/// signed by its owner with no conditions. HTTP paths carry it as-is:
+/// `x-auth-tag` for media, `BUZZ_AUTH_TAG` for the git credential helper.
+pub fn nip_oa_json(owner: &Keys, agent: &Keys) -> Result<String> {
+    Ok(nip_oa::compute_auth_tag(owner, &agent.public_key(), "")?)
+}
+
 pub fn nip_oa_tag(owner: &Keys, agent: &Keys) -> Result<Tag> {
-    let json = nip_oa::compute_auth_tag(owner, &agent.public_key(), "")?;
-    Ok(nip_oa::parse_auth_tag(&json)?)
+    Ok(nip_oa::parse_auth_tag(&nip_oa_json(owner, agent)?)?)
+}
+
+/// Multiplier on an agent's `git_push` rate. Only a repo's owner can push to
+/// it, and there are usually far fewer repos than agents. The profile's rate
+/// is per agent, so the owners carry the whole population's pushes and every
+/// other agent pushes none; total push volume stays what the profile says.
+pub fn git_push_scale(agents: u32, owners: usize, owns_repo: bool) -> f64 {
+    if !owns_repo || owners == 0 {
+        return 0.0;
+    }
+    f64::from(agents) / owners as f64
+}
+
+/// Newest received event that lives in a channel. Events from the `#p`
+/// stream (DMs, turn metrics) have no channel; a reaction to one carries an
+/// empty `h` tag, which no client sends and the relay stores without an OK.
+fn reaction_target(seen: &VecDeque<(String, String)>) -> Option<(String, String)> {
+    seen.iter().rev().find(|(_, ch)| !ch.is_empty()).cloned()
+}
+
+/// The band to move to, if the signal changed. Once the signal reader exits
+/// the channel is closed and tokio's `has_changed` returns an error even when
+/// an unseen value is waiting; the last value sent (normally `Stop`) still
+/// stands and must be acted on, or the identity never stops.
+pub fn next_band(rx: &mut watch::Receiver<Band>, current: Band) -> Option<Band> {
+    match rx.has_changed() {
+        Ok(true) => Some(*rx.borrow_and_update()),
+        Ok(false) => None,
+        Err(_) => {
+            let last = *rx.borrow_and_update();
+            (last != current).then_some(last)
+        }
+    }
 }
 
 fn unix_now() -> u64 {
@@ -269,6 +308,10 @@ struct Session {
     keys: Keys,
     role: Role,
     oa_owner: Option<Keys>,
+    /// This agent's NIP-OA credential JSON for HTTP (media); `None` for humans.
+    auth_tag: Option<String>,
+    /// See [`git_push_scale`].
+    git_push_scale: f64,
     profile: Arc<Profile>,
     world: Arc<World>,
     stats: Arc<Stats>,
@@ -285,6 +328,12 @@ struct Session {
 }
 
 impl Session {
+    fn rates(&self, band: Band) -> Rates {
+        let mut rates = scaled_rates(&self.profile, self.role, band);
+        rates.git_push *= self.git_push_scale;
+        rates
+    }
+
     fn sub_kinds(&self) -> Vec<u16> {
         let k = &self.profile.kinds;
         vec![
@@ -345,6 +394,9 @@ impl Session {
                     self.stats
                         .record_send(band.as_str(), kind, ok.accepted, &ok.message, ms);
                 }
+                if !ok.accepted {
+                    warn!("{} kind {kind} rejected: {}", self.rec.name, ok.message);
+                }
                 if ok.accepted && kind == self.profile.kinds.msg {
                     let ch = tag_value(&event, "h").unwrap_or_default();
                     self.own.push_back((ok.event_id.clone(), ch));
@@ -359,6 +411,7 @@ impl Session {
                     self.stats
                         .record_send(band.as_str(), kind, false, &e.to_string(), 0.0);
                 }
+                warn!("{} kind {kind} send failed: {e}", self.rec.name);
                 false
             }
         }
@@ -389,7 +442,7 @@ impl Session {
     }
 
     async fn act(&mut self, client: &mut BuzzTestClient, band: Band) -> Result<()> {
-        let rates = scaled_rates(&self.profile, self.role, band);
+        let rates = self.rates(band);
         let Some(action) = pick_action(&rates, &mut self.rng) else {
             return Ok(());
         };
@@ -418,7 +471,7 @@ impl Session {
                 .await?;
             }
             "reaction" => {
-                if let Some((id, target_ch)) = self.seen.back().cloned() {
+                if let Some((id, target_ch)) = reaction_target(&self.seen) {
                     self.send_channel(client, band, |seq| {
                         kinds::reaction(&keys, &k, &target_ch, &id, &name, seq)
                     })
@@ -493,7 +546,15 @@ impl Session {
                 let kb = *super::roles::pick_weighted(&sizes, &weights, &mut self.rng);
                 let mut body = vec![0u8; (kb * 1024) as usize];
                 self.rng.fill(body.as_mut_slice());
-                match media::upload(&self.http, &self.world.http_url, &keys, body).await {
+                match media::upload(
+                    &self.http,
+                    &self.world.http_url,
+                    &keys,
+                    body,
+                    self.auth_tag.as_deref(),
+                )
+                .await
+                {
                     Ok(up) => {
                         self.stats.record_media(true, up.bytes, up.put_ms);
                         let content = format!("media {}", up.url);
@@ -628,12 +689,22 @@ pub async fn run_identity(
     rng_salt: u32,
     ready: mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
+    let auth_tag = match (role, oa_owner.as_ref()) {
+        (Role::Agent, Some(owner)) => Some(nip_oa_json(owner, &keys)?),
+        _ => None,
+    };
+    let git_push_scale = match role {
+        Role::Agent => git_push_scale(profile.agent_count(), world.repos.len(), git_repo.is_some()),
+        Role::Human => 0.0,
+    };
     let mut sess = Session {
         rng: std_rng(profile.seed, rng_salt),
         rec,
         keys,
         role,
         oa_owner,
+        auth_tag,
+        git_push_scale,
         profile,
         world,
         stats,
@@ -695,8 +766,7 @@ pub async fn run_identity(
     let mut blink_closes: Vec<u64> = Vec::new();
 
     loop {
-        if band_rx.has_changed().unwrap_or(false) {
-            let new_band = *band_rx.borrow_and_update();
+        if let Some(new_band) = next_band(&mut band_rx, band) {
             if band.sampled() {
                 sess.gap_recheck(&mut client, band_unix).await;
             }
@@ -737,7 +807,7 @@ pub async fn run_identity(
 
         let active = in_active_window(sess.role, band, band_started.elapsed(), &sess.profile);
         if Instant::now() >= next_action {
-            let rates = scaled_rates(&sess.profile, sess.role, band);
+            let rates = sess.rates(band);
             if band == Band::Floor || active || rates.presence > 0.0 {
                 if band == Band::Floor {
                     let ev = kinds::presence(&sess.keys, &sess.profile.kinds)?;
@@ -818,6 +888,51 @@ pub fn uuid_v4(rng: &mut StdRng) -> uuid::Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_owners_carry_the_populations_pushes() {
+        // 20 agents, 2 repos: each owner pushes at 10x the per-agent rate.
+        assert_eq!(git_push_scale(20, 2, true), 10.0);
+        assert_eq!(git_push_scale(20, 2, false), 0.0);
+        assert_eq!(git_push_scale(20, 0, true), 0.0);
+        let total = 2.0 * git_push_scale(20, 2, true) + 18.0 * git_push_scale(20, 2, false);
+        assert_eq!(total, 20.0);
+    }
+
+    #[test]
+    fn reactions_target_channel_events_only() {
+        let mut seen = VecDeque::new();
+        seen.push_back(("chan-msg".to_string(), "chan-a".to_string()));
+        // Newest is a #p event (DM or turn metric): no channel.
+        seen.push_back(("p-event".to_string(), String::new()));
+        assert_eq!(
+            reaction_target(&seen),
+            Some(("chan-msg".to_string(), "chan-a".to_string()))
+        );
+        let only_p: VecDeque<_> = [("p-event".to_string(), String::new())].into();
+        assert_eq!(reaction_target(&only_p), None);
+    }
+
+    #[test]
+    fn stop_is_seen_after_the_band_reader_exits() {
+        let (tx, mut rx) = watch::channel(Band::Cooldown);
+        tx.send(Band::Stop).expect("send stop");
+        drop(tx);
+        // What the loop used to check: a closed channel reads as "no change",
+        // so no identity ever saw Stop and tenant_sim never exited.
+        assert!(!rx.has_changed().unwrap_or(false));
+        assert_eq!(next_band(&mut rx, Band::Cooldown), Some(Band::Stop));
+        assert_eq!(next_band(&mut rx, Band::Stop), None);
+    }
+
+    #[test]
+    fn open_channel_reports_each_change_once() {
+        let (tx, mut rx) = watch::channel(Band::Warmup);
+        assert_eq!(next_band(&mut rx, Band::Warmup), None);
+        tx.send(Band::Floor).expect("send floor");
+        assert_eq!(next_band(&mut rx, Band::Warmup), Some(Band::Floor));
+        assert_eq!(next_band(&mut rx, Band::Floor), None);
+    }
 
     #[test]
     fn warmup_eose_timeout_propagates() {

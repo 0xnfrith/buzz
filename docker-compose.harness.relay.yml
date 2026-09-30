@@ -39,6 +39,12 @@ services:
       BUZZ_RELAY_PRIVATE_KEY: ${SIM_RELAY_KEY:?missing_SIM_RELAY_KEY}
       BUZZ_GIT_HOOK_HMAC_SECRET: ${SIM_GIT_HMAC:?missing_SIM_GIT_HMAC}
       BUZZ_STORAGE_METRICS: "off"
+      # Pass-through with no value: set only while tenant_cogs.py raises the
+      # per-key limits for setup. Unset in the shell = absent in the
+      # container = the relay's default limits.
+      BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN:
+      BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC:
+      BUZZ_RATE_LIMIT_AGENT_STANDARD_MESSAGES_PER_MIN:
     ports:
       - "3030:3030"
       - "8088:8088"
