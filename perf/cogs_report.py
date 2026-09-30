@@ -363,6 +363,14 @@ def render_report(line: dict[str, Any]) -> str:
     out.append(f"- buzz_commit: `{line.get('buzz_commit')}`")
     out.append(f"- profile: `{line.get('profile')}`")
     out.append(f"- image: `{line.get('buzz_image')}`")
+    fp = line.get("machine_fingerprint") or {}
+    emulated = fp.get("emulated") or []
+    if emulated:
+        out.append(
+            f"- **emulated:** {', '.join(emulated)} ran as linux/amd64 on "
+            f"{fp.get('docker_arch')}: media upload times and MinIO CPU are not "
+            "real-speed numbers"
+        )
     out.append("")
     out.append("## Bands")
     out.append("")

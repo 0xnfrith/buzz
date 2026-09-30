@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
+use super::guard::Target;
+
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct GitRepo {
@@ -18,7 +20,8 @@ pub struct GitRepo {
     /// The owner's NIP-OA credential JSON when the owner is an agent.
     pub owner_auth_tag: Option<String>,
     pub worktree: PathBuf,
-    pub url: String,
+    /// The checked remote. Pushes name it explicitly instead of `origin`.
+    pub url: Target,
 }
 
 fn abs_helper(helper: &Path) -> PathBuf {
@@ -49,6 +52,29 @@ fn wait_child_deadline(child: std::process::Child, timeout: Duration) -> Result<
     }
 }
 
+/// Proxy variables git or libcurl would read, in both spellings. Cleared
+/// from git's environment; `http.proxy=` also switches proxying off.
+pub const PROXY_VARS: [&str; 8] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+/// Settings that keep git on the one checked address: no redirects, no
+/// proxy, and only the http(s) transports.
+pub const GIT_GUARD_CONFIG: [&str; 5] = [
+    "http.followRedirects=false",
+    "http.proxy=",
+    "protocol.allow=never",
+    "protocol.http.allow=always",
+    "protocol.https.allow=always",
+];
+
 /// Credential variables the credential helper (or anything it runs) could
 /// pick up from the caller: every `BUZZ_*` and `NOSTR_*` name.
 fn inherited_credentials(vars: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
@@ -63,7 +89,9 @@ fn inherited_credentials(vars: impl IntoIterator<Item = OsString>) -> Vec<OsStri
 /// `git` that authenticates only as this simulated identity. The caller's
 /// own Buzz/Nostr credentials (for example an agent's `BUZZ_AUTH_TAG`) are
 /// removed, then this identity's key and, for an agent, its own NIP-OA tag
-/// are set.
+/// are set. Git follows no redirect and uses no proxy (see
+/// [`GIT_GUARD_CONFIG`]); injected config (`GIT_CONFIG_PARAMETERS`,
+/// `GIT_CONFIG_COUNT`) and proxy variables are removed.
 fn git_command(
     args: &[&str],
     cwd: &Path,
@@ -87,12 +115,19 @@ fn git_command(
         "user.name=tenant-sim",
         "-c",
         "user.email=tenant-sim@example.com",
-    ])
-    .args(args)
-    .current_dir(cwd)
-    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-    .env("GIT_CONFIG_NOSYSTEM", "1")
-    .env_remove("GIT_CONFIG_COUNT");
+    ]);
+    for setting in GIT_GUARD_CONFIG {
+        cmd.args(["-c", setting]);
+    }
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS");
+    for name in PROXY_VARS {
+        cmd.env_remove(name);
+    }
     for name in inherited_credentials(inherited) {
         cmd.env_remove(name);
     }
@@ -136,8 +171,10 @@ fn git_ok(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Clone `<http_url>/git/<owner>/<name>`. `http_url` is a checked target,
+/// so git only ever talks to that address.
 pub fn clone_repo(
-    http_url: &str,
+    http_url: &Target,
     owner_hex: &str,
     name: &str,
     dest: &Path,
@@ -145,7 +182,7 @@ pub fn clone_repo(
     nsec: &str,
     auth_tag: Option<&str>,
 ) -> Result<GitRepo> {
-    let url = format!("{http_url}/git/{owner_hex}/{name}");
+    let url = http_url.join(&format!("/git/{owner_hex}/{name}"))?;
     if dest.exists() {
         std::fs::remove_dir_all(dest).ok();
     }
@@ -153,7 +190,7 @@ pub fn clone_repo(
         std::fs::create_dir_all(parent)?;
     }
     git_ok(
-        &["clone", "--quiet", &url, &dest.to_string_lossy()],
+        &["clone", "--quiet", url.as_str(), &dest.to_string_lossy()],
         dest.parent().unwrap_or(Path::new(".")),
         helper,
         nsec,
@@ -190,7 +227,7 @@ pub fn push_blob(repo: &GitRepo, helper: &Path, bytes: &[u8], seq: u64) -> Resul
     );
     let start = Instant::now();
     git_ok(
-        &["push", "--quiet", "origin", "main"],
+        &["push", "--quiet", repo.url.as_str(), "main"],
         &repo.worktree,
         helper,
         &repo.owner_nsec,
@@ -248,6 +285,159 @@ mod tests {
         );
         // A human carries no NIP-OA tag, and never the caller's.
         assert_eq!(env_of(&human, "BUZZ_AUTH_TAG"), Some(None));
+    }
+
+    use crate::sim::guard::testsrv::{self, Server};
+    use crate::sim::guard::{Cidr, TargetGuard};
+
+    /// Loopback allowed, `::1` denied: a 302 to `[::1]` is a redirect to a
+    /// denied address we can still watch.
+    fn guard() -> TargetGuard {
+        TargetGuard::new(
+            vec![Cidr::parse("127.0.0.0/8").expect("allow")],
+            vec![Cidr::parse("::1").expect("deny")],
+        )
+        .expect("guard")
+    }
+
+    const OWNER: &str = "ab";
+    const NSEC: &str = "nsec-test";
+
+    #[test]
+    fn git_carries_the_guard_settings_and_drops_proxy_and_config_vars() {
+        let cmd = git_command(
+            &["push"],
+            Path::new("."),
+            Path::new("/usr/bin/true"),
+            NSEC,
+            None,
+            [],
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for setting in GIT_GUARD_CONFIG {
+            assert!(
+                args.windows(2).any(|w| w[0] == "-c" && w[1] == setting),
+                "missing -c {setting}: {args:?}"
+            );
+        }
+        let push = args.iter().position(|a| a == "push").expect("subcommand");
+        assert!(args[..push]
+            .iter()
+            .any(|a| a == "http.followRedirects=false"));
+        for name in PROXY_VARS
+            .iter()
+            .chain(["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"].iter())
+        {
+            assert_eq!(env_of(&cmd, name), Some(None), "{name} not removed");
+        }
+    }
+
+    /// A 302 from the allowed remote to a denied address is not followed.
+    #[test]
+    fn git_does_not_follow_a_redirect() {
+        let denied = Server::start("[::1]:0", testsrv::status(200, ""));
+        let first = Server::start(
+            "127.0.0.1:0",
+            testsrv::redirect_to(&format!(
+                "{}/git/{OWNER}/r/info/refs?service=git-upload-pack",
+                denied.http()
+            )),
+        );
+        let base = guard()
+            .check_url(&first.http(), &["http"])
+            .expect("allowed");
+        let dir = testsrv::tempdir();
+        let err = clone_repo(
+            &base,
+            OWNER,
+            "r",
+            &dir.join("r"),
+            Path::new("/usr/bin/true"),
+            NSEC,
+            None,
+        )
+        .map(|_| ())
+        .expect_err("a redirect is not a clone");
+        assert!(
+            first.accepts() >= 1,
+            "git never reached the remote: {err:#}"
+        );
+        assert_eq!(denied.accepts(), 0, "git followed the redirect: {err:#}");
+    }
+
+    const GIT_PROXY_CHILD: &str = "sim::git::tests::git_ignores_proxy_variables";
+
+    /// Proxy variables in git's inherited environment are ignored.
+    #[test]
+    fn git_ignores_proxy_variables() {
+        if testsrv::is_child(GIT_PROXY_CHILD) {
+            let target = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+            let base = guard()
+                .check_url(&target.http(), &["http"])
+                .expect("allowed");
+            let dir = testsrv::tempdir();
+            let _ = clone_repo(
+                &base,
+                OWNER,
+                "r",
+                &dir.join("r"),
+                Path::new("/usr/bin/true"),
+                NSEC,
+                None,
+            );
+            assert!(
+                target.accepts() >= 1,
+                "git did not go to the remote directly"
+            );
+            println!("CHILD_OK {GIT_PROXY_CHILD}");
+            return;
+        }
+        let proxy = Server::start("127.0.0.1:0", testsrv::status(502, ""));
+        testsrv::run_child(GIT_PROXY_CHILD, &testsrv::proxy_env(&proxy.http()));
+        assert_eq!(proxy.accepts(), 0, "git used the proxy");
+    }
+
+    /// A push goes to the checked URL, whatever `origin` on disk says.
+    #[test]
+    fn push_goes_to_the_checked_url_not_origin() {
+        let checked = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let elsewhere = Server::start("[::1]:0", testsrv::status(404, ""));
+        let dir = testsrv::tempdir();
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(&wt).expect("mkdir");
+        let helper = Path::new("/usr/bin/true");
+        git_ok(&["init", "--quiet"], &wt, helper, NSEC, None).expect("init");
+        git_ok(
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("{}/git/{OWNER}/r", elsewhere.http()),
+            ],
+            &wt,
+            helper,
+            NSEC,
+            None,
+        )
+        .expect("remote");
+        let url = guard()
+            .check_url(&checked.http(), &["http"])
+            .and_then(|t| t.join(&format!("/git/{OWNER}/r")))
+            .expect("allowed");
+        let repo = GitRepo {
+            name: "r".into(),
+            owner_hex: OWNER.into(),
+            owner_nsec: NSEC.into(),
+            owner_auth_tag: None,
+            worktree: wt,
+            url,
+        };
+        let _ = push_blob(&repo, helper, b"blob", 1);
+        assert!(checked.accepts() >= 1, "push did not reach the checked URL");
+        assert_eq!(elsewhere.accepts(), 0, "push went to origin");
     }
 
     #[test]

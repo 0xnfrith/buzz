@@ -16,6 +16,7 @@ use serde::Serialize;
 use tracing::warn;
 
 use super::admission::{publish, Publish};
+use super::guard::Target;
 use super::identity::{connect_identity, IdentityRecord, Population};
 use super::kinds;
 use super::profile::KindTable;
@@ -57,7 +58,7 @@ pub fn seed_event(keys: &Keys, kinds: &KindTable, channel: &str, i: u64) -> Resu
 
 #[allow(clippy::too_many_arguments)]
 async fn writer(
-    relay_url: String,
+    relay_url: Target,
     rec: IdentityRecord,
     keys: Keys,
     oa_owner: Option<Keys>,
@@ -133,7 +134,7 @@ async fn writer(
 /// Write `target` stored messages across the population, stopping early at
 /// `max`. Agents authenticate with their owner's NIP-OA tag, as in the run.
 pub async fn seed(
-    relay_url: &str,
+    relay_url: &Target,
     pop: &Population,
     kinds: &KindTable,
     channels: &[String],
@@ -154,7 +155,7 @@ pub async fn seed(
             .and_then(|n| pop.humans.iter().find(|h| h.name == *n))
             .and_then(|h| pop.keys_of(h).ok());
         tasks.push(tokio::spawn(writer(
-            relay_url.to_string(),
+            relay_url.clone(),
             rec.clone(),
             keys,
             oa_owner,

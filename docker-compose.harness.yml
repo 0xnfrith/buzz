@@ -42,7 +42,13 @@ services:
       start_period: 5s
 
   minio:
-    image: minio/minio:latest
+    # Block's MinIO image, pinned by digest: MinIO RELEASE.2025-09-07T16-13-09Z
+    # and mc RELEASE.2025-08-13T08-35-41Z from MinIO's checksummed GitHub
+    # release files. MinIO's own Docker Hub images can no longer be pulled
+    # (block/buzz#7880). Its entrypoint is `minio`. linux/amd64 only: on an
+    # arm64 workstation it runs emulated, and the sampler records that.
+    image: ghcr.io/block/buzz-minio@sha256:b8470bbeafbf57b20c86cf63804682b714bdcfdbb517f3770247e321e623f48f
+    platform: linux/amd64
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: buzz_dev
@@ -60,7 +66,9 @@ services:
       start_period: 10s
 
   minio-init:
-    image: minio/mc:latest
+    # Same image; `mc` runs through the /bin/sh entrypoint override below.
+    image: ghcr.io/block/buzz-minio@sha256:b8470bbeafbf57b20c86cf63804682b714bdcfdbb517f3770247e321e623f48f
+    platform: linux/amd64
     depends_on:
       minio:
         condition: service_healthy

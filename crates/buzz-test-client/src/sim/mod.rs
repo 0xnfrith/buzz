@@ -3,6 +3,7 @@
 
 pub mod admission;
 pub mod git;
+pub mod guard;
 pub mod identity;
 pub mod kinds;
 pub mod media;

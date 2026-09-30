@@ -10,6 +10,8 @@ use image::{ExtendedColorType, ImageEncoder};
 use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
 use sha2::{Digest, Sha256};
 
+use super::guard::{HttpClient, Target};
+
 pub struct UploadResult {
     pub url: String,
     pub bytes: u64,
@@ -183,9 +185,12 @@ fn upload_request(
     }
 }
 
+/// `http` comes from [`super::guard::http_client`] and `http_url` from the
+/// target guard: both uploads go to that checked address, with no proxy and
+/// no redirect.
 pub async fn upload(
-    http: &reqwest::Client,
-    http_url: &str,
+    http: &HttpClient,
+    http_url: &Target,
     keys: &Keys,
     body: Vec<u8>,
     auth_tag: Option<&str>,
@@ -198,16 +203,20 @@ pub async fn upload(
     let auth = blossom_auth(keys, &sha)?;
     let header = auth_header(&auth);
     let bytes = body.len() as u64;
-    let paths = [
-        format!("{http_url}/media/upload"),
-        format!("{http_url}/upload"),
-    ];
+    let paths = [http_url.join("/media/upload")?, http_url.join("/upload")?];
     let mut last_err = anyhow!("media upload failed");
     for (i, url) in paths.iter().enumerate() {
         let start = Instant::now();
-        let resp = upload_request(http, url, &header, &sha, body.clone(), auth_tag)
-            .send()
-            .await;
+        let resp = upload_request(
+            http.inner(),
+            url.as_str(),
+            &header,
+            &sha,
+            body.clone(),
+            auth_tag,
+        )
+        .send()
+        .await;
         match resp {
             Ok(resp) => {
                 let status = resp.status();

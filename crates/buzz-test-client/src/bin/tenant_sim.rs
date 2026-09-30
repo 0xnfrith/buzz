@@ -16,6 +16,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sim::admission::{publish, Publish};
 use sim::git;
+use sim::guard::{Target, TargetGuard};
 use sim::identity::{
     connect_identity, generate_population, load_population, nip_oa_json, save_population, uuid_v4,
     IdentityRecord, Population, RepoRef, World,
@@ -43,13 +44,24 @@ struct Args {
     #[arg(long)]
     profile: PathBuf,
 
-    /// Relay WebSocket URL.
-    #[arg(long, default_value = "ws://localhost:3030")]
+    /// Relay WebSocket URL: a literal IP address, never a name.
+    #[arg(long, default_value = "ws://127.0.0.1:3030")]
     relay_url: String,
 
-    /// Relay HTTP URL (media + git).
-    #[arg(long, default_value = "http://localhost:3030")]
+    /// Relay HTTP URL (media + git): a literal IP address, never a name.
+    #[arg(long, default_value = "http://127.0.0.1:3030")]
     http_url: String,
+
+    /// Address block every target must sit inside (repeatable, required for
+    /// a run; no default). IPv4 no wider than /8, IPv6 no wider than /32.
+    #[arg(long = "allow-cidr")]
+    allow_cidr: Vec<String>,
+
+    /// File of addresses and blocks no target may use, one per line; `#`
+    /// comments. Required for a run; the file may be empty. Wins over
+    /// --allow-cidr.
+    #[arg(long)]
+    deny_list: Option<PathBuf>,
 
     /// Run output directory (identities, summary, git worktrees).
     #[arg(long)]
@@ -219,7 +231,7 @@ fn direct_members<'a>(profile: &Profile, pop: &'a Population) -> Vec<&'a Identit
 async fn send_with_retry(
     client: &mut BuzzTestClient,
     keys: &nostr::Keys,
-    relay_url: &str,
+    relay_url: &Target,
     event: nostr::Event,
     what: &str,
     setup: &mut SetupStats,
@@ -242,7 +254,7 @@ async fn send_with_retry(
                 warn!("{what} attempt {attempt}: {e}");
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-                match BuzzTestClient::connect(relay_url, keys).await {
+                match BuzzTestClient::connect(relay_url.as_str(), keys).await {
                     Ok(c) => *client = c,
                     Err(ce) => warn!("reconnect after {what}: {ce}"),
                 }
@@ -252,15 +264,32 @@ async fn send_with_retry(
     Err(last)
 }
 
+/// The run's two checked targets.
+struct Targets {
+    relay: Target,
+    http: Target,
+}
+
+/// Check both targets before anything else happens. A refusal leaves no
+/// output directory and makes no connection.
+fn check_targets(args: &Args) -> Result<Targets> {
+    let guard = TargetGuard::from_args(&args.allow_cidr, args.deny_list.as_deref())?;
+    Ok(Targets {
+        relay: guard.check_url(&args.relay_url, &["ws", "wss"])?,
+        http: guard.check_url(&args.http_url, &["http", "https"])?,
+    })
+}
+
 async fn provision(
     profile: &Profile,
     pop: &Population,
     args: &Args,
+    targets: &Targets,
     stats: &Stats,
     setup: &mut SetupStats,
 ) -> Result<(Vec<String>, Vec<RepoRef>)> {
     let owner_keys = pop.owner_keys()?;
-    let mut owner = BuzzTestClient::connect(&args.relay_url, &owner_keys)
+    let mut owner = BuzzTestClient::connect(targets.relay.as_str(), &owner_keys)
         .await
         .context("owner connect")?;
     if args.require_membership {
@@ -269,7 +298,7 @@ async fn provision(
             let ok = send_with_retry(
                 &mut owner,
                 &owner_keys,
-                &args.relay_url,
+                &targets.relay,
                 ev,
                 &format!("9030 {}", rec.name),
                 setup,
@@ -299,7 +328,7 @@ async fn provision(
         let ok = send_with_retry(
             &mut owner,
             &owner_keys,
-            &args.relay_url,
+            &targets.relay,
             ev,
             &format!("9007 {i}"),
             setup,
@@ -316,7 +345,7 @@ async fn provision(
             match send_with_retry(
                 &mut owner,
                 &owner_keys,
-                &args.relay_url,
+                &targets.relay,
                 ev,
                 &format!("9000 {} {ch}", rec.name),
                 setup,
@@ -346,7 +375,7 @@ async fn provision(
             let name = format!("sim-repo-{i}");
             let ev = kinds::repo_announce(&agent_keys, &profile.kinds, &name, &name, &channels[0])?;
             let mut agent_client =
-                connect_identity(&args.relay_url, agent, &agent_keys, agent_owner.as_ref()).await?;
+                connect_identity(&targets.relay, agent, &agent_keys, agent_owner.as_ref()).await?;
             let ok = agent_client.send_event(ev).await?;
             if !ok.accepted {
                 warn!("30617 {name} rejected: {}", ok.message);
@@ -360,7 +389,7 @@ async fn provision(
                     .map(|p| p.join("git").join(&name))
                     .unwrap_or_else(|| PathBuf::from("git").join(&name));
                 match git::clone_repo(
-                    &args.http_url,
+                    &targets.http,
                     &agent.pubkey,
                     &name,
                     &dest,
@@ -425,6 +454,9 @@ async fn run(args: Args) -> Result<i32> {
         return Ok(0);
     }
 
+    // --print-owner and --check (above) make no connection. Everything
+    // below may, so the targets are checked first.
+    let targets = check_targets(&args)?;
     let out_dir = args
         .out_dir
         .clone()
@@ -445,21 +477,22 @@ async fn run(args: Args) -> Result<i32> {
     let stats = Arc::new(Stats::new());
     let setup_started = Instant::now();
     let mut setup = SetupStats::default();
-    let (channels, repos) = match provision(&profile, &pop, &args, &stats, &mut setup).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("warm-up failed: {e:#}");
-            warn!("warm-up failed: {e:#}");
-            return Ok(3);
-        }
-    };
+    let (channels, repos) =
+        match provision(&profile, &pop, &args, &targets, &stats, &mut setup).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("warm-up failed: {e:#}");
+                warn!("warm-up failed: {e:#}");
+                return Ok(3);
+            }
+        };
     let provision_s = setup_started.elapsed().as_secs_f64();
 
     let mut seed_failed = false;
     if args.seed_events > 0 {
         emit(&serde_json::json!({"phase": "seed-start", "t_unix_ms": kinds::now_ms()}));
         let report = seed::seed(
-            &args.relay_url,
+            &targets.relay,
             &pop,
             &profile.kinds,
             &channels,
@@ -491,8 +524,8 @@ async fn run(args: Args) -> Result<i32> {
     }
 
     let world = Arc::new(World {
-        relay_url: args.relay_url.clone(),
-        http_url: args.http_url.clone(),
+        relay_url: targets.relay.clone(),
+        http_url: targets.http.clone(),
         channels,
         human_pubkeys: pop.humans.iter().map(|h| h.pubkey.clone()).collect(),
         repos,
@@ -629,7 +662,7 @@ async fn run(args: Args) -> Result<i32> {
     let summary = stats.summarize(
         &profile.name,
         profile.seed,
-        &args.relay_url,
+        targets.relay.as_str(),
         profile.humans as u64,
         profile.agent_count() as u64,
         &ends,
@@ -679,6 +712,160 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../perf/profiles/10h-20a.toml");
         load_profile(&path).expect("load 10h-20a")
+    }
+
+    fn shipped_profile_path() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../perf/profiles/10h-20a.toml")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A refused target (a name, an address outside the allow list, a
+    /// deny-listed address) stops the run before any connection and before
+    /// the output directory exists, whichever of the two targets it is.
+    #[tokio::test]
+    async fn a_refused_target_makes_no_connection_and_no_output() {
+        use sim::guard::testsrv::{self, Server};
+        let relay = Server::start("127.0.0.1:0", testsrv::status(400, ""));
+        let http = Server::start("[::1]:0", testsrv::status(400, ""));
+        let (rp, hp) = (relay.addr.port(), http.addr.port());
+        let dir = testsrv::tempdir();
+        let deny_none = dir.join("deny-none");
+        std::fs::write(&deny_none, "").expect("write");
+        let deny_relay = dir.join("deny-relay");
+        std::fs::write(&deny_relay, "127.0.0.1\n").expect("write");
+        let deny_http = dir.join("deny-http");
+        std::fs::write(&deny_http, "::1\n").expect("write");
+        let ok_http = format!("http://127.0.0.1:{hp}");
+        let cases = [
+            (
+                "name",
+                format!("ws://localhost:{rp}"),
+                ok_http.clone(),
+                "127.0.0.0/8",
+                &deny_none,
+                "not a literal IP",
+            ),
+            (
+                "outside",
+                format!("ws://127.0.0.1:{rp}"),
+                ok_http.clone(),
+                "10.0.0.0/8",
+                &deny_none,
+                "outside the allow list",
+            ),
+            (
+                "denied",
+                format!("ws://127.0.0.1:{rp}"),
+                ok_http,
+                "127.0.0.0/8",
+                &deny_relay,
+                "deny list",
+            ),
+            (
+                "http-denied",
+                format!("ws://127.0.0.1:{rp}"),
+                format!("http://[::1]:{hp}"),
+                "127.0.0.0/8",
+                &deny_http,
+                "deny list",
+            ),
+        ];
+        for (name, relay_url, http_url, allow, deny, why) in cases {
+            let out = dir.join(name);
+            let args = Args::try_parse_from([
+                "tenant_sim".to_string(),
+                "--profile".into(),
+                shipped_profile_path(),
+                "--relay-url".into(),
+                relay_url,
+                "--http-url".into(),
+                http_url,
+                "--allow-cidr".into(),
+                allow.into(),
+                "--deny-list".into(),
+                deny.to_string_lossy().into_owned(),
+                "--out-dir".into(),
+                out.to_string_lossy().into_owned(),
+            ])
+            .expect("args");
+            let err = run(args).await.expect_err(name);
+            assert!(format!("{err:#}").contains(why), "{name}: {err:#}");
+            assert!(!out.exists(), "{name}: output directory created");
+        }
+        assert_eq!(relay.accepts(), 0, "relay target contacted");
+        assert_eq!(http.accepts(), 0, "http target contacted");
+    }
+
+    /// A run needs both guard flags; `--check` and `--print-owner` make no
+    /// connection and need neither.
+    #[tokio::test]
+    async fn a_run_needs_both_guard_flags() {
+        let dir = sim::guard::testsrv::tempdir();
+        let base = [
+            "tenant_sim".to_string(),
+            "--profile".into(),
+            shipped_profile_path(),
+        ];
+        let out = dir.join("out").to_string_lossy().into_owned();
+        let no_allow = Args::try_parse_from(
+            base.iter()
+                .cloned()
+                .chain(["--out-dir".into(), out.clone()]),
+        )
+        .expect("args");
+        assert!(
+            format!("{:#}", run(no_allow).await.expect_err("no allow")).contains("--allow-cidr")
+        );
+        let no_deny = Args::try_parse_from(base.iter().cloned().chain([
+            "--allow-cidr".into(),
+            "127.0.0.0/8".into(),
+            "--out-dir".into(),
+            out.clone(),
+        ]))
+        .expect("args");
+        assert!(format!("{:#}", run(no_deny).await.expect_err("no deny")).contains("--deny-list"));
+        assert!(!dir.join("out").exists());
+        for flag in ["--check", "--print-owner"] {
+            let args =
+                Args::try_parse_from(base.iter().cloned().chain([flag.to_string()])).expect("args");
+            assert_eq!(run(args).await.expect(flag), 0);
+        }
+    }
+
+    /// The three example profiles differ only in population and world shape;
+    /// every per-identity rate is the team profile's.
+    #[test]
+    fn example_profiles_share_the_team_rates() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../perf/profiles");
+        let team = shipped_profile();
+        for (file, humans, agents, channels, repos) in [
+            ("1h-5a.toml", 1, 5, 2, 1),
+            ("10h-20a.toml", 10, 20, 6, 2),
+            ("25h-75a.toml", 25, 75, 20, 8),
+        ] {
+            let p = load_profile(&dir.join(file)).expect(file);
+            assert_eq!(
+                (p.humans, p.agent_count(), p.channels, p.repos),
+                (humans, agents, channels, repos),
+                "{file}"
+            );
+            assert_eq!(
+                p.human.rates.entries(),
+                team.human.rates.entries(),
+                "{file}"
+            );
+            assert_eq!(
+                p.agent.rates.entries(),
+                team.agent.rates.entries(),
+                "{file}"
+            );
+            assert!(
+                p.description.contains("provisional until calibration"),
+                "{file}"
+            );
+        }
     }
 
     #[test]

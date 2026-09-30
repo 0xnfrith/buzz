@@ -22,7 +22,8 @@ services:
       BUZZ_BIND_ADDR: 0.0.0.0:3030
       BUZZ_HEALTH_PORT: "8088"
       BUZZ_METRICS_PORT: "9202"
-      RELAY_URL: ws://localhost:3030
+      # The generator connects by literal address, never by name.
+      RELAY_URL: ws://127.0.0.1:3030
       DATABASE_URL: postgres://buzz:buzz_dev@postgres:5432/buzz
       REDIS_URL: redis://redis:6379
       BUZZ_S3_ENDPOINT: http://minio:9000

@@ -1,4 +1,4 @@
-# perf/profiles/10h-20a.toml — "ten humans, twenty agents"
+# perf/profiles/1h-5a.toml — "one human, five agents"
 #
 # A made-up example profile. Every rate below is provisional until
 # calibration: they are the original guesses, per identity. The three example
@@ -7,15 +7,15 @@
 # scaled from the team profile: one channel per 5 identities and one repo per
 # 10 agents, rounded up. Both are provisional too.
 [profile]
-name        = "10h-20a"
-description = "team: 10 humans x 2 agents each; small team with an agent fleet (rates provisional until calibration)"
+name        = "1h-5a"
+description = "solo: 1 human x 5 agents; a founder and their agents (rates provisional until calibration)"
 seed        = 42               # deterministic RNG: same seed = same schedule
 
 [population]
-humans           = 10
-agents_per_human = 2           # → 20 agents, 30 identities total
-channels         = 6           # stream channels; every identity joins all
-repos            = 2           # git repos announced by agents (kind 30617)
+humans           = 1
+agents_per_human = 5           # → 5 agents, 6 identities total
+channels         = 2           # stream channels; every identity joins all
+repos            = 1           # git repos announced by agents (kind 30617)
 
 [bands]                        # seconds
 warmup  = 120                  # connect + provision + first backfill; NOT sampled
