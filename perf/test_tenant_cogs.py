@@ -594,6 +594,42 @@ class TeardownTests(unittest.TestCase):
         self.assertTrue(tenant_cogs.keeps_stack(ns(False, True)))
 
 
+class FloorPipelineTests(unittest.TestCase):
+    """The floor gate reads what tenant_sim reported, through the results line."""
+
+    def line_from(self, summary: dict) -> dict:
+        comp = {"rss": 10, "rss_anon": 5, "usage_usec": 1}
+        metrics = {"ws_connections_active": 30.0, "events_stored_total": 4.0}
+        rows = [
+            {"band": "floor", "sampled": True, "t_unix": t, "metrics": metrics,
+             "relay": comp, "postgres": comp, "redis": comp, "minio": comp}
+            for t in (1, 6)
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            return tenant_cogs.write_results_line(
+                Path(td) / "results.jsonl",
+                run_id="r", substrate="s", buzz_commit="c", buzz_image="i",
+                harness_commit="h", profile="p", profile_sha="x", fingerprint={},
+                samples=rows, summary=summary, notes="",
+            )
+
+    def test_floor_kinds_reach_the_gate(self) -> None:
+        floor = {"sent": 30, "accepted": 30, "rejected": 0, "received": 0,
+                 "sent_by_kind": {"20001": 30}}
+        line = self.line_from({"bands": {"floor": floor}})
+        self.assertEqual(line["bands"]["floor"]["client"]["sent_by_kind"], {"20001": 30})
+        self.assertEqual(line["bands"]["floor"]["relay_metrics"]["events_stored"], 0)
+        self.assertEqual(tenant_cogs.floor_errors(line["bands"]["floor"]), [])
+
+    def test_unreported_kinds_fail_closed(self) -> None:
+        floor = {"sent": 30, "accepted": 30, "rejected": 0, "received": 0}
+        line = self.line_from({"bands": {"floor": floor}})
+        self.assertEqual(
+            tenant_cogs.floor_errors(line["bands"]["floor"]),
+            ["floor client.sent_by_kind missing"],
+        )
+
+
 class ComposeTeardownTests(unittest.TestCase):
     def fake_run(self, leftovers: dict[str, str], calls: list):
         def run(cmd, check=True, capture=True, env=None, timeout=None):

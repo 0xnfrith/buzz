@@ -983,6 +983,9 @@ def client_from_summary(summary: dict[str, Any], band: str) -> dict[str, Any] | 
         "ok_ms": b.get("ok_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
         "fanout_ms": b.get("fanout_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
     }
+    # Left out when tenant_sim did not report it, so the floor gate fails closed.
+    if "sent_by_kind" in b:
+        out["sent_by_kind"] = b["sent_by_kind"]
     if band == "peak":
         storm = {}
         if b.get("storm_backfill_ms"):
