@@ -54,10 +54,15 @@ Every `run` and `seed-bench` brings up its own Compose project,
 `buzz-harness-<run id>`, and prints the name. The run id ends in six random
 hex characters, so two runs started in the same second still differ. Before
 anything touches the project, the run takes an exclusive lock on
-`/tmp/buzz-harness-locks/<project>.lock` and holds it through teardown. A
-second process that asks for the same project refuses (exit 2) before it runs
-any command. The kernel drops the lock when the process exits, so a crash
-leaves no stale lock. Nothing is ever deleted before `up`: the run checks
+`<project>.lock` in a per-user directory, `$XDG_CACHE_HOME/buzz-harness/locks`
+or `~/.cache/buzz-harness/locks`, and holds it through teardown. Processes
+that should exclude each other must agree on `XDG_CACHE_HOME`. A second
+process that asks for the same project refuses (exit 2) before it runs any
+command. The kernel drops the lock when the process exits, so a crash leaves
+no stale lock. The directory is created `0700` and refused unless it is a real
+directory (not a symlink), owned by you, with no group or other access. A lock
+file must be a regular file you own with one link; a symlinked lock file is
+refused. Nothing is ever deleted before `up`: the run checks
 that the project has no container, volume or network, and refuses (exit 2,
 nothing deleted) if it has. `--compose-project`
 overrides the name, but only with one that starts with `buzz-harness-`; any

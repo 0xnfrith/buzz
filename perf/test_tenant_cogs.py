@@ -900,6 +900,111 @@ class ProjectLockTests(unittest.TestCase):
         tenant_cogs.ProjectLock(name).release()
 
 
+class LockDirSafetyTests(unittest.TestCase):
+    """The lock directory and lock files cannot be planted or swapped."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def use_lock_dir(self, path: Path) -> None:
+        patcher = mock.patch.object(tenant_cogs, "LOCK_DIR", path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_default_is_per_user_cache(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/x/cache"}):
+            self.assertEqual(tenant_cogs.default_lock_dir(), Path("/x/cache/buzz-harness/locks"))
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "relative"}):
+            self.assertEqual(
+                tenant_cogs.default_lock_dir(),
+                Path(os.path.expanduser("~")) / ".cache" / "buzz-harness" / "locks",
+            )
+
+    def test_created_0700_under_umask_022(self) -> None:
+        root = self.base / "cache" / "buzz-harness" / "locks"
+        self.use_lock_dir(root)
+        old = os.umask(0o022)
+        try:
+            lock = tenant_cogs.ProjectLock("buzz-harness-umask")
+        finally:
+            os.umask(old)
+        self.addCleanup(lock.release)
+        self.assertEqual(os.stat(root).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(lock.path).st_mode & 0o777, 0o600)
+        self.assertTrue(lock.held)
+
+    def test_directory_symlink_is_refused(self) -> None:
+        target = self.base / "elsewhere"
+        target.mkdir(mode=0o700)
+        root = self.base / "locks"
+        root.symlink_to(target)
+        self.use_lock_dir(root)
+        with self.assertRaisesRegex(tenant_cogs.Refused, "real directory"):
+            tenant_cogs.ProjectLock("buzz-harness-dirlink")
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_group_or_other_access_is_refused(self) -> None:
+        for mode in (0o755, 0o770, 0o701):
+            root = self.base / f"locks-{mode:o}"
+            root.mkdir()
+            os.chmod(root, mode)
+            self.use_lock_dir(root)
+            with self.assertRaisesRegex(tenant_cogs.Refused, "mode 0700", msg=oct(mode)):
+                tenant_cogs.ProjectLock("buzz-harness-mode")
+
+    def test_directory_owned_by_someone_else_is_refused(self) -> None:
+        root = self.base / "locks"
+        root.mkdir(mode=0o700)
+        self.use_lock_dir(root)
+        with mock.patch.object(tenant_cogs.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(tenant_cogs.Refused, "you own"):
+                tenant_cogs.ProjectLock("buzz-harness-owner")
+
+    def test_lock_file_symlink_is_refused(self) -> None:
+        root = self.base / "locks"
+        root.mkdir(mode=0o700)
+        self.use_lock_dir(root)
+        target = self.base / "planted"
+        (root / "buzz-harness-filelink.lock").symlink_to(target)
+        with self.assertRaisesRegex(tenant_cogs.Refused, "cannot open lock file"):
+            tenant_cogs.ProjectLock("buzz-harness-filelink")
+        self.assertFalse(target.exists())
+
+    def test_hard_linked_lock_file_is_refused(self) -> None:
+        root = self.base / "locks"
+        root.mkdir(mode=0o700)
+        self.use_lock_dir(root)
+        path = root / "buzz-harness-hardlink.lock"
+        path.touch()
+        os.link(path, self.base / "second-name")
+        with self.assertRaisesRegex(tenant_cogs.Refused, "one link"):
+            tenant_cogs.ProjectLock("buzz-harness-hardlink")
+
+    def test_path_replacement_leaves_one_holder(self) -> None:
+        # The reviewer's case: lock A, move its file away, put a new file at the
+        # path, lock B. B holds the file at the path; A no longer counts.
+        root = self.base / "locks"
+        self.use_lock_dir(root)
+        first = tenant_cogs.ProjectLock("buzz-harness-swap")
+        self.addCleanup(first.release)
+        os.rename(first.path, root / "moved-away")
+        first.path.touch()
+        second = tenant_cogs.ProjectLock("buzz-harness-swap")
+        self.addCleanup(second.release)
+        self.assertEqual([first.held, second.held], [False, True])
+        stale = tenant_cogs.ComposeAdapter("buzz-harness-swap", ("a.yml",), env={}, lock=first)
+
+        def forbidden(*a, **k):
+            raise AssertionError("no command expected")
+
+        with mock.patch.object(tenant_cogs, "run", forbidden):
+            with self.assertRaisesRegex(RuntimeError, "hold the lock"):
+                stale.up()
+        self.assertFalse(stale.owned)
+
+
 class RefusalTests(unittest.TestCase):
     """Refusals happen before any command runs: no docker, no tenant_sim, no openssl."""
 

@@ -18,6 +18,7 @@ import re
 import secrets
 import select
 import shlex
+import stat
 import statistics
 import subprocess
 import sys
@@ -35,10 +36,20 @@ DEFAULT_CADENCE = 5
 # Every run and seed bench brings up its own Compose project, so nothing ever
 # has to be deleted before `up`. An override must still be a harness project.
 COMPOSE_PROJECT_PREFIX = "buzz-harness-"
+
+
+def default_lock_dir() -> Path:
+    """Per-user lock directory: $XDG_CACHE_HOME (if absolute) or ~/.cache."""
+    cache = os.environ.get("XDG_CACHE_HOME", "")
+    if not os.path.isabs(cache):
+        cache = os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(cache) / "buzz-harness" / "locks"
+
+
 # One exclusive lock per harness project, held from before the empty check
-# until after teardown. A fixed path, so every process on the machine sees the
-# same lock whatever its TMPDIR.
-LOCK_DIR = Path("/tmp/buzz-harness-locks")
+# until after teardown. Fixed per user, so every process of this user sees the
+# same lock whatever its TMPDIR, and no other user shares the directory.
+LOCK_DIR = default_lock_dir()
 COMPOSE_FILES = (
     "docker-compose.harness.yml",
     "docker-compose.harness.relay.yml",
@@ -480,27 +491,68 @@ class ProjectLock:
     def __init__(self, project: str) -> None:
         check_compose_project(project)
         self.project = project
-        LOCK_DIR.mkdir(parents=True, exist_ok=True)
-        self.path = LOCK_DIR / f"{project}.lock"
-        handle = open(self.path, "a")
+        self.path = secure_lock_dir(LOCK_DIR) / f"{project}.lock"
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd = os.open(
+                self.path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
+            )
+        except OSError as exc:  # ELOOP: the lock file is a symlink
+            raise Refused(f"cannot open lock file {self.path}: {exc}. Nothing was changed.") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+                raise Refused(
+                    f"lock file {self.path} must be a regular file you own with one link "
+                    f"(uid {st.st_uid}, links {st.st_nlink}). Nothing was changed."
+                )
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            handle.close()
+            os.close(fd)
             raise ProjectBusy(
                 f"compose project {project} is in use by another harness process "
                 f"({self.path}). Refusing to start; nothing was changed."
             ) from None
-        self._handle: Any = handle
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd: int | None = fd
 
     @property
     def held(self) -> bool:
-        return self._handle is not None
+        """True while this lock is open and its file is still the one at the path."""
+        if self._fd is None:
+            return False
+        try:
+            here, ours = os.lstat(self.path), os.fstat(self._fd)
+        except OSError:
+            return False
+        return (here.st_dev, here.st_ino) == (ours.st_dev, ours.st_ino)
 
     def release(self) -> None:
-        if self._handle is not None:
-            self._handle.close()  # closing the file drops the lock
-            self._handle = None
+        if self._fd is not None:
+            os.close(self._fd)  # closing the file drops the lock
+            self._fd = None
+
+
+def secure_lock_dir(root: Path) -> Path:
+    """Create the lock directory 0700 if missing, then refuse unless it is safe.
+
+    Safe means a real directory (not a symlink), owned by this user, with no
+    group or other access.
+    """
+    root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(root, 0o700)
+        os.chmod(root, 0o700)  # exact mode whatever the umask
+    except FileExistsError:
+        pass
+    st = os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Refused(
+            f"lock directory {root} must be a real directory you own with mode 0700 "
+            f"(found {stat.filemode(st.st_mode)}, uid {st.st_uid}). Nothing was changed."
+        )
+    return root
 
 
 class ComposeAdapter:
