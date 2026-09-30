@@ -167,6 +167,26 @@ python3 perf/cogs_report.py diff     --results ./runs/all.jsonl --profile 10h-20
 python3 perf/cogs_report.py anchor   --results ./runs/all.jsonl --a <run-a> --b <run-b>
 ```
 
+### Memory figures
+
+Every memory number in a results line (`rss_bytes`) is the container's
+**working set**: cgroup `memory.current` minus `inactive_file` from
+`memory.stat`. That is cAdvisor's `container_memory_working_set_bytes`, the
+figure `docker stats` and Kubernetes read. Raw `memory.current` also counts
+page cache the kernel can drop at any time (git packs, uploaded media, files
+the relay has deleted), which moved the relay's number by 30–50 Mi inside a
+single band at 10h-20a.
+
+Each band also carries `anon_bytes`: the container's anonymous memory, its
+own heap and stacks. It is a floor, not the full need. The report shows it
+beside the working set. Each sample keeps the raw inputs as well
+(`mem_current`, `mem_file`, `mem_active_file`, `mem_inactive_file`,
+`mem_shmem`) so a surprising band can be explained from the run's own data.
+
+The report's "measured from" column names the figure behind each proposed
+value. The density and 4-vs-8 GiB lines sum the four containers' working sets
+and add a fixed k3s and OS allowance; they are not a whole-box reading.
+
 `diff` compares the two most recent lines of the same `(profile, substrate)`
 that have **different** `buzz_commit` values and flags anything that moved
 more than 15%. `buzz_commit` is the relay image's source revision (or an
@@ -197,8 +217,9 @@ band lengths in `[bands]` are the lengths the orchestrator runs.
 A successful `run` exits 0 only when the floor shows 30 connections, sampled
 bands have zero unexpected rejects, media uploads succeeded with zero
 rejects, git pushed with zero failures, the three bands are distinct, and
-`lost_after_backfill` is 0. A results line is still appended for diagnosis;
-the process exit is the weekly-job gate.
+`lost_after_backfill` is 0. "Distinct" means the relay's working set rises:
+floor p50 < steady p50 < peak max. A results line is still appended for
+diagnosis; the process exit is the weekly-job gate.
 
 `fanout_recipients_p50` is a true histogram percentile of the observations
 that landed in that band (end-minus-start bucket counts), not a lifetime

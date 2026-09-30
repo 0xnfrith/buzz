@@ -82,6 +82,82 @@ class CpuStatTests(unittest.TestCase):
         self.assertEqual(tenant_cogs.lsn_to_bytes("0/1A2B3C4"), (0 << 32) + 0x1A2B3C4)
 
 
+# memory.stat as read from a relay container during a run (trimmed).
+RELAY_MEMORY_STAT = """anon 23572480
+file 18722816
+kernel 0
+shmem 0
+file_mapped 4296704
+inactive_anon 14790656
+active_anon 9048064
+inactive_file 6262784
+active_file 12460032
+"""
+
+
+class MemoryStatTests(unittest.TestCase):
+    def test_working_set_subtracts_inactive_file(self) -> None:
+        stat = tenant_cogs.parse_memory_stat(RELAY_MEMORY_STAT)
+        self.assertEqual(
+            stat,
+            {
+                "anon": 23572480,
+                "file": 18722816,
+                "shmem": 0,
+                "inactive_file": 6262784,
+                "active_file": 12460032,
+            },
+        )
+        # memory.current 43577344 - inactive_file 6262784; docker stats read 35.46 MiB.
+        self.assertEqual(tenant_cogs.working_set(43577344, stat), 37314560)
+
+    def test_working_set_needs_both_inputs(self) -> None:
+        self.assertIsNone(tenant_cogs.working_set(43577344, {"anon": 1}))
+        self.assertIsNone(tenant_cogs.working_set(None, {"inactive_file": 1}))
+        self.assertEqual(tenant_cogs.working_set(10, {"inactive_file": 20}), 0)
+
+    def test_cgroup_records_working_set_and_raw_figures(self) -> None:
+        ad = tenant_cogs.ExecAdapter(kind="compose", project="buzz-harness")
+        files = {
+            "/sys/fs/cgroup/cpu.stat": "usage_usec 500\n",
+            "/sys/fs/cgroup/memory.current": "43577344\n",
+            "/sys/fs/cgroup/memory.stat": RELAY_MEMORY_STAT,
+        }
+        with mock.patch.object(ad, "exec", side_effect=lambda _svc, args: files[args[1]]):
+            cg = ad.cgroup("relay")
+        self.assertEqual(
+            cg,
+            {
+                "usage_usec": 500,
+                "rss": 37314560,
+                "rss_anon": 23572480,
+                "mem_current": 43577344,
+                "mem_file": 18722816,
+                "mem_active_file": 12460032,
+                "mem_inactive_file": 6262784,
+                "mem_shmem": 0,
+            },
+        )
+
+    def test_band_reports_anon_beside_working_set(self) -> None:
+        def row(t: int, rss: int, anon: int) -> dict:
+            comp = {"rss": rss, "rss_anon": anon, "usage_usec": t}
+            return {
+                "band": "floor",
+                "sampled": True,
+                "t_unix": t,
+                "relay": comp,
+                "postgres": comp,
+                "redis": comp,
+                "minio": comp,
+            }
+
+        rows = [row(1, 40, 10), row(6, 50, 12), row(11, 45, 14)]
+        stats = tenant_cogs.band_stats(rows, "floor", None)
+        self.assertEqual(stats["relay"]["rss_bytes"], {"p50": 45.0, "p95": 50.0, "max": 50.0})
+        self.assertEqual(stats["relay"]["anon_bytes"], {"p50": 12.0, "p95": 14.0, "max": 14.0})
+
+
 class AdapterCommandTests(unittest.TestCase):
     def test_compose_exec_command(self) -> None:
         ad = tenant_cogs.ExecAdapter(kind="compose", project="buzz-harness")
@@ -230,6 +306,33 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("relay.resources.requests.cpu", text)
         self.assertIn("declared_density", text)
         self.assertIn("4-vs-8", text)
+
+    def test_pg_pvc_scales_growth_not_wal_cap(self) -> None:
+        gib = 1024 * 1024 * 1024
+        line = self.fixture()
+        for name in ("floor", "steady", "peak"):
+            line["bands"][name]["seconds"] = 28800  # the three bands span one day
+        line["bands"]["floor"]["db"]["size_bytes"]["start"] = 1 * gib
+        line["bands"]["peak"]["db"]["size_bytes"]["end"] = 2 * gib
+        # 1 GiB/day for a year = 365 GiB; x 1.2 = 438 GiB; plus the WAL cap once.
+        trial = cogs_report.proposed_values(line, "trial")  # max_wal 256 MiB
+        reference = cogs_report.proposed_values(line, "reference")  # max_wal 1 GiB
+        self.assertEqual(trial["postgresql.persistence.size"], "439Gi")
+        self.assertEqual(reference["postgresql.persistence.size"], "439Gi")
+        self.assertEqual(trial["raw"]["retention_factor"], 182.5)
+
+    def test_report_labels_memory_sources(self) -> None:
+        line = self.fixture()
+        line["bands"]["floor"]["relay"]["anon_bytes"] = {"p50": 2 * 1024 * 1024, "p95": 0, "max": 3 * 1024 * 1024}
+        text = cogs_report.render_report(line)
+        self.assertIn("memory.current − inactive_file", text)
+        self.assertIn("| floor | 5/11/14 Mi | 2/3 Mi |", text)
+        self.assertIn("| steady | 10/11/14 Mi | n/a/n/a Mi |", text)
+        self.assertIn("| measured from |", text)
+        self.assertIn("steady relay CPU × 1.5", text)
+        for key in cogs_report.proposed_values(line, "trial"):
+            if key not in {"tier", "raw"}:
+                self.assertIn(key, cogs_report.VALUE_SOURCES)
 
     def test_density_includes_redis_minio(self) -> None:
         line = self.fixture()

@@ -150,11 +150,30 @@ def parse_memory_current(text: str) -> int | None:
     return int(text.split()[0])
 
 
-def parse_memory_anon(text: str) -> int | None:
+MEMORY_STAT_KEYS = ("anon", "file", "active_file", "inactive_file", "shmem")
+
+
+def parse_memory_stat(text: str) -> dict[str, int]:
+    """The memory.stat fields each sample records, in bytes."""
+    out: dict[str, int] = {}
     for line in text.splitlines():
-        if line.startswith("anon "):
-            return int(line.split()[1])
-    return None
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in MEMORY_STAT_KEYS:
+            out[parts[0]] = int(parts[1])
+    return out
+
+
+def working_set(current: int | None, stat: dict[str, int]) -> int | None:
+    """memory.current minus inactive_file.
+
+    This is cAdvisor's container_memory_working_set_bytes, the figure
+    `docker stats` and Kubernetes read. Raw memory.current also counts page
+    cache the kernel can drop at any time, which swings it far more than the
+    load does.
+    """
+    if current is None or "inactive_file" not in stat:
+        return None
+    return max(current - stat["inactive_file"], 0)
 
 
 def lsn_to_bytes(lsn: str) -> int | None:
@@ -379,11 +398,20 @@ class ExecAdapter:
     def cgroup(self, service: str) -> dict[str, int | None]:
         cpu = self.exec(service, ["cat", "/sys/fs/cgroup/cpu.stat"])
         mem = self.exec(service, ["cat", "/sys/fs/cgroup/memory.current"])
-        stat = self.exec(service, ["cat", "/sys/fs/cgroup/memory.stat"])
+        stat = parse_memory_stat(
+            self.exec(service, ["cat", "/sys/fs/cgroup/memory.stat"]) or ""
+        )
+        current = parse_memory_current(mem or "")
         return {
             "usage_usec": parse_cpu_stat(cpu or ""),
-            "rss": parse_memory_current(mem or ""),
-            "rss_anon": parse_memory_anon(stat or ""),
+            # "rss" is the working set; the raw figures stay beside it.
+            "rss": working_set(current, stat),
+            "rss_anon": stat.get("anon"),
+            "mem_current": current,
+            "mem_file": stat.get("file"),
+            "mem_active_file": stat.get("active_file"),
+            "mem_inactive_file": stat.get("inactive_file"),
+            "mem_shmem": stat.get("shmem"),
         }
 
 
@@ -876,6 +904,7 @@ def band_stats(samples: list[dict[str, Any]], name: str, client: dict[str, Any] 
         block: dict[str, Any] = {
             "cpu_s": cpu,
             "rss_bytes": pct_block(rss),
+            "anon_bytes": pct_block(series(comp, "rss_anon")),
         }
         if comp in {"relay", "postgres", "redis", "minio"}:
             block["cpu_s_per_tenant_hour"] = cpu * 3600.0 / seconds if seconds else 0.0
@@ -1581,7 +1610,8 @@ def acceptance_errors(
         peak_rss = bands["peak"]["relay"]["rss_bytes"]["max"]
         if not (floor_rss < steady_rss < peak_rss):
             errs.append(
-                f"bands not distinct: floor p50={floor_rss} steady p50={steady_rss} peak max={peak_rss}"
+                f"bands not distinct (relay working set): floor p50={floor_rss} "
+                f"steady p50={steady_rss} peak max={peak_rss}"
             )
     except (KeyError, TypeError) as exc:
         errs.append(f"band rss missing: {exc}")

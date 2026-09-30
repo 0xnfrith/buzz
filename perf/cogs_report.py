@@ -219,7 +219,9 @@ def proposed_values(line: dict[str, Any], tier: str) -> dict[str, Any]:
     retention_factor = (365 * daily_growth / db_end) if db_end else 1.0
     retention_factor = max(retention_factor, 1.0)
     max_wal = 256 * 1024 * 1024 if tier == "trial" else 1024 * 1024 * 1024
-    pg_pvc = max(ceil1gi((db_end + max_wal) * 1.2 * retention_factor), 3)
+    # A year of growth plus the WAL cap once. The WAL cap is a fixed ceiling,
+    # so it must not be scaled by the retention factor.
+    pg_pvc = max(ceil1gi(db_end * retention_factor * 1.2 + max_wal), 3)
 
     wal_gen = peak["db"].get("wal_gen_bytes_per_s") or 0
     wal_cfg = min(max(int(ceil_to(3 * wal_gen * 300, 64 * 1024 * 1024)), 128 * 1024 * 1024), 1024 * 1024 * 1024)
@@ -321,6 +323,34 @@ def density(line: dict[str, Any], trial: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Which measured figure feeds each proposed value. "Working set" is
+# memory.current - inactive_file (see TENANT_COGS.md, "Memory figures").
+VALUE_SOURCES = {
+    "relay.resources.requests.cpu": "steady relay CPU × 1.5",
+    "relay.resources.requests.memory": "relay working set p95 × 1.2 (trial: steady, reference: peak)",
+    "relay.resources.limits.cpu": "fixed, not measured",
+    "relay.resources.limits.memory": "peak relay working set max × 1.5, floor 512Mi",
+    "postgresql.resources.requests.cpu": "steady Postgres CPU × 1.5",
+    "postgresql.resources.requests.memory": "steady Postgres working set p95 × 1.2",
+    "postgresql.resources.limits.memory": "peak Postgres working set max × 1.5, floor 256Mi",
+    "postgresql.persistence.size": "DB size × retention × 1.2 + max_wal_size, floor 3Gi",
+    "postgresql.config.extraConfig max_wal_size": "peak WAL rate × 900 s, 128MB–1GB (reference: 1GB)",
+    "minio.persistence.size": "object bytes × retention × 1.2, floor 3Gi",
+    "minio.resources.requests.cpu": "steady MinIO CPU × 1.5",
+    "minio.resources.requests.memory": "steady MinIO working set p95 × 1.2",
+    "redis.resources.requests.cpu": "steady Redis CPU × 1.5",
+    "redis.resources.requests.memory": "steady Redis working set p95 × 1.2",
+    "redis.persistence.size": "fixed, not measured",
+}
+
+
+def _anon(comp: dict[str, Any], key: str) -> str:
+    anon = comp.get("anon_bytes")
+    if not anon:
+        return "n/a"
+    return str(bytes_to_mi(anon[key]))
+
+
 def render_report(line: dict[str, Any]) -> str:
     trial = proposed_values(line, "trial")
     reference = proposed_values(line, "reference")
@@ -336,39 +366,60 @@ def render_report(line: dict[str, Any]) -> str:
     out.append("")
     out.append("## Bands")
     out.append("")
-    out.append("| band | relay RSS p50/p95/max | relay CPU-s | postgres RSS p95 | db end | WAL max |")
-    out.append("|---|---|---|---|---|---|")
+    out.append(
+        "| band | relay working set p50/p95/max | relay anon p50/max | relay CPU-s "
+        "| postgres working set p95 (anon) | db end | WAL max |"
+    )
+    out.append("|---|---|---|---|---|---|---|")
     for name in ("floor", "steady", "peak"):
         b = bands[name]
         rss = b["relay"]["rss_bytes"]
         out.append(
             f"| {name} | {bytes_to_mi(rss['p50'])}/{bytes_to_mi(rss['p95'])}/{bytes_to_mi(rss['max'])} Mi "
-            f"| {b['relay']['cpu_s']:.2f} | {bytes_to_mi(b['postgres']['rss_bytes']['p95'])} Mi "
+            f"| {_anon(b['relay'], 'p50')}/{_anon(b['relay'], 'max')} Mi "
+            f"| {b['relay']['cpu_s']:.2f} "
+            f"| {bytes_to_mi(b['postgres']['rss_bytes']['p95'])} Mi ({_anon(b['postgres'], 'p95')} Mi) "
             f"| {b['db']['size_bytes']['end']} | {b['db']['wal_bytes']['max']} |"
         )
+    out.append("")
+    out.append(
+        "Memory is the container working set: `memory.current − inactive_file`, the figure "
+        "`docker stats` and Kubernetes use. Reclaimable page cache is not counted, so it is "
+        "never read as need. Anonymous memory (anon) is shown beside it; it is a floor, not "
+        "the full need."
+    )
     out.append("")
     floor_rss = bands["floor"]["relay"]["rss_bytes"]["p50"]
     steady_rss = bands["steady"]["relay"]["rss_bytes"]["p50"]
     peak_rss = bands["peak"]["relay"]["rss_bytes"]["max"]
     distinct = floor_rss < steady_rss < peak_rss
-    out.append(f"Three bands distinct (floor p50 < steady p50 < peak max): **{distinct}**")
+    out.append(f"Three bands distinct (relay working set: floor p50 < steady p50 < peak max): **{distinct}**")
     out.append("")
     out.append("## Proposed values")
     out.append("")
-    out.append("| key | trial | reference |")
-    out.append("|---|---|---|")
+    out.append("| key | trial | reference | measured from |")
+    out.append("|---|---|---|---|")
     keys = [k for k in trial if k not in {"tier", "raw"}]
     for k in keys:
-        out.append(f"| `{k}` | {trial[k]} | {reference[k]} |")
+        out.append(f"| `{k}` | {trial[k]} | {reference[k]} | {VALUE_SOURCES.get(k, '')} |")
     out.append("")
     out.append("Margins: request = measured × 1.5 CPU / × 1.2 memory; limit = peak max × 1.5 (floor 512Mi relay).")
-    out.append("PVC retention_factor default is 1 year of extrapolated daily growth, floor 3Gi.")
+    out.append(
+        "Retention is one year of growth at this run's rate (busy-hour rate × 24 h × 365), "
+        "so disk sizes overstate a team that is quiet overnight."
+    )
     out.append("")
     out.append("## Density (trial requests vs 2-vCPU / 8Gi box)")
     out.append("")
     out.append(f"- declared_density (scheduler): **{dens['declared_density']}** stacks")
     out.append(f"- measured_density (peak physics): **{dens['measured_density']}** stacks")
     out.append(f"- dedicated 4-vs-8 GiB: **{dens['dedicated_verdict']}** (need {dens['dedicated_need_bytes']} bytes)")
+    out.append("")
+    out.append(
+        "declared_density is from the trial requests above. measured_density and the "
+        "4-vs-8 GiB line are from the peak stack working set (sum of the four containers) "
+        "plus a fixed k3s and OS allowance, not from a whole-box memory reading."
+    )
     out.append("")
     sat = False
     waiters = bands["peak"]["relay_metrics"].get("db_pool_waiters_max") or 0
