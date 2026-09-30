@@ -18,6 +18,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cogs_report
 import tenant_cogs
 
+_LOCK_TMP: tempfile.TemporaryDirectory | None = None
+_REAL_LOCK_DIR = tenant_cogs.LOCK_DIR
+
+
+def setUpModule() -> None:
+    global _LOCK_TMP
+    _LOCK_TMP = tempfile.TemporaryDirectory()
+    tenant_cogs.LOCK_DIR = Path(_LOCK_TMP.name)
+
+
+def tearDownModule() -> None:
+    tenant_cogs.LOCK_DIR = _REAL_LOCK_DIR
+    if _LOCK_TMP is not None:
+        _LOCK_TMP.cleanup()
+
+
+def locked_adapter(case: unittest.TestCase, project: str, files=("a.yml",), env=None):
+    """An adapter holding its project's lock, released when the test ends."""
+    lock = tenant_cogs.ProjectLock(project)
+    case.addCleanup(lock.release)
+    return tenant_cogs.ComposeAdapter(project, files, env=env or {}, lock=lock)
+
 
 class PercentileTests(unittest.TestCase):
     def test_empty(self) -> None:
@@ -716,7 +738,7 @@ class ComposeProjectTests(unittest.TestCase):
 
     def test_up_on_a_fresh_project_then_teardown(self) -> None:
         docker = FakeDocker()
-        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", ("a.yml",), env={})
+        ad = locked_adapter(self, "buzz-harness-t1")
         with mock.patch.object(tenant_cogs, "run", docker.run):
             with tenant_cogs.RunSession(ad, keep=False):
                 ad.up()
@@ -728,7 +750,7 @@ class ComposeProjectTests(unittest.TestCase):
     def test_a_non_empty_project_is_refused_and_nothing_deleted(self) -> None:
         old = {"containers": ["c1"], "volumes": ["v1"], "networks": []}
         docker = FakeDocker({"buzz-harness-old": old})
-        ad = tenant_cogs.ComposeAdapter("buzz-harness-old", ("a.yml",), env={})
+        ad = locked_adapter(self, "buzz-harness-old")
         with mock.patch.object(tenant_cogs, "run", docker.run):
             with self.assertRaisesRegex(tenant_cogs.ProjectNotEmpty, "nothing was deleted"):
                 with tenant_cogs.RunSession(ad, keep=False):
@@ -742,7 +764,7 @@ class ComposeProjectTests(unittest.TestCase):
         second = tenant_cogs.compose_project_for("2026-09-30T16:00:00Z-c-10h-20a")
         still_up = {"containers": ["r1"], "volumes": ["d1"], "networks": ["n1"]}
         docker = FakeDocker({first: still_up})
-        ad = tenant_cogs.ComposeAdapter(second, ("a.yml",), env={})
+        ad = locked_adapter(self, second)
         with mock.patch.object(tenant_cogs, "run", docker.run):
             with tenant_cogs.RunSession(ad, keep=False):
                 ad.up()
@@ -752,7 +774,7 @@ class ComposeProjectTests(unittest.TestCase):
 
     def test_leftovers_fail_teardown(self) -> None:
         docker = FakeDocker()
-        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", ("a.yml",), env={})
+        ad = locked_adapter(self, "buzz-harness-t1")
 
         def down_leaves_a_volume(cmd, **kw):
             out = docker.run(cmd, **kw)
@@ -767,11 +789,115 @@ class ComposeProjectTests(unittest.TestCase):
 
     def test_failed_down_fails_teardown(self) -> None:
         docker = FakeDocker(fail_down=True)
-        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", ("a.yml",), env={})
+        ad = locked_adapter(self, "buzz-harness-t1")
         with mock.patch.object(tenant_cogs, "run", docker.run):
             ad.up()
             with self.assertRaises(subprocess.CalledProcessError):
                 ad.teardown()
+
+
+class ProjectLockTests(unittest.TestCase):
+    PROFILE = str(Path(__file__).resolve().parent / "profiles" / "10h-20a.toml")
+
+    def test_same_second_runs_get_distinct_projects(self) -> None:
+        import datetime as real_dt
+
+        fixed = real_dt.datetime(2026, 9, 30, 16, 41, 5, tzinfo=real_dt.timezone.utc)
+
+        class FrozenClock:
+            timezone = real_dt.timezone
+
+            class datetime:
+                @staticmethod
+                def now(tz=None):
+                    return fixed
+
+        with mock.patch.object(tenant_cogs, "dt", FrozenClock):
+            a = tenant_cogs.new_run_id("c", "10h-20a")
+            b = tenant_cogs.new_run_id("c", "10h-20a")
+        for run_id in (a, b):
+            self.assertRegex(run_id, r"^2026-09-30T16:41:05Z-c-10h-20a-[0-9a-f]{6}$")
+            tenant_cogs.check_compose_project(tenant_cogs.compose_project_for(run_id))
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(tenant_cogs.compose_project_for(a), tenant_cogs.compose_project_for(b))
+
+    def test_a_project_has_one_lock_holder(self) -> None:
+        first = tenant_cogs.ProjectLock("buzz-harness-lock1")
+        self.addCleanup(first.release)
+        with self.assertRaises(tenant_cogs.ProjectBusy):
+            tenant_cogs.ProjectLock("buzz-harness-lock1")
+        first.release()
+        again = tenant_cogs.ProjectLock("buzz-harness-lock1")  # free once released
+        again.release()
+
+    def test_two_adapters_on_one_project_cannot_both_own_it(self) -> None:
+        # The reviewer's interleaving: both check empty, then both run `up`.
+        docker = FakeDocker()
+        a = locked_adapter(self, "buzz-harness-shared1")
+        b = tenant_cogs.ComposeAdapter("buzz-harness-shared1", ("a.yml",), env={})
+        with self.assertRaises(tenant_cogs.ProjectBusy):
+            b.lock = tenant_cogs.ProjectLock("buzz-harness-shared1")
+        with mock.patch.object(tenant_cogs, "run", docker.run):
+            a.ensure_empty()
+            b.ensure_empty()
+            a.up()
+            calls_before = len(docker.calls)
+            with self.assertRaisesRegex(RuntimeError, "hold the lock"):
+                b.up()
+            self.assertEqual(len(docker.calls), calls_before)  # b ran nothing
+            b.teardown()  # b does not own it: a no-op
+        self.assertTrue(a.owned)
+        self.assertFalse(b.owned)
+        self.assertIn("buzz-harness-shared1", docker.state)
+
+    def test_session_releases_the_lock_after_teardown(self) -> None:
+        docker = FakeDocker()
+        ad = locked_adapter(self, "buzz-harness-lock2")
+        with mock.patch.object(tenant_cogs, "run", docker.run):
+            with tenant_cogs.RunSession(ad, keep=False):
+                ad.up()
+        self.assertFalse(ad.lock.held)
+        self.assertEqual(docker.state, {})
+        tenant_cogs.ProjectLock("buzz-harness-lock2").release()
+
+    def test_same_override_in_a_second_process_refuses_before_any_command(self) -> None:
+        name = "buzz-harness-shared2"
+        path = tenant_cogs.LOCK_DIR / f"{name}.lock"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import fcntl, sys; f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+                "print('held', flush=True); sys.stdin.read()",
+                str(path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+
+            def forbidden(*a, **k):
+                raise AssertionError("no command expected while another process holds the lock")
+
+            with tempfile.TemporaryDirectory() as td:
+                for cmd in (["run"], ["seed-bench", "--limits", "raised"]):
+                    out = Path(td) / cmd[0]
+                    argv = [*cmd, "--substrate", "compose", "--compose-project", name,
+                            "--profile", self.PROFILE, "--out-dir", str(out)]
+                    with mock.patch.object(tenant_cogs, "run", forbidden), mock.patch.object(
+                        tenant_cogs.subprocess, "Popen", forbidden
+                    ), mock.patch.object(tenant_cogs.subprocess, "run", forbidden), mock.patch("sys.stderr"):
+                        self.assertEqual(tenant_cogs.main(argv), 2, cmd)
+                    self.assertFalse(out.exists(), cmd)
+        finally:
+            holder.kill()  # a crash, not a clean exit
+            holder.wait(timeout=5)
+            holder.stdout.close()
+            holder.stdin.close()
+        # The kernel dropped the dead holder's lock: nothing stale is left.
+        tenant_cogs.ProjectLock(name).release()
 
 
 class RefusalTests(unittest.TestCase):
@@ -852,7 +978,7 @@ class SetupRateLimitTests(unittest.TestCase):
                 calls.append((cmd, dict(kw.get("env") or {})))
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", env={"SIM_RELAY_KEY": "k"})
+        ad = locked_adapter(self, "buzz-harness-t1", files=tenant_cogs.COMPOSE_FILES, env={"SIM_RELAY_KEY": "k"})
         with mock.patch.object(tenant_cogs, "run", fake_run):
             ad.up(tenant_cogs.raised_limit_env(1000))
             ad.recreate_relay()

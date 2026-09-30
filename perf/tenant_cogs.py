@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import select
 import shlex
 import statistics
@@ -33,6 +35,10 @@ DEFAULT_CADENCE = 5
 # Every run and seed bench brings up its own Compose project, so nothing ever
 # has to be deleted before `up`. An override must still be a harness project.
 COMPOSE_PROJECT_PREFIX = "buzz-harness-"
+# One exclusive lock per harness project, held from before the empty check
+# until after teardown. A fixed path, so every process on the machine sees the
+# same lock whatever its TMPDIR.
+LOCK_DIR = Path("/tmp/buzz-harness-locks")
 COMPOSE_FILES = (
     "docker-compose.harness.yml",
     "docker-compose.harness.relay.yml",
@@ -433,8 +439,14 @@ class ProjectNotEmpty(Refused):
     """The Compose project already has containers, volumes or networks."""
 
 
+class ProjectBusy(Refused):
+    """Another harness process holds this project's lock."""
+
+
 def new_run_id(tag: str, name: str) -> str:
-    return f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}-{tag}-{name}"
+    """UTC second plus a random suffix: runs started in the same second differ."""
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"{now}-{tag}-{name}-{secrets.token_hex(3)}"
 
 
 def compose_project_for(run_id: str) -> str:
@@ -458,15 +470,51 @@ def resolve_compose_project(args: argparse.Namespace, run_id: str) -> str:
     return compose_project_for(run_id)
 
 
+class ProjectLock:
+    """An exclusive, non-blocking flock on one harness project's lock file.
+
+    Taken before anything touches the project and held through teardown. The
+    kernel drops it when the process exits, so a crash leaves no stale lock.
+    """
+
+    def __init__(self, project: str) -> None:
+        check_compose_project(project)
+        self.project = project
+        LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        self.path = LOCK_DIR / f"{project}.lock"
+        handle = open(self.path, "a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            raise ProjectBusy(
+                f"compose project {project} is in use by another harness process "
+                f"({self.path}). Refusing to start; nothing was changed."
+            ) from None
+        self._handle: Any = handle
+
+    @property
+    def held(self) -> bool:
+        return self._handle is not None
+
+    def release(self) -> None:
+        if self._handle is not None:
+            self._handle.close()  # closing the file drops the lock
+            self._handle = None
+
+
 class ComposeAdapter:
     def __init__(
         self,
         project: str,
         files: tuple[str, ...] = COMPOSE_FILES,
         env: dict[str, str] | None = None,
+        lock: ProjectLock | None = None,
     ) -> None:
         check_compose_project(project)
         self.project = project
+        # This process's lock on the project; `up` refuses without it.
+        self.lock = lock
         self.files = files
         # Never inherit rate-limit overrides from the caller's shell.
         self.env = without_limit_env({**os.environ, **(env or {})})
@@ -491,6 +539,8 @@ class ComposeAdapter:
             )
 
     def up(self, extra_env: dict[str, str] | None = None) -> None:
+        if self.lock is None or not self.lock.held or self.lock.project != self.project:
+            raise RuntimeError(f"up needs this process to hold the lock for {self.project}")
         self.ensure_empty()
         # From here on, anything in this project was created by this run.
         self.owned = True
@@ -869,13 +919,17 @@ class RunSession:
                 proc.wait(timeout=10)
             except Exception:
                 pass
+        failed = False
         if self.adapter is not None and not self.keep:
             try:
                 self.adapter.teardown()
             except Exception as exc:
                 print(f"teardown failed: {exc}", file=sys.stderr)
-                return True
-        return False
+                failed = True
+        lock = getattr(self.adapter, "lock", None)
+        if lock is not None:
+            lock.release()
+        return failed
 
 
 def band_stats(samples: list[dict[str, Any]], name: str, client: dict[str, Any] | None) -> dict[str, Any]:
@@ -1280,6 +1334,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     name, profile_sha, bands = load_profile_meta(profile_path)
     run_id = new_run_id(args.substrate[0], name)
     project = resolve_compose_project(args, run_id)
+    lock = ProjectLock(project)
     print(f"compose project: {project}", file=sys.stderr)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1290,7 +1345,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     tenant_sim = args.tenant_sim
 
     notes: list[str] = []
-    adapter: Any = ComposeAdapter(project, tuple(args.compose_files.split(",")), env)
+    adapter: Any = ComposeAdapter(project, tuple(args.compose_files.split(",")), env, lock=lock)
     fp = fingerprint_compose()
     services = {
         "relay": "relay",
@@ -1510,13 +1565,14 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
     if args.compose_project:
         check_compose_project(args.compose_project)
     project = resolve_compose_project(args, new_run_id("seed", args.limits))
+    lock = ProjectLock(project)
     print(f"compose project: {project}", file=sys.stderr)
     profile_path = Path(args.profile)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     env, image = sim_env(args, profile_path)
     limit = DEFAULT_SETUP_RATE_LIMIT if args.limits == "raised" else 0
-    adapter = ComposeAdapter(project, tuple(args.compose_files.split(",")), env)
+    adapter = ComposeAdapter(project, tuple(args.compose_files.split(",")), env, lock=lock)
     execs = ExecAdapter(kind="compose", project=project)
     sampler = Sampler(
         execs,

@@ -51,9 +51,15 @@ python3 perf/tenant_cogs.py run \
 ```
 
 Every `run` and `seed-bench` brings up its own Compose project,
-`buzz-harness-<run id>`, and prints the name. Nothing is ever deleted before
-`up`: the run first checks that the project has no container, volume or
-network, and refuses (exit 2, nothing deleted) if it has. `--compose-project`
+`buzz-harness-<run id>`, and prints the name. The run id ends in six random
+hex characters, so two runs started in the same second still differ. Before
+anything touches the project, the run takes an exclusive lock on
+`/tmp/buzz-harness-locks/<project>.lock` and holds it through teardown. A
+second process that asks for the same project refuses (exit 2) before it runs
+any command. The kernel drops the lock when the process exits, so a crash
+leaves no stale lock. Nothing is ever deleted before `up`: the run checks
+that the project has no container, volume or network, and refuses (exit 2,
+nothing deleted) if it has. `--compose-project`
 overrides the name, but only with one that starts with `buzz-harness-`; any
 other name is refused before any command runs. The host ports are fixed, so
 one harness stack runs at a time; a second `up` fails on the port and removes
