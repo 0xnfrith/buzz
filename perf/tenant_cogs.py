@@ -30,7 +30,9 @@ from typing import Any, Callable
 
 SCHEMA = 1
 DEFAULT_CADENCE = 5
-COMPOSE_PROJECT = "buzz-harness"
+# Every run and seed bench brings up its own Compose project, so nothing ever
+# has to be deleted before `up`. An override must still be a harness project.
+COMPOSE_PROJECT_PREFIX = "buzz-harness-"
 COMPOSE_FILES = (
     "docker-compose.harness.yml",
     "docker-compose.harness.relay.yml",
@@ -359,7 +361,7 @@ class ExecAdapter:
     """Run a command inside a named container/pod and return stdout."""
 
     kind: str  # compose | k3s
-    project: str = COMPOSE_PROJECT
+    project: str = ""
     kubeconfig: str | None = None
     namespace: str = "buzz-loadtest"
     compose_files: tuple[str, ...] = COMPOSE_FILES
@@ -423,17 +425,54 @@ def compose_ps_cmd(project: str, files: tuple[str, ...]) -> list[str]:
     return cmd
 
 
+class Refused(Exception):
+    """A request the harness will not act on. main() exits 2; nothing was changed."""
+
+
+class ProjectNotEmpty(Refused):
+    """The Compose project already has containers, volumes or networks."""
+
+
+def new_run_id(tag: str, name: str) -> str:
+    return f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}-{tag}-{name}"
+
+
+def compose_project_for(run_id: str) -> str:
+    """The run's own Compose project: the prefix plus the run id, lowercased."""
+    return COMPOSE_PROJECT_PREFIX + re.sub(r"[^a-z0-9_-]", "", run_id.lower())
+
+
+def check_compose_project(name: str) -> None:
+    """Refuse any Compose project that is not a harness project."""
+    if not re.fullmatch(re.escape(COMPOSE_PROJECT_PREFIX) + r"[a-z0-9][a-z0-9_-]*", name):
+        raise Refused(
+            f"compose project must be {COMPOSE_PROJECT_PREFIX!r} followed by a-z, 0-9, "
+            f"'-' or '_' (got {name!r}). Nothing was changed."
+        )
+
+
+def resolve_compose_project(args: argparse.Namespace, run_id: str) -> str:
+    if args.compose_project:
+        check_compose_project(args.compose_project)
+        return args.compose_project
+    return compose_project_for(run_id)
+
+
 class ComposeAdapter:
     def __init__(
         self,
-        project: str = COMPOSE_PROJECT,
+        project: str,
         files: tuple[str, ...] = COMPOSE_FILES,
         env: dict[str, str] | None = None,
     ) -> None:
+        check_compose_project(project)
         self.project = project
         self.files = files
         # Never inherit rate-limit overrides from the caller's shell.
         self.env = without_limit_env({**os.environ, **(env or {})})
+        # True once this process has run `up` on the (verified empty) project;
+        # teardown removes only a stack this process brought up.
+        self.owned = False
 
     def cmd(self, *args: str) -> list[str]:
         out = ["docker", "compose", "-p", self.project]
@@ -442,11 +481,19 @@ class ComposeAdapter:
         out.extend(args)
         return out
 
-    def reset(self) -> None:
-        """Start from nothing: the same verified removal as teardown."""
-        self.teardown()
+    def ensure_empty(self) -> None:
+        """Refuse to start on a project that has anything in it. Deletes nothing."""
+        left = {kind: ids for kind, ids in self.remaining().items() if ids}
+        if left:
+            raise ProjectNotEmpty(
+                f"compose project {self.project} is not empty: {left}. "
+                "Refusing to start; nothing was deleted."
+            )
 
     def up(self, extra_env: dict[str, str] | None = None) -> None:
+        self.ensure_empty()
+        # From here on, anything in this project was created by this run.
+        self.owned = True
         env = {**self.env, **(extra_env or {})}
         run(self.cmd("up", "-d"), check=True, env=env, capture=True)
 
@@ -501,7 +548,12 @@ class ComposeAdapter:
         return out
 
     def teardown(self) -> None:
-        """Remove the project and prove nothing of it is left. Safe to repeat."""
+        """Remove the stack this process brought up and prove nothing is left.
+
+        A no-op unless this process ran `up`. Safe to repeat.
+        """
+        if not self.owned:
+            return
         run(self.cmd("down", "-v", "--remove-orphans"), check=True, env=self.env, capture=True)
         left = {kind: ids for kind, ids in self.remaining().items() if ids}
         if left:
@@ -1150,6 +1202,10 @@ def cmd_fingerprint(args: argparse.Namespace) -> int:
 
 
 def cmd_sample(args: argparse.Namespace) -> int:
+    if args.substrate == "compose":
+        if not args.compose_project:
+            raise Refused("sample --substrate compose needs --compose-project buzz-harness-<run>")
+        check_compose_project(args.compose_project)
     execs = ExecAdapter(
         kind=args.substrate,
         project=args.compose_project,
@@ -1203,11 +1259,6 @@ def resolve_setup_rate_limit(args: argparse.Namespace) -> int:
     return limit
 
 
-def keeps_stack(args: argparse.Namespace) -> bool:
-    """A run tears down only a stack it brought up (not --skip-reset, not --keep)."""
-    return bool(args.keep or args.skip_reset)
-
-
 K3S_RUN_DISABLED = (
     "run --substrate k3s is disabled: a k3s run needs a bounded, manifest-bound "
     "install and teardown, which this tree does not have yet. Nothing was changed."
@@ -1218,8 +1269,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.substrate != "compose":
         print(K3S_RUN_DISABLED, file=sys.stderr)
         return 2
+    if args.compose_project:
+        check_compose_project(args.compose_project)
+    elif args.skip_reset:
+        raise Refused(
+            "--skip-reset samples a harness stack that is already running; name it "
+            "with --compose-project buzz-harness-<run>. Nothing was changed."
+        )
     profile_path = Path(args.profile)
     name, profile_sha, bands = load_profile_meta(profile_path)
+    run_id = new_run_id(args.substrate[0], name)
+    project = resolve_compose_project(args, run_id)
+    print(f"compose project: {project}", file=sys.stderr)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     samples_path = out_dir / "samples.jsonl"
@@ -1229,7 +1290,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     tenant_sim = args.tenant_sim
 
     notes: list[str] = []
-    adapter: Any = ComposeAdapter(args.compose_project, tuple(args.compose_files.split(",")), env)
+    adapter: Any = ComposeAdapter(project, tuple(args.compose_files.split(",")), env)
     fp = fingerprint_compose()
     services = {
         "relay": "relay",
@@ -1237,12 +1298,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         "redis": "redis",
         "minio": "minio",
     }
-    execs = ExecAdapter(kind="compose", project=args.compose_project)
+    execs = ExecAdapter(kind="compose", project=project)
     substrate_label = args.substrate_label or "workstation-orbstack"
 
-    with RunSession(adapter, keep=keeps_stack(args)) as session:
+    with RunSession(adapter, keep=args.keep) as session:
         if not args.skip_reset:
-            adapter.reset()
             adapter.up(raised_limit_env(setup_limit))
         adapter.wait_ready(args.health_url)
 
@@ -1280,6 +1340,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         setup: dict[str, Any] = {
             "rate_limit": setup_limit,
             "provision": setup_line.get("provision"),
+            "compose_project": project,
         }
         if setup_limit:
             # Measured bands run at the relay's default limits: restart the
@@ -1345,7 +1406,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             if "community" in msg.lower():
                 notes.append(f"community bootstrap: {msg} x{n}")
 
-        run_id = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}-{args.substrate[0]}-{name}"
         buzz_commit, buzz_image = resolve_buzz_identity(image)
         line = write_results_line(
             Path(args.results),
@@ -1442,20 +1502,28 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
     """Measure seed throughput on a fresh compose stack: no bands, no results line."""
     if args.substrate != "compose":
         raise SystemExit("seed-bench supports --substrate compose only")
+    if args.skip_reset:
+        raise Refused(
+            "seed-bench always measures a fresh stack under its own project name; "
+            "--skip-reset has nothing to skip. Nothing was changed."
+        )
+    if args.compose_project:
+        check_compose_project(args.compose_project)
+    project = resolve_compose_project(args, new_run_id("seed", args.limits))
+    print(f"compose project: {project}", file=sys.stderr)
     profile_path = Path(args.profile)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     env, image = sim_env(args, profile_path)
     limit = DEFAULT_SETUP_RATE_LIMIT if args.limits == "raised" else 0
-    adapter = ComposeAdapter(args.compose_project, tuple(args.compose_files.split(",")), env)
-    execs = ExecAdapter(kind="compose", project=args.compose_project)
+    adapter = ComposeAdapter(project, tuple(args.compose_files.split(",")), env)
+    execs = ExecAdapter(kind="compose", project=project)
     sampler = Sampler(
         execs,
         args.metrics_url,
         {"relay": "relay", "postgres": "postgres", "redis": "redis", "minio": "minio"},
     )
     with RunSession(adapter, keep=args.keep) as session:
-        adapter.reset()
         adapter.up(raised_limit_env(limit))
         adapter.wait_ready(args.health_url)
         overrides = adapter.relay_rate_limit_overrides()
@@ -1514,9 +1582,15 @@ FLOOR_KINDS = frozenset({"20001", "20002"})
 def floor_errors(floor: dict[str, Any]) -> list[str]:
     """Floor is idle clients: heartbeats only, nothing stored."""
     errs: list[str] = []
-    kinds = (floor.get("client") or {}).get("sent_by_kind")
+    client = floor.get("client") or {}
+    kinds = client.get("sent_by_kind")
+    sent = int(client.get("sent") or 0)
     if kinds is None:
         errs.append("floor client.sent_by_kind missing")
+    elif sum(int(v) for v in kinds.values()) != sent:
+        errs.append(
+            f"floor sent_by_kind covers {sum(int(v) for v in kinds.values())} of {sent} sends"
+        )
     else:
         other = {k: v for k, v in sorted(kinds.items()) if k not in FLOOR_KINDS and int(v)}
         if other:
@@ -1619,7 +1693,11 @@ def build_parser() -> argparse.ArgumentParser:
             default="./target/release/git-credential-nostr",
         )
         sp.add_argument("--buzz-image", default=os.environ.get("BUZZ_IMAGE"))
-        sp.add_argument("--compose-project", default=COMPOSE_PROJECT)
+        sp.add_argument(
+            "--compose-project",
+            default=None,
+            help="default: buzz-harness-<run id>, new per run; an override must start with buzz-harness-",
+        )
         sp.add_argument("--compose-files", default=",".join(COMPOSE_FILES))
         sp.add_argument("--kubeconfig", default=None)
         sp.add_argument("--namespace", default="buzz-loadtest")
@@ -1664,17 +1742,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.cmd == "fingerprint":
-        return cmd_fingerprint(args)
-    if args.cmd == "sample":
-        return cmd_sample(args)
-    if args.cmd == "blink":
-        return cmd_blink(args)
-    if args.cmd == "run":
-        return cmd_run(args)
-    if args.cmd == "seed-bench":
-        return cmd_seed_bench(args)
-    raise SystemExit(f"unknown command {args.cmd}")
+    commands = {
+        "fingerprint": cmd_fingerprint,
+        "sample": cmd_sample,
+        "blink": cmd_blink,
+        "run": cmd_run,
+        "seed-bench": cmd_seed_bench,
+    }
+    try:
+        return commands[args.cmd](args)
+    except Refused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -192,10 +192,10 @@ class AdapterCommandTests(unittest.TestCase):
         )
 
     def test_compose_up_command(self) -> None:
-        ad = tenant_cogs.ComposeAdapter()
+        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1")
         self.assertEqual(
             ad.cmd("up", "-d")[:6],
-            ["docker", "compose", "-p", "buzz-harness", "-f", "docker-compose.harness.yml"],
+            ["docker", "compose", "-p", "buzz-harness-t1", "-f", "docker-compose.harness.yml"],
         )
 
 
@@ -392,6 +392,7 @@ class SchemaTests(unittest.TestCase):
 
         chatty = json.loads(json.dumps(line))
         chatty["bands"]["floor"]["client"]["sent_by_kind"]["9"] = 2
+        chatty["bands"]["floor"]["client"]["sent"] += 2
         self.assertEqual(
             tenant_cogs.acceptance_errors(chatty, summary, 0),
             ["floor sent non-heartbeat kinds {'9': 2}"],
@@ -410,6 +411,27 @@ class SchemaTests(unittest.TestCase):
             tenant_cogs.acceptance_errors(unknown, summary, 0),
             ["floor client.sent_by_kind missing"],
         )
+
+    def test_floor_kind_map_must_cover_every_send(self) -> None:
+        summary = {
+            "identities": {"humans": 10, "agents": 20},
+            "media": {"uploads": 3, "rejected": 0},
+            "git": {"pushes": 1, "failed": 0},
+        }
+        line = self.fixture()
+        line["bands"]["floor"]["client"]["sent"] = 330
+        line["bands"]["floor"]["client"]["sent_by_kind"] = {}
+        self.assertEqual(
+            tenant_cogs.acceptance_errors(line, summary, 0),
+            ["floor sent_by_kind covers 0 of 330 sends"],
+        )
+        line["bands"]["floor"]["client"]["sent_by_kind"] = {"20001": 329}
+        self.assertEqual(
+            tenant_cogs.acceptance_errors(line, summary, 0),
+            ["floor sent_by_kind covers 329 of 330 sends"],
+        )
+        line["bands"]["floor"]["client"]["sent_by_kind"] = {"20001": 330}
+        self.assertEqual(tenant_cogs.acceptance_errors(line, summary, 0), [])
 
 
 class HistogramQuantileTests(unittest.TestCase):
@@ -587,11 +609,15 @@ class TeardownTests(unittest.TestCase):
                 with tenant_cogs.RunSession(Adapter(), keep=False):
                     raise RuntimeError("ready failed")
 
-    def test_only_a_stack_the_run_brought_up_is_torn_down(self) -> None:
-        ns = lambda keep, skip: tenant_cogs.argparse.Namespace(keep=keep, skip_reset=skip)
-        self.assertFalse(tenant_cogs.keeps_stack(ns(False, False)))
-        self.assertTrue(tenant_cogs.keeps_stack(ns(True, False)))
-        self.assertTrue(tenant_cogs.keeps_stack(ns(False, True)))
+    def test_teardown_is_a_no_op_unless_this_process_ran_up(self) -> None:
+        def forbidden(*a, **k):
+            raise AssertionError("no docker call expected")
+
+        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", ("a.yml",), env={})
+        with mock.patch.object(tenant_cogs, "run", forbidden):
+            ad.teardown()
+            with tenant_cogs.RunSession(ad, keep=False):
+                pass
 
 
 class FloorPipelineTests(unittest.TestCase):
@@ -630,53 +656,150 @@ class FloorPipelineTests(unittest.TestCase):
         )
 
 
-class ComposeTeardownTests(unittest.TestCase):
-    def fake_run(self, leftovers: dict[str, str], calls: list):
-        def run(cmd, check=True, capture=True, env=None, timeout=None):
-            calls.append((cmd, check))
-            out = ""
-            for kind, ids in leftovers.items():
-                if kind in cmd:  # "ps", "volume" or "network"
-                    out = ids
-            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+class FakeDocker:
+    """Just enough docker for the adapter: per-project state, every call recorded."""
 
-        return run
+    LS = {"ps": "containers", "volume": "volumes", "network": "networks"}
 
-    def test_teardown_removes_and_verifies_the_project(self) -> None:
-        ad = tenant_cogs.ComposeAdapter("buzz-harness", ("a.yml",), env={})
-        calls: list = []
-        with mock.patch.object(tenant_cogs, "run", self.fake_run({}, calls)):
-            ad.teardown()
-            ad.reset()  # same verified removal; safe to repeat
-        down = ["docker", "compose", "-p", "buzz-harness", "-f", "a.yml", "down", "-v", "--remove-orphans"]
-        self.assertEqual(calls[0], (down, True))
-        label = "label=com.docker.compose.project=buzz-harness"
-        self.assertEqual(
-            [c[0] for c in calls[1:4]],
-            [
-                ["docker", "ps", "-a", "-q", "--filter", label],
-                ["docker", "volume", "ls", "-q", "--filter", label],
-                ["docker", "network", "ls", "-q", "--filter", label],
-            ],
-        )
-        self.assertTrue(all(check for _, check in calls))
-        self.assertEqual(len(calls), 8)
+    def __init__(self, state: dict | None = None, fail_down: bool = False) -> None:
+        self.state = {k: dict(v) for k, v in (state or {}).items()}
+        self.calls: list[list[str]] = []
+        self.fail_down = fail_down
+
+    def run(self, cmd, check=True, capture=True, env=None, timeout=None):
+        self.calls.append(cmd)
+        out = ""
+        if cmd[:2] == ["docker", "compose"]:
+            project, action = cmd[3], cmd[cmd.index("-f") + 2 :]
+            if action[:2] == ["up", "-d"] and len(action) == 2:
+                self.state[project] = {
+                    "containers": [f"{project}-relay-1"],
+                    "volumes": [f"{project}_data"],
+                    "networks": [f"{project}_default"],
+                }
+            elif action[0] == "down":
+                if self.fail_down:
+                    raise subprocess.CalledProcessError(1, cmd)
+                self.state.pop(project, None)
+        elif cmd[1] in self.LS:
+            project = cmd[-1].rsplit("=", 1)[1]
+            out = "\n".join(self.state.get(project, {}).get(self.LS[cmd[1]], []))
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    def projects_touched(self) -> set[str]:
+        out = set()
+        for cmd in self.calls:
+            if cmd[:2] == ["docker", "compose"]:
+                out.add(cmd[3])
+            else:
+                out.add(cmd[-1].rsplit("=", 1)[1])
+        return out
+
+    def deletes(self) -> list[list[str]]:
+        return [c for c in self.calls if "down" in c or "rm" in c]
+
+
+class ComposeProjectTests(unittest.TestCase):
+    def test_each_run_gets_its_own_harness_project(self) -> None:
+        name = tenant_cogs.compose_project_for("2026-09-30T15:43:32Z-c-10h-20a")
+        self.assertEqual(name, "buzz-harness-2026-09-30t154332z-c-10h-20a")
+        tenant_cogs.check_compose_project(name)
+
+    def test_a_non_harness_project_is_refused_before_any_call(self) -> None:
+        def forbidden(*a, **k):
+            raise AssertionError("no call expected")
+
+        with mock.patch.object(tenant_cogs, "run", forbidden):
+            for bad in ("buzz-prod", "buzz-harness", "buzz-harness-", "buzz-harness-X", "prod-buzz-harness-1"):
+                with self.assertRaises(tenant_cogs.Refused, msg=bad):
+                    tenant_cogs.ComposeAdapter(bad)
+
+    def test_up_on_a_fresh_project_then_teardown(self) -> None:
+        docker = FakeDocker()
+        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", ("a.yml",), env={})
+        with mock.patch.object(tenant_cogs, "run", docker.run):
+            with tenant_cogs.RunSession(ad, keep=False):
+                ad.up()
+            ad.teardown()  # safe to repeat
+        self.assertEqual(docker.state, {})
+        down = ["docker", "compose", "-p", "buzz-harness-t1", "-f", "a.yml", "down", "-v", "--remove-orphans"]
+        self.assertEqual(docker.deletes(), [down, down])
+
+    def test_a_non_empty_project_is_refused_and_nothing_deleted(self) -> None:
+        old = {"containers": ["c1"], "volumes": ["v1"], "networks": []}
+        docker = FakeDocker({"buzz-harness-old": old})
+        ad = tenant_cogs.ComposeAdapter("buzz-harness-old", ("a.yml",), env={})
+        with mock.patch.object(tenant_cogs, "run", docker.run):
+            with self.assertRaisesRegex(tenant_cogs.ProjectNotEmpty, "nothing was deleted"):
+                with tenant_cogs.RunSession(ad, keep=False):
+                    ad.up()
+        self.assertEqual(docker.deletes(), [])
+        self.assertFalse(any("up" in c for c in docker.calls))
+        self.assertEqual(docker.state["buzz-harness-old"], old)
+
+    def test_a_second_run_never_touches_the_first(self) -> None:
+        first = "buzz-harness-2026-09-30t150000z-c-10h-20a"
+        second = tenant_cogs.compose_project_for("2026-09-30T16:00:00Z-c-10h-20a")
+        still_up = {"containers": ["r1"], "volumes": ["d1"], "networks": ["n1"]}
+        docker = FakeDocker({first: still_up})
+        ad = tenant_cogs.ComposeAdapter(second, ("a.yml",), env={})
+        with mock.patch.object(tenant_cogs, "run", docker.run):
+            with tenant_cogs.RunSession(ad, keep=False):
+                ad.up()
+        self.assertNotEqual(first, second)
+        self.assertEqual(docker.projects_touched(), {second})
+        self.assertEqual(docker.state, {first: still_up})
 
     def test_leftovers_fail_teardown(self) -> None:
-        ad = tenant_cogs.ComposeAdapter("buzz-harness", ("a.yml",), env={})
-        with mock.patch.object(tenant_cogs, "run", self.fake_run({"volume": "vol1\n"}, [])):
+        docker = FakeDocker()
+        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", ("a.yml",), env={})
+
+        def down_leaves_a_volume(cmd, **kw):
+            out = docker.run(cmd, **kw)
+            if "down" in cmd:
+                docker.state["buzz-harness-t1"] = {"volumes": ["vol1"]}
+            return out
+
+        with mock.patch.object(tenant_cogs, "run", down_leaves_a_volume):
+            ad.up()
             with self.assertRaisesRegex(RuntimeError, r"not empty after teardown: \{'volumes': \['vol1'\]\}"):
                 ad.teardown()
 
     def test_failed_down_fails_teardown(self) -> None:
-        ad = tenant_cogs.ComposeAdapter("buzz-harness", ("a.yml",), env={})
-
-        def run(cmd, check=True, capture=True, env=None, timeout=None):
-            raise subprocess.CalledProcessError(1, cmd)
-
-        with mock.patch.object(tenant_cogs, "run", run):
+        docker = FakeDocker(fail_down=True)
+        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", ("a.yml",), env={})
+        with mock.patch.object(tenant_cogs, "run", docker.run):
+            ad.up()
             with self.assertRaises(subprocess.CalledProcessError):
                 ad.teardown()
+
+
+class RefusalTests(unittest.TestCase):
+    """Refusals happen before any command runs: no docker, no tenant_sim, no openssl."""
+
+    def refused(self, argv: list[str]) -> int:
+        def forbidden(*a, **k):
+            raise AssertionError(f"no command expected for {argv}")
+
+        with mock.patch.object(tenant_cogs, "run", forbidden), mock.patch.object(
+            tenant_cogs.subprocess, "Popen", forbidden
+        ), mock.patch.object(tenant_cogs.subprocess, "run", forbidden), mock.patch("sys.stderr"):
+            return tenant_cogs.main(argv)
+
+    def test_wrong_project_name(self) -> None:
+        for cmd in (["run"], ["seed-bench", "--limits", "raised"], ["sample"]):
+            argv = [*cmd, "--substrate", "compose", "--compose-project", "buzz-prod"]
+            self.assertEqual(self.refused(argv), 2, argv)
+
+    def test_seed_bench_skip_reset(self) -> None:
+        argv = ["seed-bench", "--substrate", "compose", "--limits", "raised", "--skip-reset"]
+        self.assertEqual(self.refused(argv), 2)
+
+    def test_run_skip_reset_needs_a_named_harness_project(self) -> None:
+        self.assertEqual(self.refused(["run", "--substrate", "compose", "--skip-reset"]), 2)
+
+    def test_sample_needs_a_named_harness_project(self) -> None:
+        self.assertEqual(self.refused(["sample", "--substrate", "compose"]), 2)
 
 
 class K3sRunTests(unittest.TestCase):
@@ -717,7 +840,7 @@ class SetupRateLimitTests(unittest.TestCase):
 
     def test_adapter_never_inherits_shell_overrides(self) -> None:
         with mock.patch.dict(os.environ, {VARS[0]: "7"}):
-            ad = tenant_cogs.ComposeAdapter(env={"BUZZ_IMAGE": "img"})
+            ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", env={"BUZZ_IMAGE": "img"})
         self.assertNotIn(VARS[0], ad.env)
         self.assertEqual(ad.env["BUZZ_IMAGE"], "img")
 
@@ -725,10 +848,11 @@ class SetupRateLimitTests(unittest.TestCase):
         calls: list[tuple[list[str], dict]] = []
 
         def fake_run(cmd, **kw):
-            calls.append((cmd, dict(kw.get("env") or {})))
+            if cmd[:2] == ["docker", "compose"]:  # skip the empty-project check
+                calls.append((cmd, dict(kw.get("env") or {})))
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        ad = tenant_cogs.ComposeAdapter(env={"SIM_RELAY_KEY": "k"})
+        ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", env={"SIM_RELAY_KEY": "k"})
         with mock.patch.object(tenant_cogs, "run", fake_run):
             ad.up(tenant_cogs.raised_limit_env(1000))
             ad.recreate_relay()

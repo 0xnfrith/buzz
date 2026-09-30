@@ -50,8 +50,19 @@ python3 perf/tenant_cogs.py run \
   --git-credential-helper ./target/release/git-credential-nostr
 ```
 
-`tenant_cogs.py` wipes the compose project (`down -v`) before each run unless
-you pass `--skip-reset`. Pass `--keep` to leave the stack up.
+Every `run` and `seed-bench` brings up its own Compose project,
+`buzz-harness-<run id>`, and prints the name. Nothing is ever deleted before
+`up`: the run first checks that the project has no container, volume or
+network, and refuses (exit 2, nothing deleted) if it has. `--compose-project`
+overrides the name, but only with one that starts with `buzz-harness-`; any
+other name is refused before any command runs. The host ports are fixed, so
+one harness stack runs at a time; a second `up` fails on the port and removes
+only its own project.
+
+`--keep` leaves the stack up under its printed name. `run --skip-reset
+--compose-project buzz-harness-<run>` samples a harness stack that is already
+running and never tears it down. `seed-bench` refuses `--skip-reset`: it
+always measures a fresh stack.
 
 Pin the image by digest (`ghcr.io/block/buzz@sha256:…`) for a result you
 will compare later; a tag can move. The results line records the digest and
@@ -202,8 +213,8 @@ The profile is parsed as TOML by both `tenant_sim` and `tenant_cogs.py`, so
 band lengths in `[bands]` are the lengths the orchestrator runs.
 
 A successful `run` exits 0 only when the floor shows 30 connections and is
-idle (every client send is presence or typing, kinds 20001/20002, and the
-relay stores nothing), sampled bands have zero unexpected rejects, media uploads succeeded with zero
+idle (the per-kind counts cover every client send, every one is presence or
+typing, kinds 20001/20002, and the relay stores nothing), sampled bands have zero unexpected rejects, media uploads succeeded with zero
 rejects, git pushed with zero failures, the three bands are distinct, and
 `lost_after_backfill` is 0. "Distinct" means the relay's working set rises:
 floor p50 < steady p50 < peak max. A results line is still appended for
@@ -213,12 +224,12 @@ diagnosis; the process exit is the weekly-job gate.
 that landed in that band (end-minus-start bucket counts), not a lifetime
 `sum/count` mean. Ready/summary reads time out against a silent child.
 
-`run` tears down only a stack it brought up: never with `--keep` or
-`--skip-reset`. Teardown is `docker compose down -v --remove-orphans`,
-then a check that no container, volume or network with the project's compose
-label is left. If either step fails, the run exits nonzero, even after a
-passing result. The reset before `up` runs the same removal and check, so a
-run never starts on an old stack. Both are safe to repeat.
+The only delete is the final teardown, and only of a stack this same process
+brought up: never with `--keep`, never with `--skip-reset`, never after a
+refused start. Teardown is `docker compose down -v --remove-orphans`, then a
+check that no container, volume or network with the project's compose label
+is left. If either step fails, the run exits nonzero, even after a passing
+result. Teardown is safe to repeat.
 
 ## What is not in this tree
 

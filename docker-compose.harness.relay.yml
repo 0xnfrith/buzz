@@ -1,4 +1,4 @@
-# Relay-as-container overlay for the isolated `buzz-harness` compose project.
+# Relay-as-container overlay for an isolated `buzz-harness-*` compose project.
 #
 # Pins the relay to two CPUs so workstation numbers are comparable to a
 # 2-vCPU box. Backing services stay in docker-compose.harness.yml.
@@ -7,7 +7,7 @@
 #   export SIM_OWNER_PUBKEY=$(./target/release/tenant_sim --print-owner --profile perf/profiles/10h-20a.toml)
 #   export SIM_RELAY_KEY=$(openssl rand -hex 32)
 #   export SIM_GIT_HMAC=$(openssl rand -hex 32)
-#   docker compose -p buzz-harness \
+#   docker compose -p buzz-harness-manual \
 #     -f docker-compose.harness.yml \
 #     -f docker-compose.harness.relay.yml up -d
 #
