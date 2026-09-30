@@ -64,6 +64,11 @@ doc/
 identity.key
 **/identity.key
 
+# tenant_sim / tenant_cogs local run artifacts (never push)
+/runs/
+/perf/runs/
+identities.json
+
 # Claude Code worktrees
 .claude/worktrees/
 

@@ -1,0 +1,81 @@
+# perf/profiles/10h-20a.toml — "ten humans, twenty agents"
+[profile]
+name        = "10h-20a"
+description = "10 humans x 2 agents each; small team with an agent fleet"
+seed        = 42               # deterministic RNG: same seed = same schedule
+
+[population]
+humans           = 10
+agents_per_human = 2           # → 20 agents, 30 identities total
+channels         = 6           # stream channels; every identity joins all
+repos            = 2           # git repos announced by agents (kind 30617)
+
+[bands]                        # seconds
+warmup  = 120                  # connect + provision + first backfill; NOT sampled
+floor   = 600                  # connected + subscribed + idle: presence heartbeats only, nothing stored
+steady  = 900                  # duty cycles below
+peak    = 300                  # storm + all agents active
+cooldown= 60                   # drain; NOT sampled
+
+[roles.human]
+backfill_limit          = 200  # REQ limit per channel on join
+presence_interval_s     = 60   # kind 20001
+typing_before_msg_prob  = 0.5  # kind 20002 before a message
+burst_len_s             = 90   # a human is chatty for 90 s ...
+burst_gap_s             = 600  # ... then silent ~10 min (bursty, mostly idle)
+peak_multiplier         = 3
+
+[roles.human.steady_per_hour]
+msg = 12
+reaction = 8
+edit = 1
+media = 0.5
+dm = 2
+
+[roles.agent]
+nip_oa                  = true # authenticate with an owner-signed auth tag
+active_s                = 300  # long-running: 5 min on ...
+idle_s                  = 900  # ... 15 min off (spiky)
+peak_multiplier = 4
+peak_all_active = true         # every agent is "on" for the whole peak band
+
+[roles.agent.steady_per_hour]
+msg = 40
+reaction = 10
+canvas = 2
+issue = 1
+pr = 0.5
+git_push = 1
+media = 1
+turn_metric = 20
+presence = 60
+
+[storm]                        # the Monday-9am backfill storm
+enabled        = true
+at_band        = "peak"        # fires at the start of this band
+joiners        = "humans"      # who reconnects cold
+stagger_s      = 10            # all joiners within this many seconds
+backfill_limit = 500
+
+[media]                        # bytes uploaded via PUT /media/upload (Blossom)
+sizes_kb = [40, 200, 1200]
+weights  = [0.6, 0.3, 0.1]
+
+[git]
+push_kb = [4, 64]              # random blob size per push; 1 commit per push
+
+[kinds]                        # override the default kind numbers if buzz renumbers
+msg = 9
+reaction = 7
+edit = 40003
+canvas = 40100
+issue = 1621
+pr = 1618
+repo_announce = 30617
+turn_metric = 44200
+presence = 20001
+typing = 20002
+dm = 1059
+member_add = 9000
+channel_create = 9007
+relay_member_add = 9030
