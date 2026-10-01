@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use super::git::{self, GitRepo};
+use super::guard::{self, Target};
 use super::kinds;
 use super::media;
 use super::profile::{Profile, Rates};
@@ -52,8 +53,10 @@ impl Population {
 }
 
 pub struct World {
-    pub relay_url: String,
-    pub http_url: String,
+    /// The relay's websocket URL, checked by the target guard.
+    pub relay_url: Target,
+    /// The relay's HTTP base (media and git), checked by the target guard.
+    pub http_url: Target,
     pub channels: Vec<String>,
     pub human_pubkeys: Vec<String>,
     pub repos: Vec<RepoRef>,
@@ -68,7 +71,8 @@ pub struct RepoRef {
     pub owner_hex: String,
     pub owner_nsec: String,
     pub a_tag: String,
-    pub clone_url: String,
+    /// The checked git URL: pushes go here, never to a URL read from disk.
+    pub clone_url: Target,
     pub worktree: PathBuf,
 }
 
@@ -287,7 +291,7 @@ async fn subscribe_all(
 }
 
 pub async fn connect_identity(
-    relay_url: &str,
+    relay_url: &Target,
     rec: &IdentityRecord,
     keys: &Keys,
     oa_owner: Option<&Keys>,
@@ -295,12 +299,12 @@ pub async fn connect_identity(
     if rec.role == "agent" {
         if let Some(owner) = oa_owner {
             let tag = nip_oa_tag(owner, keys)?;
-            let mut client = BuzzTestClient::connect_unauthenticated(relay_url).await?;
+            let mut client = BuzzTestClient::connect_unauthenticated(relay_url.as_str()).await?;
             client.authenticate_with_nip_oa(keys, &tag).await?;
             return Ok(client);
         }
     }
-    Ok(BuzzTestClient::connect(relay_url, keys).await?)
+    Ok(BuzzTestClient::connect(relay_url.as_str(), keys).await?)
 }
 
 struct Session {
@@ -324,7 +328,7 @@ struct Session {
     missing: HashSet<String>,
     last_seen_created_at: u64,
     git_repo: Option<GitRepo>,
-    http: reqwest::Client,
+    http: guard::HttpClient,
 }
 
 impl Session {
@@ -532,7 +536,7 @@ impl Session {
                         &k,
                         &repo.a_tag,
                         &repo.owner_hex,
-                        &repo.clone_url,
+                        repo.clone_url.as_str(),
                         &commit,
                         &name,
                         n,
@@ -716,9 +720,7 @@ pub async fn run_identity(
         missing: HashSet::new(),
         last_seen_created_at: unix_now(),
         git_repo,
-        http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?,
+        http: guard::http_client(Duration::from_secs(30))?,
     };
 
     let mut client = match connect_identity(

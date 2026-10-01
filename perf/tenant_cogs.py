@@ -12,6 +12,7 @@ import argparse
 import datetime as dt
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -25,10 +26,11 @@ import sys
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 
 SCHEMA = 1
@@ -93,6 +95,15 @@ def run(
     env: dict[str, str] | None = None,
     timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Every command the harness runs. A `docker` command must name a checked
+    endpoint (`docker_cmd`); it then runs with that endpoint as DOCKER_HOST and
+    without DOCKER_CONTEXT, whatever `env` or this process's environment says."""
+    if cmd and cmd[0] == "docker":
+        if len(cmd) < 3 or cmd[1] != "--host" or not isinstance(cmd[2], DockerEndpoint):
+            raise Refused(
+                f"docker command without a checked endpoint: {cmd[:3]}. Nothing was run."
+            )
+        env = docker_env(cmd[2], env)
     return subprocess.run(
         cmd,
         check=check,
@@ -136,6 +147,398 @@ def rate_limit_overrides(container_env: list[str]) -> dict[str, str]:
         if sep and name in RATE_LIMIT_VARS:
             out[name] = value
     return out
+
+
+# --- Docker endpoint guard -----------------------------------------------------
+# The Docker control connection is a target too: `run` and `seed-bench` create
+# and delete containers, volumes and networks through it. Before any lock,
+# output directory or docker command, the harness resolves the endpoint the
+# Docker CLI would use (DOCKER_HOST, else DOCKER_CONTEXT, else the config's
+# currentContext, else the default socket) and refuses unless it is a local
+# Unix socket. Every docker command then names that endpoint with `--host` and
+# runs with DOCKER_HOST set to it and DOCKER_CONTEXT removed. With a host
+# given, the Docker CLI uses the default context and never reads the context
+# store. A remote endpoint is never accepted here.
+
+DEFAULT_DOCKER_HOST = "unix:///var/run/docker.sock"
+
+
+class DockerEndpoint(str):
+    """A Docker endpoint resolve_docker_endpoint checked: a local Unix socket."""
+
+
+def docker_config_dir(env: Mapping[str, str]) -> Path:
+    cfg = env.get("DOCKER_CONFIG")
+    return Path(cfg) if cfg else Path(os.path.expanduser("~")) / ".docker"
+
+
+def _docker_refusal(why: str) -> "Refused":
+    return Refused(f"docker endpoint refused: {why}. Nothing was changed.")
+
+
+def _context_host(config_dir: Path, name: str, docker_host: str) -> str:
+    """The endpoint a named Docker context selects."""
+    if name == "default":
+        return docker_host or DEFAULT_DOCKER_HOST
+    meta = config_dir / "contexts" / "meta" / hashlib.sha256(name.encode()).hexdigest() / "meta.json"
+    try:
+        host = json.loads(meta.read_text())["Endpoints"]["docker"]["Host"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise _docker_refusal(f"cannot read docker context {name!r} ({exc})") from None
+    if not isinstance(host, str):
+        raise _docker_refusal(f"docker context {name!r} has no endpoint")
+    return host
+
+
+def _current_context(config_dir: Path) -> str:
+    path = config_dir / "config.json"
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return "default"
+    except (OSError, ValueError) as exc:
+        raise _docker_refusal(f"cannot read {path} ({exc})") from None
+    if not isinstance(data, dict):
+        raise _docker_refusal(f"{path} is not a JSON object")
+    name = data.get("currentContext") or "default"
+    if not isinstance(name, str):
+        raise _docker_refusal(f"{path} has a malformed currentContext")
+    return name
+
+
+def _local_socket(host: str, source: str) -> DockerEndpoint:
+    if not host.startswith("unix://"):
+        raise _docker_refusal(f"{source} selects {host!r}; only a local Unix socket is allowed")
+    path = host[len("unix://"):]
+    if not path.startswith("/"):
+        raise _docker_refusal(f"{source} selects {host!r}; the socket path must be absolute")
+    try:
+        mode = os.stat(path).st_mode  # follows a symlinked /var/run/docker.sock
+    except OSError as exc:
+        raise _docker_refusal(f"{source} selects {host!r}, which does not exist ({exc.strerror})") from None
+    if not stat.S_ISSOCK(mode):
+        raise _docker_refusal(f"{source} selects {host!r}, which is not a Unix socket")
+    return DockerEndpoint(host)
+
+
+def resolve_docker_endpoint(env: Mapping[str, str] | None = None) -> DockerEndpoint:
+    """The endpoint the Docker CLI would use, if it is a local Unix socket.
+
+    A DOCKER_CONTEXT naming anything else is refused even when DOCKER_HOST is
+    set, so no selector in the environment can point at a remote daemon."""
+    env = os.environ if env is None else env
+    config_dir = docker_config_dir(env)
+    host = env.get("DOCKER_HOST", "")
+    context = env.get("DOCKER_CONTEXT", "")
+    from_context = None
+    if context:
+        from_context = _local_socket(
+            _context_host(config_dir, context, host), f"DOCKER_CONTEXT={context}"
+        )
+    if host:
+        return _local_socket(host, "DOCKER_HOST")
+    if from_context is not None:
+        return from_context
+    name = _current_context(config_dir)
+    return _local_socket(_context_host(config_dir, name, ""), f"docker context {name!r}")
+
+
+def docker_cmd(endpoint: DockerEndpoint, *args: str) -> list[str]:
+    """A docker command bound to a checked endpoint."""
+    if not isinstance(endpoint, DockerEndpoint):
+        raise Refused(f"docker needs a checked endpoint, got {endpoint!r}. Nothing was run.")
+    return ["docker", "--host", endpoint, *args]
+
+
+def docker_env(endpoint: DockerEndpoint, env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """`env` (default: this process's) with DOCKER_HOST set to `endpoint` and
+    DOCKER_CONTEXT removed."""
+    src = os.environ if env is None else env
+    out = {k: v for k, v in src.items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
+    out["DOCKER_HOST"] = str(endpoint)
+    return out
+
+
+# --- Target guard ------------------------------------------------------------
+# The sampler's own wall against the wrong relay. Every URL it reads (health,
+# metrics) and every URL it hands tenant_sim must be a literal IP address, never
+# a name, inside the run's allow list (--allow-cidr, required) and not on its
+# deny list (--deny-list, required; the deny list wins). tenant_sim checks its
+# own targets again. No flag or environment variable turns this off.
+
+# Narrowest allow entry per IP version: a wider one would switch the allow
+# list off (0.0.0.0/0 allows everything).
+MIN_ALLOW_PREFIX = {4: 8, 6: 32}
+_IPV4_LITERAL = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
+_IPV6_CHARS = re.compile(r"[0-9A-Fa-f:.]+")
+_PORT = re.compile(r"[1-9][0-9]{0,4}")
+_PREFIX = re.compile(r"0|[1-9][0-9]{0,2}")
+
+IpAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _canonical_ip(ip: IpAddress) -> IpAddress:
+    """An IPv4-mapped IPv6 address is the IPv4 address it maps to."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _strict_ipv4(s: str) -> ipaddress.IPv4Address | None:
+    """Four decimal parts, no leading zeros: refuses 127.1, 0x7f.0.0.1, 0177.0.0.1."""
+    if not _IPV4_LITERAL.fullmatch(s):
+        return None
+    if any(len(p) > 1 and p.startswith("0") for p in s.split(".")):
+        return None
+    try:
+        return ipaddress.IPv4Address(s)
+    except ValueError:
+        return None
+
+
+def _strict_ipv6(s: str) -> ipaddress.IPv6Address | None:
+    """An IPv6 literal with no zone id (ipaddress itself accepts fe80::1%eth0)."""
+    if not _IPV6_CHARS.fullmatch(s):
+        return None
+    try:
+        return ipaddress.IPv6Address(s)
+    except ValueError:
+        return None
+
+
+def parse_ip_literal(s: str) -> IpAddress | None:
+    v4 = _strict_ipv4(s)
+    if v4 is not None:
+        return v4
+    v6 = _strict_ipv6(s)
+    return _canonical_ip(v6) if v6 is not None else None
+
+
+def parse_cidr(s: str) -> IpNetwork:
+    """`a.b.c.d/n`, `x::y/n`, or a bare address. Host bits must be zero; an
+    IPv4-mapped block becomes the IPv4 block it maps to."""
+    addr, sep, prefix = s.partition("/")
+    if sep and not _PREFIX.fullmatch(prefix):
+        raise ValueError(f"{s!r}: bad prefix length")
+    ip: IpAddress | None = _strict_ipv4(addr)
+    if ip is None:
+        ip = _strict_ipv6(addr)
+    if ip is None:
+        raise ValueError(f"{s!r}: not a literal IP address or block")
+    plen = int(prefix) if sep else ip.max_prefixlen
+    if plen > ip.max_prefixlen:
+        raise ValueError(f"{s!r}: prefix longer than {ip.max_prefixlen}")
+    if isinstance(ip, ipaddress.IPv6Address) and plen >= 96 and ip.ipv4_mapped is not None:
+        ip, plen = ip.ipv4_mapped, plen - 96
+    try:
+        return ipaddress.ip_network(f"{ip}/{plen}", strict=True)
+    except ValueError as exc:
+        start = ipaddress.ip_network(f"{ip}/{plen}", strict=False)
+        raise ValueError(f"{s!r}: host bits set; the block starts at {start}") from exc
+
+
+def parse_deny_list(text: str) -> list[IpNetwork]:
+    """One address or block per line; `#` comments and blank lines ignored."""
+    out: list[IpNetwork] = []
+    for i, line in enumerate(text.splitlines(), 1):
+        entry = line.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        try:
+            out.append(parse_cidr(entry))
+        except ValueError as exc:
+            raise ValueError(f"deny list line {i}: {exc}") from exc
+    return out
+
+
+class CheckedUrl(str):
+    """A URL that passed TargetGuard.check_url. http_get takes nothing else."""
+
+
+class TargetGuard:
+    def __init__(self, allow: list[IpNetwork], deny: list[IpNetwork]) -> None:
+        if not allow:
+            raise ValueError("the allow list is empty")
+        for net in allow:
+            floor = MIN_ALLOW_PREFIX[net.version]
+            if net.prefixlen < floor:
+                raise ValueError(
+                    f"--allow-cidr {net} is wider than /{floor}; that would switch the allow list off"
+                )
+        self.allow = allow
+        self.deny = deny
+
+    @classmethod
+    def from_args(cls, allow: list[str] | None, deny_list: str | None) -> "TargetGuard":
+        """Both flags are required. An empty deny-list file is fine; a missing one is not."""
+        if not allow:
+            raise Refused("--allow-cidr is required (repeatable; no default). Nothing was changed.")
+        if not deny_list:
+            raise Refused(
+                "--deny-list <file> is required (the file may be empty). Nothing was changed."
+            )
+        try:
+            text = Path(deny_list).read_text()
+            nets = [parse_cidr(a) for a in allow]
+            return cls(nets, parse_deny_list(text))
+        except (OSError, ValueError) as exc:
+            raise Refused(f"target guard: {exc}. Nothing was changed.") from exc
+
+    def check_ip(self, ip: IpAddress) -> None:
+        ip = _canonical_ip(ip)
+        if ip.is_unspecified or ip.is_multicast or ip == ipaddress.IPv4Address("255.255.255.255"):
+            raise ValueError(f"{ip} is not a unicast address")
+        for net in self.deny:
+            if ip.version == net.version and ip in net:
+                raise ValueError(f"{ip} is on the deny list ({net})")
+        if not any(ip.version == net.version and ip in net for net in self.allow):
+            raise ValueError(f"{ip} is outside the allow list")
+
+    def check_url(self, raw: str, schemes: tuple[str, ...]) -> CheckedUrl:
+        """`scheme://IP[:port][path]`, nothing a parser would rewrite, and the
+        stdlib parser must agree on the same address and port."""
+
+        def refuse(why: str) -> Refused:
+            return Refused(f"target {raw!r} refused: {why}. Nothing was changed.")
+
+        if not raw.isascii():
+            raise refuse("non-ASCII characters")
+        if any(c.isspace() or ord(c) < 32 or ord(c) == 127 or c in "\\%" for c in raw):
+            raise refuse("whitespace, control characters, '\\' or '%'")
+        scheme, sep, rest = raw.partition("://")
+        if not sep:
+            raise refuse("no scheme")
+        if scheme not in schemes:
+            raise refuse(f"scheme must be one of {list(schemes)}")
+        authority = re.match(r"[^/?#]*", rest).group(0)  # type: ignore[union-attr]
+        path = rest[len(authority):]
+        if any(c in path for c in "?#@"):
+            raise refuse("query, fragment or '@' after the address")
+        if "@" in authority:
+            raise refuse("userinfo ('@')")
+        ip: IpAddress | None
+        if authority.startswith("["):
+            host, closed, after = authority[1:].partition("]")
+            if not closed:
+                raise refuse("unclosed '['")
+            if after and not after.startswith(":"):
+                raise refuse("junk after ']'")
+            port = after[1:] if after else None
+            ip = _strict_ipv6(host)
+            if ip is None:
+                raise refuse("not an IPv6 literal")
+        else:
+            host, colon, port_s = authority.partition(":")
+            port = port_s if colon else None
+            ip = _strict_ipv4(host)
+            if ip is None:
+                raise refuse("not a literal IP address")
+        if port is not None and (not _PORT.fullmatch(port) or int(port) > 65535):
+            raise refuse("bad port")
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+            same = (
+                parsed.username is None
+                and parsed.password is None
+                and parsed.hostname is not None
+                and ipaddress.ip_address(parsed.hostname) == ip
+                and parsed.port == (int(port) if port is not None else None)
+            )
+        except ValueError:
+            same = False
+        if not same:
+            raise refuse("the URL parser reads a different address")
+        try:
+            self.check_ip(ip)
+        except ValueError as exc:
+            raise refuse(str(exc)) from exc
+        return CheckedUrl(raw)
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"redirect to {newurl!r} refused", headers, fp
+        )
+
+
+def guarded_opener() -> urllib.request.OpenerDirector:
+    """Plain HTTP only, redirects refused, and no ProxyHandler, so proxy
+    variables in the environment are never read. (`build_opener` would add
+    the environment-reading ProxyHandler.)"""
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        _RefuseRedirect(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
+_OPENER = guarded_opener()
+
+
+def http_get(url: CheckedUrl, timeout: float) -> Any:
+    """The sampler's only HTTP read."""
+    if not isinstance(url, CheckedUrl):
+        raise TypeError(f"http_get needs a URL checked by the target guard, got {url!r}")
+    return _OPENER.open(url, timeout=timeout)
+
+
+@dataclass(frozen=True)
+class Targets:
+    relay: CheckedUrl
+    http: CheckedUrl
+    health: CheckedUrl
+    metrics: CheckedUrl
+
+
+def check_targets(args: argparse.Namespace) -> Targets:
+    """Check every URL a run uses before the lock, docker or tenant_sim."""
+    guard = TargetGuard.from_args(args.allow_cidr, args.deny_list)
+    return Targets(
+        relay=guard.check_url(args.relay_url, ("ws", "wss")),
+        http=guard.check_url(args.http_url, ("http", "https")),
+        health=guard.check_url(args.health_url, ("http",)),
+        metrics=guard.check_url(args.metrics_url, ("http",)),
+    )
+
+
+def guard_args(args: argparse.Namespace) -> list[str]:
+    """The same allow and deny lists, passed on to tenant_sim."""
+    out: list[str] = []
+    for cidr in args.allow_cidr:
+        out.extend(["--allow-cidr", cidr])
+    out.extend(["--deny-list", str(Path(args.deny_list).resolve())])
+    return out
+
+
+def tenant_sim_cmd(
+    args: argparse.Namespace,
+    targets: Targets,
+    profile_path: Path,
+    out_dir: Path,
+    extra: list[str],
+) -> list[str]:
+    """tenant_sim with the checked targets and the same guard lists."""
+    return [
+        args.tenant_sim,
+        "--profile",
+        str(profile_path),
+        "--relay-url",
+        targets.relay,
+        "--http-url",
+        targets.http,
+        *guard_args(args),
+        "--out-dir",
+        str(out_dir),
+        "--git-credential-helper",
+        str(Path(args.git_credential_helper).resolve()),
+        *extra,
+    ]
 
 
 def percentile(xs: list[float], p: float) -> float:
@@ -382,9 +785,11 @@ class ExecAdapter:
     kubeconfig: str | None = None
     namespace: str = "buzz-loadtest"
     compose_files: tuple[str, ...] = COMPOSE_FILES
+    # The checked Docker endpoint; compose commands refuse without one.
+    endpoint: DockerEndpoint | None = None
 
     def compose_base(self) -> list[str]:
-        cmd = ["docker", "compose", "-p", self.project]
+        cmd = docker_cmd(self.endpoint, "compose", "-p", self.project)  # type: ignore[arg-type]
         for f in self.compose_files:
             cmd.extend(["-f", f])
         return cmd
@@ -394,7 +799,7 @@ class ExecAdapter:
 
     def exec_cmd(self, service: str, args: list[str], container: str | None = None) -> list[str]:
         if self.kind == "compose":
-            return ["docker", "exec", container or self.container(service), *args]
+            return docker_cmd(self.endpoint, "exec", container or self.container(service), *args)  # type: ignore[arg-type]
         # k3s: service is a kubectl target like "deploy/buzz" or a pod name.
         cmd = ["kubectl"]
         if self.kubeconfig:
@@ -432,14 +837,6 @@ class ExecAdapter:
             "mem_inactive_file": stat.get("inactive_file"),
             "mem_shmem": stat.get("shmem"),
         }
-
-
-def compose_ps_cmd(project: str, files: tuple[str, ...]) -> list[str]:
-    cmd = ["docker", "compose", "-p", project]
-    for f in files:
-        cmd.extend(["-f", f])
-    cmd.append("ps")
-    return cmd
 
 
 class Refused(Exception):
@@ -562,8 +959,15 @@ class ComposeAdapter:
         files: tuple[str, ...] = COMPOSE_FILES,
         env: dict[str, str] | None = None,
         lock: ProjectLock | None = None,
+        *,
+        endpoint: DockerEndpoint,
     ) -> None:
         check_compose_project(project)
+        if not isinstance(endpoint, DockerEndpoint):
+            raise Refused(f"ComposeAdapter needs a checked docker endpoint, got {endpoint!r}")
+        # Every compose and docker command of this stack goes to this endpoint,
+        # including teardown.
+        self.endpoint = endpoint
         self.project = project
         # This process's lock on the project; `up` refuses without it.
         self.lock = lock
@@ -575,7 +979,7 @@ class ComposeAdapter:
         self.owned = False
 
     def cmd(self, *args: str) -> list[str]:
-        out = ["docker", "compose", "-p", self.project]
+        out = docker_cmd(self.endpoint, "compose", "-p", self.project)
         for f in self.files:
             out.extend(["-f", f])
         out.extend(args)
@@ -612,23 +1016,23 @@ class ComposeAdapter:
 
     def relay_rate_limit_overrides(self) -> dict[str, str]:
         proc = run(
-            [
-                "docker",
+            docker_cmd(
+                self.endpoint,
                 "inspect",
                 "--format",
                 "{{json .Config.Env}}",
                 f"{self.project}-relay-1",
-            ],
+            ),
             check=True,
         )
         return rate_limit_overrides(json.loads(proc.stdout or "[]") or [])
 
-    def wait_ready(self, health_url: str, timeout_s: int = 180) -> None:
+    def wait_ready(self, health_url: CheckedUrl, timeout_s: int = 180) -> None:
         deadline = time.time() + timeout_s
         last = ""
         while time.time() < deadline:
             try:
-                with urllib.request.urlopen(health_url, timeout=2) as resp:
+                with http_get(health_url, timeout=2) as resp:
                     if resp.status == 200:
                         return
                     last = f"status {resp.status}"
@@ -642,9 +1046,9 @@ class ComposeAdapter:
         label = f"label=com.docker.compose.project={self.project}"
         out: dict[str, list[str]] = {}
         for kind, cmd in (
-            ("containers", ["docker", "ps", "-a", "-q", "--filter", label]),
-            ("volumes", ["docker", "volume", "ls", "-q", "--filter", label]),
-            ("networks", ["docker", "network", "ls", "-q", "--filter", label]),
+            ("containers", docker_cmd(self.endpoint, "ps", "-a", "-q", "--filter", label)),
+            ("volumes", docker_cmd(self.endpoint, "volume", "ls", "-q", "--filter", label)),
+            ("networks", docker_cmd(self.endpoint, "network", "ls", "-q", "--filter", label)),
         ):
             out[kind] = run(cmd, check=True, env=self.env).stdout.split()
         return out
@@ -662,7 +1066,28 @@ class ComposeAdapter:
             raise RuntimeError(f"compose project {self.project} not empty after teardown: {left}")
 
 
-def fingerprint_compose(relay_cpu_pin: float = 2.0) -> dict[str, Any]:
+# Services the harness pins to linux/amd64 (Block's MinIO image is amd64 only).
+AMD64_ONLY_SERVICES = ("minio", "minio-init")
+
+
+def emulated_services(docker_arch: str | None) -> list[str]:
+    """amd64-only services that run emulated on this Docker host."""
+    if docker_arch in ("x86_64", "amd64"):
+        return []
+    return list(AMD64_ONLY_SERVICES)
+
+
+def emulation_note(fp: dict[str, Any]) -> str | None:
+    emulated = fp.get("emulated") or []
+    if not emulated:
+        return None
+    return (
+        f"{', '.join(emulated)} ran emulated (linux/amd64 on {fp.get('docker_arch')}): "
+        "media upload times and MinIO CPU are not real-speed numbers"
+    )
+
+
+def fingerprint_compose(endpoint: DockerEndpoint, relay_cpu_pin: float = 2.0) -> dict[str, Any]:
     def sysctl(*args: str) -> str | None:
         try:
             return run(["sysctl", "-n", *args]).stdout.strip()
@@ -670,19 +1095,19 @@ def fingerprint_compose(relay_cpu_pin: float = 2.0) -> dict[str, Any]:
             return None
 
     docker = run(
-        [
-            "docker",
+        docker_cmd(
+            endpoint,
             "info",
             "--format",
-            "{{.NCPU}} {{.MemTotal}} {{.ServerVersion}}",
-        ],
+            "{{.NCPU}} {{.MemTotal}} {{.ServerVersion}} {{.Architecture}}",
+        ),
         check=False,
     )
-    ncpu, mem, ver = None, None, None
+    ncpu, mem, ver, arch = None, None, None, None
     if docker.returncode == 0:
         parts = docker.stdout.split()
-        if len(parts) >= 3:
-            ncpu, mem, ver = parts[0], parts[1], parts[2]
+        if len(parts) >= 4:
+            ncpu, mem, ver, arch = parts[0], parts[1], parts[2], parts[3]
     os_ver = None
     try:
         os_ver = run(["sw_vers", "-productVersion"], check=False).stdout.strip()
@@ -695,6 +1120,9 @@ def fingerprint_compose(relay_cpu_pin: float = 2.0) -> dict[str, Any]:
         "docker_cpus": ncpu,
         "docker_mem_bytes": mem,
         "docker_version": ver,
+        "docker_arch": arch,
+        "docker_endpoint": str(endpoint),
+        "emulated": emulated_services(arch),
         "relay_cpu_pin": relay_cpu_pin,
         "os": os_ver,
         "k3s_version": None,
@@ -735,38 +1163,13 @@ def fingerprint_k3s(ssh: str | None = None) -> dict[str, Any]:
     }
 
 
-def fetch_metrics(url: str) -> dict[str, Any] | None:
+def fetch_metrics(url: CheckedUrl) -> dict[str, Any] | None:
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with http_get(url, timeout=5) as resp:
             text = resp.read().decode("utf-8", "replace")
         return parse_prometheus(text)
     except (urllib.error.URLError, TimeoutError, OSError):
         return None
-
-
-def docker_stats_rss(project: str) -> dict[str, int]:
-    proc = run(
-        [
-            "docker",
-            "stats",
-            "--no-stream",
-            "--format",
-            "{{.Name}} {{.MemUsage}}",
-        ],
-        check=False,
-    )
-    out: dict[str, int] = {}
-    if proc.returncode != 0:
-        return out
-    for line in proc.stdout.splitlines():
-        if not line.startswith(project):
-            continue
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        name, mem = parts[0], parts[1]
-        out[name] = parse_docker_mem(mem)
-    return out
 
 
 def parse_docker_mem(s: str) -> int:
@@ -783,7 +1186,7 @@ class Sampler:
     def __init__(
         self,
         execs: ExecAdapter,
-        metrics_url: str,
+        metrics_url: CheckedUrl,
         services: dict[str, str],
     ) -> None:
         self.execs = execs
@@ -1247,9 +1650,9 @@ def git_head() -> str:
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
 
 
-def inspect_docker_image(image: str) -> dict[str, Any]:
+def inspect_docker_image(image: str, endpoint: DockerEndpoint) -> dict[str, Any]:
     proc = run(
-        ["docker", "image", "inspect", image, "--format", "{{json .}}"],
+        docker_cmd(endpoint, "image", "inspect", image, "--format", "{{json .}}"),
         check=False,
     )
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -1261,14 +1664,16 @@ def inspect_docker_image(image: str) -> dict[str, Any]:
 
 
 def resolve_buzz_identity(
-    image: str, inspect: dict[str, Any] | None = None
+    image: str,
+    inspect: dict[str, Any] | None = None,
+    endpoint: DockerEndpoint | None = None,
 ) -> tuple[str, str]:
     """Return (buzz_commit, buzz_image) that can distinguish two Monday runs.
 
     Never records the moving tag `main`. Prefer the image's immutable digest
     plus `org.opencontainers.image.revision` / `sha-<hex>` source commit.
     """
-    info = inspect if inspect is not None else inspect_docker_image(image)
+    info = inspect if inspect is not None else inspect_docker_image(image, endpoint)  # type: ignore[arg-type]
     repo_digests = info.get("RepoDigests") or []
     digest_ref = repo_digests[0] if repo_digests else None
     labels = (info.get("Config") or {}).get("Labels") or {}
@@ -1299,32 +1704,32 @@ def image_commit(image: str, inspect: dict[str, Any] | None = None) -> str:
     return resolve_buzz_identity(image, inspect)[0]
 
 
+K3S_UNGUARDED = (
+    "--substrate k3s is disabled for {cmd}: it would reach a host through ssh or "
+    "kubectl, which the target guard does not cover yet. Nothing was changed."
+)
+
+
 def cmd_fingerprint(args: argparse.Namespace) -> int:
-    if args.substrate == "compose":
-        print(json.dumps(fingerprint_compose(), indent=2))
-    else:
-        print(json.dumps(fingerprint_k3s(args.ssh), indent=2))
+    if args.substrate != "compose":
+        raise Refused(K3S_UNGUARDED.format(cmd="fingerprint"))
+    endpoint = resolve_docker_endpoint()
+    print(json.dumps(fingerprint_compose(endpoint), indent=2))
     return 0
 
 
 def cmd_sample(args: argparse.Namespace) -> int:
-    if args.substrate == "compose":
-        if not args.compose_project:
-            raise Refused("sample --substrate compose needs --compose-project buzz-harness-<run>")
-        check_compose_project(args.compose_project)
-    execs = ExecAdapter(
-        kind=args.substrate,
-        project=args.compose_project,
-        kubeconfig=args.kubeconfig,
-        namespace=args.namespace,
-    )
-    services = {
-        "relay": "relay" if args.substrate == "compose" else args.relay_target,
-        "postgres": "postgres" if args.substrate == "compose" else args.postgres_target,
-        "redis": "redis" if args.substrate == "compose" else args.redis_target,
-        "minio": "minio" if args.substrate == "compose" else args.minio_target,
-    }
-    sampler = Sampler(execs, args.metrics_url, services)
+    if args.substrate != "compose":
+        raise Refused(K3S_UNGUARDED.format(cmd="sample"))
+    if not args.compose_project:
+        raise Refused("sample --substrate compose needs --compose-project buzz-harness-<run>")
+    check_compose_project(args.compose_project)
+    endpoint = resolve_docker_endpoint()
+    guard = TargetGuard.from_args(args.allow_cidr, args.deny_list)
+    metrics = guard.check_url(args.metrics_url, ("http",))
+    execs = ExecAdapter(kind="compose", project=args.compose_project, endpoint=endpoint)
+    services = {"relay": "relay", "postgres": "postgres", "redis": "redis", "minio": "minio"}
+    sampler = Sampler(execs, metrics, services)
     row = sampler.sample("debug", True)
     print(json.dumps(row, indent=2))
     return 0
@@ -1375,6 +1780,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.substrate != "compose":
         print(K3S_RUN_DISABLED, file=sys.stderr)
         return 2
+    # Before the lock, docker or tenant_sim: a refused endpoint or target
+    # changes nothing.
+    endpoint = resolve_docker_endpoint()
+    targets = check_targets(args)
     if args.compose_project:
         check_compose_project(args.compose_project)
     elif args.skip_reset:
@@ -1397,39 +1806,34 @@ def cmd_run(args: argparse.Namespace) -> int:
     tenant_sim = args.tenant_sim
 
     notes: list[str] = []
-    adapter: Any = ComposeAdapter(project, tuple(args.compose_files.split(",")), env, lock=lock)
-    fp = fingerprint_compose()
+    adapter: Any = ComposeAdapter(
+        project, tuple(args.compose_files.split(",")), env, lock=lock, endpoint=endpoint
+    )
+    fp = fingerprint_compose(endpoint)
+    note = emulation_note(fp)
+    if note:
+        notes.append(note)
     services = {
         "relay": "relay",
         "postgres": "postgres",
         "redis": "redis",
         "minio": "minio",
     }
-    execs = ExecAdapter(kind="compose", project=project)
+    execs = ExecAdapter(kind="compose", project=project, endpoint=endpoint)
     substrate_label = args.substrate_label or "workstation-orbstack"
 
     with RunSession(adapter, keep=args.keep) as session:
         if not args.skip_reset:
             adapter.up(raised_limit_env(setup_limit))
-        adapter.wait_ready(args.health_url)
+        adapter.wait_ready(targets.health)
 
-        sim_cmd = [
-            tenant_sim,
-            "--profile",
-            str(profile_path),
-            "--relay-url",
-            args.relay_url,
-            "--http-url",
-            args.http_url,
-            "--out-dir",
-            str(out_dir),
-            "--git-credential-helper",
-            str(Path(args.git_credential_helper).resolve()),
-            "--band-signal",
-            "stdin",
-            "--log-level",
-            "info",
-        ]
+        sim_cmd = tenant_sim_cmd(
+            args,
+            targets,
+            profile_path,
+            out_dir,
+            ["--band-signal", "stdin", "--log-level", "info"],
+        )
         if args.blink:
             sim_cmd.append("--blink")
         if setup_limit:
@@ -1453,7 +1857,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             # Measured bands run at the relay's default limits: restart the
             # relay alone before any identity connects.
             adapter.recreate_relay()
-            adapter.wait_ready(args.health_url)
+            adapter.wait_ready(targets.health)
             notes.append(
                 f"setup rate limits raised to {setup_limit}; relay restarted "
                 "with default limits before the population connected"
@@ -1470,7 +1874,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             proc.stdin.flush()
         wait_ready_line(proc, args.ready_timeout)
 
-        sampler = Sampler(execs, args.metrics_url, services)
+        sampler = Sampler(execs, targets.metrics, services)
         samples: list[dict[str, Any]] = []
 
         def run_band(band: str, seconds: int, sampled: bool) -> None:
@@ -1513,7 +1917,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if "community" in msg.lower():
                 notes.append(f"community bootstrap: {msg} x{n}")
 
-        buzz_commit, buzz_image = resolve_buzz_identity(image)
+        buzz_commit, buzz_image = resolve_buzz_identity(image, endpoint=endpoint)
         line = write_results_line(
             Path(args.results),
             run_id=run_id,
@@ -1614,6 +2018,8 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
             "seed-bench always measures a fresh stack under its own project name; "
             "--skip-reset has nothing to skip. Nothing was changed."
         )
+    endpoint = resolve_docker_endpoint()
+    targets = check_targets(args)
     if args.compose_project:
         check_compose_project(args.compose_project)
     project = resolve_compose_project(args, new_run_id("seed", args.limits))
@@ -1624,39 +2030,36 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     env, image = sim_env(args, profile_path)
     limit = DEFAULT_SETUP_RATE_LIMIT if args.limits == "raised" else 0
-    adapter = ComposeAdapter(project, tuple(args.compose_files.split(",")), env, lock=lock)
-    execs = ExecAdapter(kind="compose", project=project)
+    adapter = ComposeAdapter(
+        project, tuple(args.compose_files.split(",")), env, lock=lock, endpoint=endpoint
+    )
+    execs = ExecAdapter(kind="compose", project=project, endpoint=endpoint)
     sampler = Sampler(
         execs,
-        args.metrics_url,
+        targets.metrics,
         {"relay": "relay", "postgres": "postgres", "redis": "redis", "minio": "minio"},
     )
     with RunSession(adapter, keep=args.keep) as session:
         adapter.up(raised_limit_env(limit))
-        adapter.wait_ready(args.health_url)
+        adapter.wait_ready(targets.health)
         overrides = adapter.relay_rate_limit_overrides()
         expected = raised_limit_env(limit)
         if overrides != expected:
             raise RuntimeError(f"relay rate-limit env {overrides} != expected {expected}")
         proc = subprocess.Popen(
-            [
-                args.tenant_sim,
-                "--profile",
-                str(profile_path),
-                "--relay-url",
-                args.relay_url,
-                "--http-url",
-                args.http_url,
-                "--out-dir",
-                str(out_dir),
-                "--git-credential-helper",
-                str(Path(args.git_credential_helper).resolve()),
-                "--seed-events",
-                str(args.seed_events),
-                "--seed-max-seconds",
-                str(args.seed_max_seconds),
-                "--setup-only",
-            ],
+            tenant_sim_cmd(
+                args,
+                targets,
+                profile_path,
+                out_dir,
+                [
+                    "--seed-events",
+                    str(args.seed_events),
+                    "--seed-max-seconds",
+                    str(args.seed_max_seconds),
+                    "--setup-only",
+                ],
+            ),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,
@@ -1674,7 +2077,7 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("tenant_sim did not exit after setup") from exc
         result = seed_bench_result(args.limits, done.get("seed") or {}, before, after)
-        result["buzz_image"] = resolve_buzz_identity(image)[1]
+        result["buzz_image"] = resolve_buzz_identity(image, endpoint=endpoint)[1]
         result["relay_rate_limit_env"] = overrides
         result["provision"] = setup_line.get("provision")
         result["tenant_sim_exit"] = code
@@ -1779,6 +2182,11 @@ def cmd_blink(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_docker_endpoint(args: argparse.Namespace) -> int:
+    print(resolve_docker_endpoint())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tenant_cogs.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1786,10 +2194,22 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--substrate", choices=("compose", "k3s"), required=True)
         sp.add_argument("--profile", default="perf/profiles/10h-20a.toml")
-        sp.add_argument("--relay-url", default="ws://localhost:3030")
-        sp.add_argument("--http-url", default="http://localhost:3030")
-        sp.add_argument("--metrics-url", default="http://localhost:9202/metrics")
-        sp.add_argument("--health-url", default="http://localhost:8088/_readiness")
+        # Targets are literal IP addresses, never names (see the target guard).
+        sp.add_argument("--relay-url", default="ws://127.0.0.1:3030")
+        sp.add_argument("--http-url", default="http://127.0.0.1:3030")
+        sp.add_argument("--metrics-url", default="http://127.0.0.1:9202/metrics")
+        sp.add_argument("--health-url", default="http://127.0.0.1:8088/_readiness")
+        sp.add_argument(
+            "--allow-cidr",
+            action="append",
+            default=[],
+            help="block every target must sit inside (repeatable; required to connect; no default)",
+        )
+        sp.add_argument(
+            "--deny-list",
+            default=None,
+            help="file of addresses/blocks no target may use; wins over --allow-cidr (required to connect; may be empty)",
+        )
         sp.add_argument("--out-dir", default="./runs/latest")
         sp.add_argument("--results", default="metrics/cogs/results.jsonl")
         sp.add_argument("--cadence", type=int, default=DEFAULT_CADENCE)
@@ -1845,6 +2265,10 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--limits", choices=("default", "raised"), required=True)
     bench.add_argument("--seed-events", type=int, default=20000)
     bench.add_argument("--seed-max-seconds", type=int, default=300)
+    sub.add_parser(
+        "docker-endpoint",
+        help="print the checked local Docker endpoint, or refuse (exit 2); used by build-linux.sh",
+    )
     return p
 
 
@@ -1856,6 +2280,7 @@ def main(argv: list[str] | None = None) -> int:
         "blink": cmd_blink,
         "run": cmd_run,
         "seed-bench": cmd_seed_bench,
+        "docker-endpoint": cmd_docker_endpoint,
     }
     try:
         return commands[args.cmd](args)
