@@ -336,6 +336,18 @@ class Ramps(unittest.TestCase):
         self.assertEqual([s["k"] for s in r["steps"]], [30, 45, 60])
         self.assertEqual(r["relays"]["a"], {"held_k": 60, "ended": "held at the max"})
 
+    def test_a_step_that_would_pass_the_max_stops_at_it(self) -> None:
+        """The step doesn't divide the max: the last step is the max itself,
+        and no generator is ever sent more identities than that."""
+        w = World(["a"])
+        code, res = self.ramp(w, bc.Ramp(start=30, step=15, every_s=300, max=70, budget_s=36000))
+        self.assertEqual(code, 0)
+        r = res["items"][0]["ramp"]
+        self.assertEqual([s["k"] for s in r["steps"]], [30, 45, 60, 70])
+        ramps_a = [l.split()[1] for g, l in w.lines if g == "a" and l.startswith("ramp ")]
+        self.assertEqual(ramps_a, ["30", "45", "60", "70"])
+        self.assertEqual(r["relays"]["a"], {"held_k": 70, "ended": "held at the max"})
+
     def test_a_ramp_that_runs_out_of_time(self) -> None:
         w = World(["a"])
         code, res = self.ramp(w, bc.Ramp(start=30, step=15, every_s=300, max=660, budget_s=900))
