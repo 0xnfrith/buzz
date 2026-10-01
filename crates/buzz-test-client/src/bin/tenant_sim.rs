@@ -1335,6 +1335,59 @@ mod tests {
             (code, live["ended"].as_str(), live["joined"].as_u64()),
             (0, Some("stop"), Some(18))
         );
+
+        // A setup clone that can't happen fails setup: exit 3, before
+        // setup-done, with the clone's own line. The solo profile has one
+        // repo; the git server refuses it, or the credential helper is
+        // missing (then no git runs).
+        let refusing =
+            sim::guard::testsrv::Server::start("127.0.0.1:0", sim::guard::testsrv::status(404, ""));
+        for (name, helper, reached) in [
+            ("clone-refused", "/usr/bin/true".to_string(), true),
+            (
+                "clone-no-helper",
+                dir.join("no-such-helper").to_string_lossy().into_owned(),
+                false,
+            ),
+        ] {
+            let before = refusing.accepts();
+            let out = dir.join(name);
+            let args = Args::try_parse_from([
+                "tenant_sim".to_string(),
+                "--profile".into(),
+                solo.to_string_lossy().into_owned(),
+                "--relay-url".into(),
+                relay.clone(),
+                "--http-url".into(),
+                refusing.http(),
+                "--allow-cidr".into(),
+                "127.0.0.0/8".into(),
+                "--deny-list".into(),
+                deny.to_string_lossy().into_owned(),
+                "--out-dir".into(),
+                out.to_string_lossy().into_owned(),
+                "--band-signal".into(),
+                "fifo".into(),
+                "--git-credential-helper".into(),
+                helper,
+            ])
+            .expect("args");
+            let task = tokio::spawn(run(args));
+            let code = match timeout(Duration::from_secs(60), task).await {
+                Ok(joined) => joined.expect("join").expect("run"),
+                Err(_) => panic!("{name}: the run went on past a failed setup clone"),
+            };
+            assert_eq!(code, 3, "{name}");
+            assert!(
+                !read(&out.join("phases.jsonl")).contains("setup-done"),
+                "{name}: setup-done after a failed clone"
+            );
+            assert_eq!(
+                refusing.accepts() > before,
+                reached,
+                "{name}: git reached the server"
+            );
+        }
     }
 
     #[test]
