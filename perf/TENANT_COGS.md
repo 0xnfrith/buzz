@@ -431,6 +431,10 @@ python3 perf/tenant_cogs.py remote-sample \
     failures. A missing or unreadable `--live-file` is a void too, never
     "no errors", and so is a file without `rejected`, `media_failed` or
     `git_failed`: a total missing is never read as 0.
+  - `tenant_sim`'s live counters stop being live: `t_unix` missing or not
+    a whole number of seconds, more than 10 s old or 10 s ahead of the
+    clock when the loop reads it, or lower than the last one read. The
+    writer and the loop share the generator box's clock.
   - "The relay breaks" is the first of: relay rejects or dropped
     connections rising in the live counters, a relay OOM kill, or no relay
     container in a `docker ps` that worked (a failed listing is not a
@@ -442,7 +446,10 @@ python3 perf/tenant_cogs.py remote-sample \
 `tenant_sim` rewrites `<out-dir>/live.json` every 2 s for this: totals of
 sent, accepted, rejected and received, its own errors by kind
 (`send_failed`, `recv_error`, `reconnect_failed`, `backfill_failed`,
-`connection_dropped`), and media and git failures. A media or git failure
+`connection_dropped`), and media and git failures, stamped `t_unix`. If a
+rewrite fails, `tenant_sim` logs it and carries on; the file then goes
+stale and the loop voids 10 s later, so stop the loop before `tenant_sim`
+ends. A media or git failure
 counts whether the relay refused it or the generator failed to send it, so
 a relay that refuses uploads before any other sign of breaking voids the
 run as the generator's fault.

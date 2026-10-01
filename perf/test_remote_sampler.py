@@ -387,6 +387,29 @@ class Voids(unittest.TestCase):
             self.assertIsNone(m.gen_tick(t, gen_sample(t, 0, 0), live_counters(t, rejected=5, send_failed=1), None))
         self.assertEqual(len(m.notes), 2, "one rise is noted once")
 
+    def test_live_counters_must_be_live(self) -> None:
+        """tenant_sim rewrites the file every 2 s; one it stopped rewriting
+        must not pass. Each case voids with its own line."""
+        rows = [
+            ("stale", [(1000, 989)], "the generator's live counters are stale: t_unix 989 is 11.0 s old, over the 10 s limit"),
+            ("stale later", [(1000, 1000), (1005, 1000), (1011, 1000)], "the generator's live counters are stale: t_unix 1000 is 11.0 s old, over the 10 s limit"),
+            ("ahead", [(1000, 1011)], "the generator's live counters are ahead of this box's clock: t_unix 1011 is 11.0 s ahead, over the 10 s limit"),
+            ("backwards", [(1000, 1000), (1005, 999)], "the generator's live counters went backwards: t_unix 999, after 1000"),
+        ]
+        for name, ticks, want in rows:
+            with self.subTest(name):
+                m = rs.Monitor(expected={}, live_required=True)
+                for t, lt in ticks[:-1]:
+                    self.assertIsNone(m.gen_tick(t, gen_sample(t, 0, 0), live_counters(lt), None))
+                t, lt = ticks[-1]
+                v = m.gen_tick(t, gen_sample(t, 0, 0), live_counters(lt), None)
+                self.assertEqual((v.reason, v.box, v.t_unix, v.gen_event_t), (want, "generator", t, t))
+
+    def test_live_counters_within_the_limit_pass(self) -> None:
+        m = rs.Monitor(expected={}, live_required=True)
+        for t, lt in ((1000, 990), (1005, 995), (1010, 1000), (1010, 1000), (1015, 1025)):
+            self.assertIsNone(m.gen_tick(t, gen_sample(t, 0, 0), live_counters(lt), None), (t, lt))
+
     def test_media_and_git_failures_are_the_generators_own_errors(self) -> None:
         """Each rising before the relay breaks voids; after it, a note."""
         for k in ("media_failed", "git_failed"):
@@ -426,7 +449,13 @@ class Voids(unittest.TestCase):
             p.write_text("{")
             self.assertEqual(rs.read_live(str(p))[1], f"{p} is not JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)")
             p.write_text("{}")
+            self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no t_unix"))
+            p.write_text('{"t_unix": 7}')
             self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no client_errors"))
+            for bad in ('"7"', "true", "7.5", "0", "-3", "null"):
+                with self.subTest(t_unix=bad):
+                    p.write_text('{"t_unix": %s, "client_errors": {}, "rejected": 0, "media_failed": 0, "git_failed": 0}' % bad)
+                    self.assertEqual(rs.read_live(str(p)), (None, f"{p}: t_unix {bad} is not a whole number of seconds"))
             whole = live_counters(7)
             p.write_text(json.dumps({**whole, "client_errors": {"send_failed": "2"}}))
             self.assertEqual(rs.read_live(str(p)), (None, f"{p} has a counter that is not a whole number"))
@@ -520,6 +549,41 @@ class Loop(unittest.TestCase):
             self.assertEqual(code, 3)
             void = json.loads((Path(d) / "samples" / "void.json").read_text())
             self.assertEqual(void["reason"], "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: the reply is not a fast sample")
+
+    def test_live_counters_written_once_void_as_stale(self) -> None:
+        """The production seam: run_loop reads the file from disk each tick."""
+        with tempfile.TemporaryDirectory() as d:
+            live = Path(d) / "live.json"
+            live.write_text(json.dumps(live_counters(1000)))
+            code, _ = self.drive(self.settings(Path(d), live_file=str(live)),
+                                 lambda t, tier: (0, json.dumps(relay_sample(t, tier=tier)), ""))
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual((void["reason"], void["box"], void["t_unix"]),
+                             ("the generator's live counters are stale: t_unix 1000 is 15.0 s old, over the 10 s limit", "generator", 1015.0))
+            self.assertEqual(self.stderr, f"void: {void['reason']}\n")
+
+    def test_live_counters_rewritten_each_tick_never_void(self) -> None:
+        """The age is taken when the file is read, not when the tick began:
+        slow ssh calls before it must not make a fresh file look ahead."""
+        with tempfile.TemporaryDirectory() as d:
+            live = Path(d) / "live.json"
+            clock = {"t": 1000.0}
+
+            def runner(argv: list[str]) -> tuple[int, str, str]:
+                clock["t"] += 15  # each call takes 15 s
+                live.write_text(json.dumps(live_counters(int(clock["t"]))))
+                return 0, json.dumps(relay_sample(clock["t"], tier=argv[-1])), ""
+
+            def local(tier: str, cfg: dict) -> dict:
+                return {**gen_sample(clock["t"], 0, int(clock["t"])), "tier": tier}
+
+            live.write_text(json.dumps(live_counters(1000)))
+            s = self.settings(Path(d), live_file=str(live), duration=120.0)
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = rs.run_loop(s, runner=runner, clock=lambda: clock["t"], sleep=lambda sec: None, local=local)
+            self.assertEqual(code, 0)
+            self.assertFalse((Path(d) / "samples" / "void.json").exists())
 
     def test_bands_and_the_end_of_a_run(self) -> None:
         with tempfile.TemporaryDirectory() as d:

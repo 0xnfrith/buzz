@@ -14,7 +14,8 @@ the conditions that void a run:
   two 60 s windows in a row, MemAvailable under 10% of MemTotal for 3 ticks,
   an out-of-memory kill on its box, or its own errors rising in tenant_sim's
   live counters, media and git failures included;
-- tenant_sim's live counters are missing or unreadable;
+- tenant_sim's live counters are missing, unreadable, stale, ahead of the
+  clock, or go backwards;
 
 On a void it writes `<out>/samples/void.json` and exits 3; whoever drives
 the bands acts on that. It never stops anything itself.
@@ -62,6 +63,9 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 LIVE_TOTALS = ("rejected", "media_failed", "git_failed")
 # Media uploads and git pushes that failed: the generator's own errors too.
 GEN_FAILURE_TOTALS = ("media_failed", "git_failed")
+# tenant_sim rewrites live.json every 2 s. Older than this (five writes
+# missed), or this far ahead of the clock, the file is no longer live.
+LIVE_MAX_AGE_S = 10.0
 
 
 class Refused(Exception):
@@ -235,6 +239,7 @@ class Monitor:
     mem_min_pct: float = 10.0
     mem_ticks: int = 3
     live_required: bool = False
+    live_max_age_s: float = LIVE_MAX_AGE_S
     consecutive: dict[str, int] = field(default_factory=dict)
     misses: dict[str, int] = field(default_factory=dict)
     ticks: dict[str, int] = field(default_factory=dict)
@@ -290,9 +295,11 @@ class Monitor:
                 self.relay_break(t, f"{key}: the relay was OOM-killed")
         return None
 
-    def gen_tick(self, t: float, sample: dict[str, Any], live: dict[str, Any] | None, live_err: str | None) -> Void | None:
+    def gen_tick(self, t: float, sample: dict[str, Any], live: dict[str, Any] | None, live_err: str | None,
+                 live_t: float | None = None) -> Void | None:
         """The generator box's own tick: its sample, and tenant_sim's live
-        counters (or why they can't be read)."""
+        counters (or why they can't be read), read at live_t (t if not
+        given). tenant_sim and the loop share this box's clock."""
         events: list[str] = []
         ticks = (sample.get("box") or {}).get("cpu", {}).get("ticks") or {}
         if ticks:
@@ -325,6 +332,18 @@ class Monitor:
         if self.live_required:
             if live is None:
                 return Void(f"the generator's live counters: {live_err}", "generator", t, gen_event_t=t, relay_break_t=self.relay_break_t)
+            # tenant_sim logs a failed rewrite and carries on, so an old
+            # file with no errors in it must not pass as a live one.
+            lt, now = live["t_unix"], t if live_t is None else live_t
+            stale = None
+            if self._live0 is not None and lt < self._live0["t_unix"]:
+                stale = f"went backwards: t_unix {lt}, after {self._live0['t_unix']}"
+            elif now - lt > self.live_max_age_s:
+                stale = f"are stale: t_unix {lt} is {now - lt:.1f} s old, over the {self.live_max_age_s:g} s limit"
+            elif lt - now > self.live_max_age_s:
+                stale = f"are ahead of this box's clock: t_unix {lt} is {lt - now:.1f} s ahead, over the {self.live_max_age_s:g} s limit"
+            if stale:
+                return Void(f"the generator's live counters {stale}", "generator", t, gen_event_t=t, relay_break_t=self.relay_break_t)
             # Each tick is compared with the one before, so one rise is
             # reported once.
             ce = live.get("client_errors") or {}
@@ -358,7 +377,11 @@ def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
         v = json.loads(text)
     except json.JSONDecodeError as e:
         return None, f"{path} is not JSON: {e}"
-    if not isinstance(v, dict) or not isinstance(v.get("client_errors"), dict):
+    if not isinstance(v, dict) or "t_unix" not in v:
+        return None, f"{path} has no t_unix"
+    if type(v["t_unix"]) is not int or v["t_unix"] <= 0:
+        return None, f"{path}: t_unix {json.dumps(v['t_unix'])} is not a whole number of seconds"
+    if not isinstance(v.get("client_errors"), dict):
         return None, f"{path} has no client_errors"
     for k in LIVE_TOTALS:
         if k not in v:
@@ -614,6 +637,7 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
                             return void(v)
             if s.self_role and s.self_config is not None:
                 live, live_err = read_live(s.live_file) if s.live_file else (None, None)
+                live_t = clock()
                 for tier in tiers:
                     sample = local(tier, s.self_config)
                     now_cpu = own_cpu_s()
@@ -622,7 +646,7 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
                     rings[s.self_role].append(json.dumps({"t": t, "band": band, "tier": tier, "sample": sample, **({"live": live} if live else {})}, separators=(",", ":")))
                     stats[s.self_role].add(tier, sample)
                     if tier == "fast":
-                        v = mon.gen_tick(t, sample, live, live_err)
+                        v = mon.gen_tick(t, sample, live, live_err, live_t)
                         if v:
                             return void(v)
             if s.once or (s.duration is not None and clock() - start >= s.duration):
