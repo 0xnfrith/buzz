@@ -271,6 +271,9 @@ async fn subscribe_all(
             .collect_until_eose(&sid, Duration::from_secs(12))
             .await;
         let eose_ok = eose_result.is_ok();
+        if !eose_ok {
+            stats.record_client_error("backfill_failed");
+        }
         let n = apply_eose(identity, ch, eose, eose_result)?;
         returned += n;
         if record_join && eose_ok {
@@ -279,14 +282,13 @@ async fn subscribe_all(
     }
     let sid = format!("{identity}-p");
     client.subscribe(&sid, vec![filter_p(pubkey)]).await?;
-    apply_eose(
-        identity,
-        "#p",
-        eose,
-        client
-            .collect_until_eose(&sid, Duration::from_secs(8))
-            .await,
-    )?;
+    let p_result = client
+        .collect_until_eose(&sid, Duration::from_secs(8))
+        .await;
+    if p_result.is_err() {
+        stats.record_client_error("backfill_failed");
+    }
+    apply_eose(identity, "#p", eose, p_result)?;
     Ok(returned)
 }
 
@@ -415,6 +417,7 @@ impl Session {
                     self.stats
                         .record_send(band.as_str(), kind, false, &e.to_string(), 0.0);
                 }
+                self.stats.record_client_error("send_failed");
                 warn!("{} kind {kind} send failed: {e}", self.rec.name);
                 false
             }
@@ -560,7 +563,7 @@ impl Session {
                 .await
                 {
                     Ok(up) => {
-                        self.stats.record_media(true, up.bytes, up.put_ms);
+                        self.stats.record_media(up.bytes, up.put_ms);
                         let content = format!("media {}", up.url);
                         self.send_channel(client, band, |seq| {
                             kinds::stream_message(&keys, &k, &ch, &name, seq, &content)
@@ -568,24 +571,25 @@ impl Session {
                         .await?;
                     }
                     Err(e) => {
-                        warn!("{} media: {e}", self.rec.name);
-                        self.stats.record_media(false, 0, 0.0);
+                        warn!("{} media ({:?}): {e}", self.rec.name, e.at);
+                        self.stats.record_media_failed(e.at);
                     }
                 }
             }
             "git_push" => {
-                if let Some(repo) = self.git_repo.as_ref() {
+                if let Some(repo) = self.git_repo.clone() {
                     let lo = self.profile.git.push_kb[0];
                     let hi = *self.profile.git.push_kb.last().unwrap_or(&lo);
                     let kb = lo + (rng_f64(&mut self.rng) * (hi.saturating_sub(lo) as f64)) as u64;
                     let mut blob = vec![0u8; (kb * 1024).max(1) as usize];
                     self.rng.fill(blob.as_mut_slice());
                     let git_seq = self.seq + 1;
-                    match git::push_blob(repo, &self.world.git_helper, &blob, git_seq) {
-                        Ok((bytes, ms)) => self.stats.record_git(true, bytes, ms),
+                    let helper = self.world.git_helper.clone();
+                    match git::push_blob_async(repo, helper, blob, git_seq).await {
+                        Ok((bytes, ms)) => self.stats.record_git(bytes, ms),
                         Err(e) => {
-                            warn!("{} git push: {e}", self.rec.name);
-                            self.stats.record_git(false, 0, 0.0);
+                            warn!("{} git push ({:?}): {e}", self.rec.name, e.at);
+                            self.stats.record_git_failed(e.at);
                         }
                     }
                 }
@@ -670,6 +674,7 @@ impl Session {
                     return Ok(client);
                 }
                 Err(e) => {
+                    self.stats.record_client_error("reconnect_failed");
                     warn!("{} reconnect failed: {e}", self.rec.name);
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(cap);
@@ -855,6 +860,7 @@ pub async fn run_identity(
                         )
                         .await?;
                 } else if is_closed {
+                    sess.stats.record_client_error("connection_dropped");
                     warn!("{} connection dropped: {s}", sess.rec.name);
                     client = sess
                         .reconnect(
@@ -866,6 +872,7 @@ pub async fn run_identity(
                         )
                         .await?;
                 } else {
+                    sess.stats.record_client_error("recv_error");
                     warn!("{} recv: {s}", sess.rec.name);
                 }
             }

@@ -10,9 +10,29 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 
 use super::guard::Target;
+use super::stats::GitFailure;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// A failed push, and where it failed: the live counters keep the
+/// generator's own failures apart from the relay's.
+#[derive(Debug)]
+pub struct PushError {
+    pub at: GitFailure,
+    pub err: anyhow::Error,
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.err)
+    }
+}
+
+fn failed(at: GitFailure) -> impl Fn(anyhow::Error) -> PushError {
+    move |err| PushError { at, err }
+}
+
+#[derive(Clone)]
 pub struct GitRepo {
     pub name: String,
     pub owner_hex: String,
@@ -206,25 +226,65 @@ pub fn clone_repo(
     })
 }
 
-pub fn push_blob(repo: &GitRepo, helper: &Path, bytes: &[u8], seq: u64) -> Result<(u64, f64)> {
+/// [`clone_repo`] on tokio's blocking pool: git runs as a child process for
+/// up to [`GIT_TIMEOUT`], and must not hold a runtime worker meanwhile.
+pub async fn clone_repo_async(
+    http_url: Target,
+    owner_hex: String,
+    name: String,
+    dest: PathBuf,
+    helper: PathBuf,
+    nsec: String,
+    auth_tag: Option<String>,
+) -> Result<GitRepo> {
+    tokio::task::spawn_blocking(move || {
+        clone_repo(
+            &http_url,
+            &owner_hex,
+            &name,
+            &dest,
+            &helper,
+            &nsec,
+            auth_tag.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("clone task: {e}"))?
+}
+
+/// Commits `bytes` as a new file and pushes it. Writing the file, `add`,
+/// `commit` and `branch` are the generator's own work (`Local`); the push
+/// is the relay's (`Push`). Each blob is a new file, so `commit` always has
+/// a change to commit.
+pub fn push_blob(
+    repo: &GitRepo,
+    helper: &Path,
+    bytes: &[u8],
+    seq: u64,
+) -> std::result::Result<(u64, f64), PushError> {
+    let local = failed(GitFailure::Local);
     let file = repo.worktree.join(format!("blob-{seq}.bin"));
-    std::fs::write(&file, bytes)?;
+    std::fs::write(&file, bytes)
+        .with_context(|| format!("write {}", file.display()))
+        .map_err(&local)?;
     let tag = repo.owner_auth_tag.as_deref();
-    git_ok(&["add", "."], &repo.worktree, helper, &repo.owner_nsec, tag)?;
-    let _ = git_ok(
+    git_ok(&["add", "."], &repo.worktree, helper, &repo.owner_nsec, tag).map_err(&local)?;
+    git_ok(
         &["commit", "--quiet", "-m", &format!("sim {seq}")],
         &repo.worktree,
         helper,
         &repo.owner_nsec,
         tag,
-    );
-    let _ = git_ok(
+    )
+    .map_err(&local)?;
+    git_ok(
         &["branch", "-M", "main"],
         &repo.worktree,
         helper,
         &repo.owner_nsec,
         tag,
-    );
+    )
+    .map_err(&local)?;
     let start = Instant::now();
     git_ok(
         &["push", "--quiet", repo.url.as_str(), "main"],
@@ -232,8 +292,29 @@ pub fn push_blob(repo: &GitRepo, helper: &Path, bytes: &[u8], seq: u64) -> Resul
         helper,
         &repo.owner_nsec,
         tag,
-    )?;
+    )
+    .map_err(failed(GitFailure::Push))?;
     Ok((bytes.len() as u64, start.elapsed().as_secs_f64() * 1e3))
+}
+
+/// [`push_blob`] on tokio's blocking pool: git runs as child processes for
+/// up to [`GIT_TIMEOUT`] each, and must not hold a runtime worker meanwhile.
+/// The generator box has 2 vCPUs, so 2 workers: two slow pushes run on
+/// them would stall every task, the live counters' writer too.
+pub async fn push_blob_async(
+    repo: GitRepo,
+    helper: PathBuf,
+    bytes: Vec<u8>,
+    seq: u64,
+) -> std::result::Result<(u64, f64), PushError> {
+    tokio::task::spawn_blocking(move || push_blob(&repo, &helper, &bytes, seq))
+        .await
+        .unwrap_or_else(|e| {
+            Err(PushError {
+                at: GitFailure::Local,
+                err: anyhow!("push task: {e}"),
+            })
+        })
 }
 
 #[cfg(test)]
@@ -438,6 +519,185 @@ mod tests {
         let _ = push_blob(&repo, helper, b"blob", 1);
         assert!(checked.accepts() >= 1, "push did not reach the checked URL");
         assert_eq!(elsewhere.accepts(), 0, "push went to origin");
+    }
+
+    /// A fresh worktree whose pushes go to `url`.
+    fn local_repo(wt: PathBuf, url: Target) -> GitRepo {
+        std::fs::create_dir_all(&wt).expect("mkdir");
+        git_ok(
+            &["init", "--quiet"],
+            &wt,
+            Path::new("/usr/bin/true"),
+            NSEC,
+            None,
+        )
+        .expect("init");
+        GitRepo {
+            name: "r".into(),
+            owner_hex: OWNER.into(),
+            owner_nsec: NSEC.into(),
+            owner_auth_tag: None,
+            worktree: wt,
+            url,
+        }
+    }
+
+    fn remote(server: &Server) -> Target {
+        guard()
+            .check_url(&server.http(), &["http"])
+            .and_then(|t| t.join(&format!("/git/{OWNER}/r")))
+            .expect("allowed")
+    }
+
+    /// Each blob is a new file, so `add`, `commit` and `branch` succeed on
+    /// every push of a healthy run: a push the relay refuses fails as the
+    /// relay's (`Push`), never as the generator's (`Local`).
+    #[test]
+    fn a_healthy_run_never_fails_commit() {
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let dir = testsrv::tempdir();
+        let repo = local_repo(dir.join("wt"), remote(&refusing));
+        let helper = Path::new("/usr/bin/true");
+        for seq in 1..=3u64 {
+            let e = push_blob(&repo, helper, &[seq as u8; 32], seq).expect_err("a push to a 404");
+            assert_eq!(e.at, GitFailure::Push, "push {seq}: {e}");
+        }
+        let n = git_ok(
+            &["rev-list", "--count", "main"],
+            &repo.worktree,
+            helper,
+            NSEC,
+            None,
+        )
+        .expect("rev-list");
+        assert_eq!(n.trim(), "3", "every push committed its blob");
+        assert!(refusing.accepts() >= 3);
+    }
+
+    /// `commit` failing is the generator's own failure. A healthy run can't
+    /// reach it (each blob is a new file); the same blob twice does.
+    #[test]
+    fn a_commit_with_nothing_new_is_local() {
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let dir = testsrv::tempdir();
+        let repo = local_repo(dir.join("wt"), remote(&refusing));
+        let helper = Path::new("/usr/bin/true");
+        let first = push_blob(&repo, helper, b"same", 7).expect_err("a push to a 404");
+        assert_eq!(first.at, GitFailure::Push, "{first}");
+        let again = push_blob(&repo, helper, b"same", 7).expect_err("nothing to commit");
+        assert_eq!(again.at, GitFailure::Local, "{again}");
+        assert!(again.to_string().contains("commit"), "{again}");
+    }
+
+    /// `git add` failing is the generator's own failure, and nothing is
+    /// pushed. The repo's own index is locked, so `add` fails inside the
+    /// test's repo whatever surrounds the temp dir.
+    #[test]
+    fn an_add_that_fails_is_local() {
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let dir = testsrv::tempdir();
+        let repo = local_repo(dir.join("wt"), remote(&refusing));
+        std::fs::write(repo.worktree.join(".git").join("index.lock"), b"").expect("lock");
+        let e = push_blob(&repo, Path::new("/usr/bin/true"), b"x", 1).expect_err("index locked");
+        assert_eq!(e.at, GitFailure::Local, "{e}");
+        assert!(e.to_string().contains("\"add\""), "{e}");
+        assert_eq!(refusing.accepts(), 0, "a failed add still pushed");
+    }
+
+    /// Two pushes to a remote that answers only after 12 s, at once, on a
+    /// 2-worker runtime: the generator box's 2 vCPUs. The live counters'
+    /// writer keeps running, so live.json is never more than a few seconds
+    /// old; the sampler voids at 10 s. Run on the workers, the pushes would
+    /// stall it for the whole 12 s.
+    #[test]
+    fn slow_pushes_do_not_stall_the_live_writer() {
+        use crate::sim::stats::{spawn_live_writer, write_live, Stats};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let slow = Server::start_after(
+            "127.0.0.1:0",
+            testsrv::status(500, ""),
+            Duration::from_secs(12),
+        );
+        let dir = testsrv::tempdir();
+        let repos: Vec<GitRepo> = (0..2)
+            .map(|i| local_repo(dir.join(format!("wt{i}")), remote(&slow)))
+            .collect();
+        let live = dir.join("live.json");
+        let now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_secs_f64()
+        };
+        // tenant_sim writes the file once before the writer starts.
+        let stats = Arc::new(Stats::new());
+        write_live(&live, &stats.live(now() as u64)).expect("first write");
+        let done = Arc::new(AtomicBool::new(false));
+        // A plain thread, off the runtime, reads live.json's age throughout.
+        let watcher = {
+            let (live, done) = (live.clone(), done.clone());
+            thread::spawn(move || {
+                let (mut worst, mut reads) = (0.0f64, 0u32);
+                while !done.load(Ordering::SeqCst) {
+                    let t = std::fs::read(&live)
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .and_then(|v| v["t_unix"].as_u64());
+                    if let Some(t) = t {
+                        worst = worst.max(now() - t as f64);
+                        reads += 1;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                (worst, reads)
+            })
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = Instant::now();
+        let results = rt.block_on(async {
+            let writer = spawn_live_writer(stats.clone(), live.clone(), Duration::from_secs(2));
+            let pushes: Vec<_> = repos
+                .into_iter()
+                .enumerate()
+                .map(|(i, repo)| {
+                    tokio::spawn(push_blob_async(
+                        repo,
+                        PathBuf::from("/usr/bin/true"),
+                        vec![i as u8; 64],
+                        1,
+                    ))
+                })
+                .collect();
+            let mut out = Vec::new();
+            for p in pushes {
+                out.push(p.await.expect("push task"));
+            }
+            writer.abort();
+            out
+        });
+        let took = started.elapsed();
+        done.store(true, Ordering::SeqCst);
+        let (worst, reads) = watcher.join().expect("watcher");
+        assert!(
+            took >= Duration::from_secs(12),
+            "the pushes didn't wait for the slow remote: {took:?}"
+        );
+        for r in results {
+            let e = r.map(|_| ()).expect_err("a push to a 500");
+            assert_eq!(e.at, GitFailure::Push, "{e}");
+        }
+        assert!(reads >= 20, "live.json was read only {reads} times");
+        assert!(
+            worst < 5.0,
+            "live.json was {worst:.1} s old while two slow pushes ran; the sampler voids at 10 s"
+        );
     }
 
     #[test]

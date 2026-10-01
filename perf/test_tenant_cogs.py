@@ -205,6 +205,7 @@ class MemoryStatTests(unittest.TestCase):
         rows = [row(1, 40, 10), row(6, 50, 12), row(11, 45, 14)]
         stats = tenant_cogs.band_stats(rows, "floor", None)
         self.assertEqual(stats["relay"]["rss_bytes"], {"p50": 45.0, "p95": 50.0, "max": 50.0})
+        self.assertEqual(stats["relay"]["rss_samples"], 3)
         self.assertEqual(stats["relay"]["anon_bytes"], {"p50": 12.0, "p95": 14.0, "max": 14.0})
 
 
@@ -257,6 +258,7 @@ class SchemaTests(unittest.TestCase):
                 "cpu_s_per_tenant_hour": 4.0,
                 "cpu_s_per_1k_events": 0.1,
                 "rss_bytes": {"p50": 10_000_000, "p95": 12_000_000, "max": 15_000_000},
+                "rss_samples": 12,
             }
 
         band = {
@@ -439,6 +441,44 @@ class SchemaTests(unittest.TestCase):
         bad["bands"]["steady"]["relay_metrics"]["events_rejected"] = 27
         errs = tenant_cogs.acceptance_errors(bad, summary, 0)
         self.assertTrue(any("events_rejected" in e for e in errs))
+
+    def summary_ok(self) -> dict:
+        return {
+            "identities": {"humans": 10, "agents": 20},
+            "media": {"uploads": 3, "rejected": 0},
+            "git": {"pushes": 2, "failed": 0},
+        }
+
+    def test_band_order_is_a_note_not_a_gate(self) -> None:
+        # A valid paid run must not fail because the relay's working set
+        # didn't rise floor < steady < peak.
+        line = self.fixture()
+        line["bands"]["floor"]["relay"]["rss_bytes"]["p50"] = 30_000_000
+        line["bands"]["steady"]["relay"]["rss_bytes"]["p50"] = 10_000_000
+        self.assertEqual(tenant_cogs.acceptance_errors(line, self.summary_ok(), 0), [])
+        self.assertEqual(
+            tenant_cogs.band_order_note(line),
+            "band order: not distinct (relay working set floor p50=30000000 steady p50=10000000 peak max=20000000)",
+        )
+        self.assertEqual(
+            tenant_cogs.band_order_note(self.fixture()),
+            "band order: distinct (relay working set rises floor < steady < peak)",
+        )
+
+    def test_each_sampled_band_needs_three_working_set_samples(self) -> None:
+        for name in ("floor", "steady", "peak"):
+            with self.subTest(band=name):
+                line = self.fixture()
+                line["bands"][name]["relay"]["rss_samples"] = 2
+                self.assertEqual(
+                    tenant_cogs.acceptance_errors(line, self.summary_ok(), 0),
+                    [f"{name}: 2 samples with the relay's working set, fewer than 3"],
+                )
+                del line["bands"][name]["relay"]["rss_samples"]
+                self.assertEqual(
+                    tenant_cogs.acceptance_errors(line, self.summary_ok(), 0),
+                    [f"{name}: 0 samples with the relay's working set, fewer than 3"],
+                )
 
     def test_floor_must_be_idle(self) -> None:
         summary = {

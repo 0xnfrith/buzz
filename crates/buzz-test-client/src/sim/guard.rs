@@ -445,6 +445,12 @@ pub(crate) mod testsrv {
 
     impl Server {
         pub fn start(bind: &str, response: String) -> Server {
+            Server::start_after(bind, response, std::time::Duration::ZERO)
+        }
+
+        /// [`Server::start`], but each answer waits `delay` first: a slow
+        /// remote.
+        pub fn start_after(bind: &str, response: String, delay: std::time::Duration) -> Server {
             let listener = TcpListener::bind(bind).expect("bind test server");
             let addr = listener.local_addr().expect("addr");
             let accepts = Arc::new(AtomicUsize::new(0));
@@ -472,6 +478,7 @@ pub(crate) mod testsrv {
                         }
                         let mut body = vec![0u8; len];
                         let _ = reader.read_exact(&mut body);
+                        std::thread::sleep(delay);
                         let mut stream = reader.into_inner();
                         let _ = stream.write_all(response.as_bytes());
                         let _ = stream.flush();
