@@ -21,6 +21,8 @@ guard"); the default URLs use `127.0.0.1`. k3s runs are disabled for now (see
 | `perf/tenant_cogs.py` | orchestrator + cgroup/Postgres/MinIO/`/metrics` sampler |
 | `perf/cogs_report.py` | bands → proposed Helm values, density, diff, anchor |
 | `docker-compose.harness.relay.yml` | overlay that runs the relay as a 2-CPU container on top of `docker-compose.harness.yml` |
+| `perf/band_clock.py` | the band clock (`tenant_cogs.py clock`): drives every `tenant_sim` of a run through one hook command; stdlib only |
+| `perf/clock-proof.sh`, `perf/clock_proof.py`, `perf/clock_proof_hook.py`, `perf/clock-proof/` | the clock's local proof: two relay stacks on this machine, and its hook |
 
 ## One-time build
 
@@ -471,8 +473,10 @@ band lengths in `[bands]` are the lengths the orchestrator runs.
 
 A successful `run` exits 0 only when the floor shows 30 connections and is
 idle (the per-kind counts cover every client send, every one is presence or
-typing, kinds 20001/20002, and the relay stores nothing), sampled bands have zero unexpected rejects, media uploads succeeded with zero
-rejects, git pushed with zero failures, each sampled band (floor, steady,
+typing, kinds 20001/20002, and the relay stores nothing), sampled bands have zero unexpected rejects, no send the relay
+didn't answer and none that failed before it was written, media uploads succeeded with zero
+rejects, git pushed with zero failures, no agent read failed and, when agents
+took turns, at least one read was answered, each sampled band (floor, steady,
 peak) has at least 3 samples carrying the relay's working set, and
 `lost_after_backfill` is 0. Whether the bands are distinct (the relay's
 working set rising floor p50 < steady p50 < peak max) is reported as
@@ -735,6 +739,130 @@ blocking pool, never on a runtime worker: each git command can take up to
 90 s, and the generator box's 2 vCPUs give the runtime 2 workers. Two slow
 pushes on them would stall every task, the live counters' writer
 included, and the loop would void the run as stale at the relay's limit.
+
+## The band clock (`tenant_cogs.py clock`)
+
+One clock drives every `tenant_sim` of a run: each profile's bands in turn,
+then a ramp. `tenant_cogs.py clock` runs `perf/band_clock.py`, which is one
+stdlib-only file so a wrapper can pin it by its sha256.
+
+```bash
+python3 perf/tenant_cogs.py clock --gen a --gen b \
+  --profile perf/profiles/10h-20a.toml \
+  --ramp perf/profiles/10h-20a.toml --ramp-start 30 --ramp-step 15 --ramp-every 300 --ramp-max 660 \
+  --out <dir> --setup-must-not-rate-limit -- <hook command...>
+```
+
+**It knows nothing about where the relays or generators run.** Everything it
+does to the world goes through the hook: a command, run with an event and
+its arguments appended, no shell, its output capped at 16 MiB and its time
+at 1800 s.
+
+| Event | Arguments | The hook... |
+|---|---|---|
+| `setup` | item | readies every relay for the item (a profile's name, or `ramp`): a fresh stack, at the raised setup limits |
+| `gen-start` | gen, item | starts that generator for the item, `--pause-after-setup`, its band signal on a fifo |
+| `phases` | gen | prints that generator's phase lines (`phases.jsonl`) |
+| `fleet` | | restarts every relay at its fleet limits, and fails if a raised limit is still set |
+| `send` | gen, line | sends one band-signal line to that generator |
+| `sampler` | `start` or `stop` | starts or stops the sampler loop (`remote-sample`), one `--live` per relay |
+| `band` | name | tells the sampler the band's name (its `--band-file`) |
+| `boundary` | band | checks the run at a measured band's end (for example, an egress proof) |
+| `rules` | | checks the run's isolation |
+| `status` | | prints JSON: `void` (the loop's `void.json`), `breaks` (its `breaks.json`), `sampler` and `gens` (`active` or how each ended) |
+| `end` | | the run is over: stops whatever still runs. Always called |
+
+**The order of an item:**
+
+1. `setup`, then `gen-start` for each generator, then a barrier: every
+   generator's `setup-done`. A `setup-failed` line, or no `setup-done`
+   within `--setup-timeout` (3600 s), stops the run (exit 5).
+2. With `--setup-must-not-rate-limit`, a `setup-done` whose
+   `provision.rate_limited` isn't 0 stops the run (exit 6): the setup
+   limits are raised, so a rate limit there means the setup is wrong.
+3. `fleet`, then `continue` to each generator, then a barrier on `ready`
+   (`--ready-timeout`, 300 s), then `sampler start`.
+4. Each band: its line to every generator with a lease of its length plus
+   `--lease-slack` (120 s), the sampler told, the band held. After each
+   measured band (`floor`, `steady`, `peak`) every generator pauses (`band
+   pause`, lease `--pause-lease`, 900 s), then the rules and `boundary`
+   run. **A boundary that fails stops the run.**
+5. `stop` to each generator, wait until each has ended
+   (`--stop-timeout`), `sampler stop`.
+
+**While it holds a band** it reads `status` every `--cadence` (5 s) and runs
+`rules` every `--rules-every` (60 s) and at each boundary. It stops the run
+on a void (exit 3, `void: <the loop's reason>`), on a sampler or a
+generator that ended on its own (exit 3), and on any hook event that exits
+nonzero (exit 4, `the hook failed at <event>: exit <n>: <its last line>`).
+**It never decides "the relay broke" itself:** it reads each relay's
+break from `status`, as the sampler loop wrote it.
+
+**The ramp** (`--ramp`, a profile's TOML; its warmup runs first): every
+generator to `band steady`, then `ramp <k>` steps from `--ramp-start`, adding
+`--ramp-step` every `--ramp-every` seconds up to `--ramp-max`, within
+`--ramp-budget` (4 h). A step is the band `ramp-<n>` to the sampler, so its
+ack test is judged on it. **A step's breaks are read as the next step
+begins** (the sampler judges a step when the band changes), and each is put
+on the step its break names. A generator whose relay broke is stopped
+without waiting for it to end, so one slow to stop (its relay frozen) holds
+no other generator's next step past its lease; the item's end waits for
+every generator it stopped. The ramp ends when every relay broke, at the
+max, past its budget, or on a void. After the last step it pauses and waits `--judge-wait` (15 s, three
+of the sampler's 5 s ticks) before it reads the last step's result.
+
+**What it writes:** `<out>/clock.json`, rewritten whole after each item and at
+the end: the generators, each item (its provision, the bands it ran, and a
+ramp's steps and each relay's `held_k`, `broke_k`, `broke_step`, `why` and
+`band`, or `held_k` and `ended`: "held at the max" or "the ramp's time ran
+out"), the exit and the line that stopped it. **A ramp stopped by a void or
+a failed hook keeps its steps and each break found before it;** a relay
+that hadn't broken has no result (`held_k` stays null): the void voids it.
+
+**Exits:** 0 done; 2 refused (bad arguments, a profile that can't be read);
+3 void; 4 a hook failed; 5 setup failed or timed out; 6 setup was
+rate-limited with `--setup-must-not-rate-limit`; 130 and 143 on INT and TERM.
+**`end` always runs,** whatever stopped the run; an `end` that fails turns
+exit 0 into 4 and is in `clock.json`.
+
+**If the clock itself dies,** nothing runs `end`. The generators stop on
+their own when their leases run out (`"ended": "lease"`), and the loop voids
+on that. Whatever runs the clock must then run `end`, or its own teardown.
+
+## The clock's local proof (`clock-proof.sh`)
+
+`perf/clock-proof.sh --out <dir>` builds `tenant_sim` and
+`git-credential-nostr`, then runs `perf/clock_proof.py`: the real clock,
+`tenant_sim`, sampler loop and relays, on this machine. Each generator
+drives its own stack, a Compose project `<prefix>-a` or `<prefix>-b`
+(`perf/clock-proof/compose.yml`), through `perf/clock_proof_hook.py`. It
+prints which `python3` ran and checks first that every image is already
+here by its exact reference (Compose runs with `--pull never`; a missing
+image stops the proof) and that both projects are empty. The proof
+profiles in `perf/clock-proof/profiles` are pinned by `SHA256SUMS`: short
+bands, and rates high enough that a short band has its 20 acks and agents
+take turns. Every check prints PASS or FAIL; the proof exits 1 if any
+failed. Whatever happens in a row, the hook's `end` runs after it, and the
+proof checks nothing is left by label.
+
+| Row | What it forces | What must happen |
+|---|---|---|
+| `reads` | nothing: two generators through every band | exit 0; both sent every band in order, paused after each measured one; the rules every minute and at each boundary; fleet read back no raised limit; **every agent read answered, none refused or dropped** |
+| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and the ack test breaks it on a step after at least one held; a holds to the max |
+| `ramp-freeze` | relay b frozen (`docker pause`) at the second step | exit 0; b broke at step 2 because its sends went unanswered (`send_unanswered`, none `send_failed`): a break, never a void; a holds to the max |
+| `boundary` | the floor's boundary check fails | exit 4 on that line; no band after it; `end` ran |
+| `void` | generator a stopped (SIGSTOP) in the steady band | the loop voids on a's stale live file; exit 3 on that line |
+| `crash-gen` | generator b killed (SIGKILL) in the steady band | exit 3: "the generator for b stopped on its own: exited -9" |
+| `crash-clock` | the clock killed (SIGKILL) in the steady band | each generator's lease runs out (exit 5, `ended: lease`); the loop voids on a lost driver and exits 3; nothing ran `end` until the proof did |
+| `heavy-seed` | one generator, `25h-75a`'s 90-day seed (757,803 events) at raised limits | every event acknowledged, and the seed's time |
+
+**What only a rented run can show:** the relays on their own boxes and the
+generator on another, so the generator box's CPU and memory void is real
+(here the generators share the machine with the relays, and nothing samples
+it); the relay box's own signals over ssh (memory, OOM kills, a missing
+relay container); real network latency; and a relay's limit found by load
+alone, at its real size. The local relays are capped by Docker, and Docker
+Hub's arm64 MinIO stands in for the pinned one (amd64 only).
 
 ## What is not in this tree
 

@@ -1,0 +1,90 @@
+# perf/clock-proof/profiles/proof-heavy.toml: the band clock's local proof, the
+# heavy seed's time. perf/profiles/25h-75a.toml with short bands: the same
+# population and rates, so its 90-day seed is the heavy profile's.
+#
+# A made-up example profile. Every rate below is provisional until
+# calibration: they are the original guesses, per identity. The three example
+# profiles (1h-5a solo, 10h-20a team, 25h-75a heavy) share these per-identity
+# rates; only the population and the world shape differ. World shape is
+# scaled from the team profile: one channel per 5 identities and one repo per
+# 10 agents, rounded up. Both are provisional too.
+[profile]
+name        = "proof-heavy"
+description = "heavy: 25 humans x 3 agents each; a busy organisation (rates provisional until calibration)"
+seed        = 42               # deterministic RNG: same seed = same schedule
+
+[population]
+humans           = 25
+agents_per_human = 3           # → 75 agents, 100 identities total
+channels         = 20          # stream channels; every identity joins all
+repos            = 8           # git repos announced by agents (kind 30617)
+
+[bands]                        # seconds: short, for the clock's local proof
+warmup  = 30
+floor   = 20
+steady  = 30
+peak    = 20
+cooldown= 10
+
+[roles.human]
+backfill_limit          = 200  # REQ limit per channel on join
+presence_interval_s     = 60   # kind 20001
+typing_before_msg_prob  = 0.5  # kind 20002 before a message
+burst_len_s             = 90   # a human is chatty for 90 s ...
+burst_gap_s             = 600  # ... then silent ~10 min (bursty, mostly idle)
+peak_multiplier         = 3
+
+[roles.human.steady_per_hour]
+msg = 12
+reaction = 8
+edit = 1
+media = 0.5
+dm = 2
+
+[roles.agent]
+nip_oa                  = true # authenticate with an owner-signed auth tag
+active_s                = 300  # long-running: 5 min on ...
+idle_s                  = 900  # ... 15 min off (spiky)
+peak_multiplier = 4
+peak_all_active = true         # every agent is "on" for the whole peak band
+
+[roles.agent.steady_per_hour]
+msg = 40
+reaction = 10
+canvas = 2
+issue = 1
+pr = 0.5
+git_push = 1
+media = 1
+turn_metric = 20
+presence = 60
+
+[storm]                        # the Monday-9am backfill storm
+enabled        = true
+at_band        = "peak"        # fires at the start of this band
+joiners        = "humans"      # who reconnects cold
+stagger_s      = 10            # all joiners within this many seconds
+backfill_limit = 500
+
+[media]                        # bytes uploaded via PUT /media/upload (Blossom)
+sizes_kb = [40, 200, 1200]
+weights  = [0.6, 0.3, 0.1]
+
+[git]
+push_kb = [4, 64]              # random blob size per push; 1 commit per push
+
+[kinds]                        # override the default kind numbers if buzz renumbers
+msg = 9
+reaction = 7
+edit = 40003
+canvas = 40100
+issue = 1621
+pr = 1618
+repo_announce = 30617
+turn_metric = 44200
+presence = 20001
+typing = 20002
+dm = 1059
+member_add = 9000
+channel_create = 9007
+relay_member_add = 9030
