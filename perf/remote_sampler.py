@@ -29,6 +29,13 @@ Every limit a tick crosses is decided at the tick's end, after all of
 that tick's break signals: a limit and a break on the same tick count as
 after the break.
 
+"The relay broke" is computed here, once, per relay: the service level
+(acks within 500 ms at a measured band's end, the relay box's free memory,
+lost events, failed joins) and the signals the loop already had. It goes
+to `samples/breaks.json` as it comes, for a band driver to read. Each
+generator's live file is bound to the relay it drives (`--live
+RELAY=PATH`).
+
 On a void it writes `<out>/samples/void.json` and exits 3; whoever drives
 the bands acts on that. It never stops anything itself.
 
@@ -74,9 +81,21 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 # holds only the kinds that happened, so a kind missing there is 0.
 # rate_limited (sends the relay's per-key rate limits turned away) is
 # counted apart: neither the relay breaking nor the generator's own error.
-LIVE_TOTALS = ("rejected", "rate_limited", "media_client_failed", "media_refused", "media_unanswered",
-               "git_local_failed", "git_push_failed",
-               "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited")
+LIVE_TOTALS = ("sent", "accepted", "rejected", "rate_limited", "media_client_failed", "media_refused",
+               "media_unanswered", "git_local_failed", "git_push_failed",
+               "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "lost", "joined")
+# tenant_sim's ack-time histogram: accepted sends within each bound, in ms,
+# cumulative. 500 ms is a bound, so the service level's share is exact.
+ACK_BOUNDS = ("10", "25", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf")
+# The service level: 95% of events acknowledged within
+# 500 ms, judged on a measured band or ramp step with at least 20 acks.
+SLO_ACK_MS, SLO_ACK_SHARE, SLO_MIN_ACKS = "500", 95.0, 20
+# The bands the service level is judged on; a ramp step is ramp-<n>. A ramp
+# step's window starts STEP_SETTLE_S after the step, once its joiners have
+# connected and run their backfill.
+MEASURED_BANDS = ("floor", "steady", "peak")
+RAMP_STEP = re.compile(r"ramp-[0-9]{1,4}")
+STEP_SETTLE_S = 60.0
 # Media, git and read failures, split by where they failed. A media upload
 # or an agent's read that failed before it went out, or a git add, commit or
 # branch, is the generator's own error.
@@ -277,6 +296,11 @@ class Void:
     relay_break_t: float | None = None
 
 
+# What a limit waits on, besides one relay's role: the first break of any
+# relay, or every relay's.
+ANY, ALL = "*any", "*all"
+
+
 @dataclass
 class Limit:
     """A limit one tick crossed. The tick's end decides it, once every
@@ -286,9 +310,10 @@ class Limit:
     reason: str
     role: str  # whose result: a relay box's role, or "generator"
     t: float
-    # The relay box whose break the limit waits on; None: the first break
-    # of any relay (the generator's own limits).
-    ip: str | None = None
+    # The break the limit waits on: a relay's role (that relay's own), ANY
+    # (the first break of any relay) or ALL (every relay's: the generator
+    # box's own limits, which spoil every relay that hasn't broken).
+    waits: str = ANY
     # A void before that break, a note after it. False: a void at any time.
     after_break: bool = False
     # After the break, noted once per key; None: noted each time.
@@ -307,60 +332,75 @@ class Monitor:
     mem_ticks: int = 3
     live_required: bool = False
     live_max_age_s: float = LIVE_MAX_AGE_S
+    # The relays a run measures, by role: its relay boxes, and the relays
+    # its live files are bound to.
+    relays: list[str] = field(default_factory=list)
+    # The service level: SLO_ACK_SHARE % of acks within SLO_ACK_MS, judged
+    # on a band with at least SLO_MIN_ACKS; and the relay box's
+    # MemAvailable at least relay_mem_min_pct of MemTotal.
+    relay_mem_min_pct: float = 10.0
     consecutive: dict[str, int] = field(default_factory=dict)
     misses: dict[str, int] = field(default_factory=dict)
     ticks: dict[str, int] = field(default_factory=dict)
     slow_consecutive: dict[str, int] = field(default_factory=dict)
     slow_misses: dict[str, int] = field(default_factory=dict)
     slow_calls: dict[str, int] = field(default_factory=dict)
-    # The first break of any relay: what the generator's own limits wait on.
+    # The first break of any relay.
     relay_break_t: float | None = None
-    # A break the live counters showed. Until each live file is bound to the
-    # relay it drives, it counts for every relay box.
-    live_break_t: float | None = None
-    # Each relay box's own break, from its samples: its relay OOM-killed, or
-    # no relay container in a listing that worked.
-    box_break_t: dict[str, float] = field(default_factory=dict)
+    # Each break signal's first time, by source and relay: ("box", role)
+    # from a relay box's own sample; ("live", role) from the live file bound
+    # to that relay; ("live", None) from a live file bound to none, which
+    # counts for every relay.
+    breaks: dict[tuple[str, str | None], float] = field(default_factory=dict)
     notes: list[dict[str, Any]] = field(default_factory=list)
     _win: tuple[float, dict[str, int]] | None = None
     _over: list[float] = field(default_factory=list)
     _mem_low: int = 0
     _gen_oom0: int | None = None
     _relay_oom0: dict[str, int] = field(default_factory=dict)
-    _live0: dict[str, Any] | None = None
+    # The last good read of each live file, by the relay it is bound to.
+    _lives: dict[str | None, dict[str, Any]] = field(default_factory=dict)
     _noted: set[str] = field(default_factory=set)
 
-    def relay_break(self, t: float, why: str, ip: str | None = None) -> None:
-        """A break signal: from a relay box's own sample (ip), or from the
-        live counters (no ip). Each source's first is noted."""
-        if ip is None:
-            new = self.live_break_t is None
-            if new:
-                self.live_break_t = t
-        else:
-            new = ip not in self.box_break_t
-            if new:
-                self.box_break_t[ip] = t
+    def relay_break(self, t: float, why: str, role: str | None = None, source: str = "live") -> None:
+        """A break signal for relay `role` (None: a live file bound to no
+        relay, so every relay). Each source's first is noted."""
+        key = (source, role)
+        if key not in self.breaks:
+            self.breaks[key] = t
+            self.notes.append({"t_unix": t, "relay_break": why, **({"relay": role} if role else {})})
         if self.relay_break_t is None:
             self.relay_break_t = t
-        if new:
-            self.notes.append({"t_unix": t, "relay_break": why})
 
-    def break_at(self, ip: str | None) -> float | None:
-        """When the relay broke, for a limit on box ip: that box's own break
-        or the live counters', whichever came first. ip None: the first
-        break of any relay."""
-        if ip is None:
+    def relay_broke(self, role: str) -> float | None:
+        """When relay `role` broke: its first break signal, from its box, its
+        live file, or a live file bound to no relay."""
+        ts = [self.breaks.get(k) for k in (("box", role), ("live", role), ("live", None))]
+        found = [x for x in ts if x is not None]
+        return min(found) if found else None
+
+    def break_at(self, waits: str) -> float | None:
+        """When the break a limit waits on came: one relay's, the first of
+        any (ANY), or the last of every relay's (ALL: None while any relay
+        hasn't broken)."""
+        if waits == ANY or (waits == ALL and not self.relays):
             return self.relay_break_t
-        ts = [x for x in (self.live_break_t, self.box_break_t.get(ip)) if x is not None]
-        return min(ts) if ts else None
+        if waits == ALL:
+            ts = [self.relay_broke(r) for r in self.relays]
+            return None if any(x is None for x in ts) else max(ts)  # type: ignore[type-var]
+        return self.relay_broke(waits)
+
+    def broken(self) -> dict[str, float]:
+        """Each relay that has broken, and when: what a band driver reads."""
+        out = {r: self.relay_broke(r) for r in self.relays}
+        return {r: t for r, t in out.items() if t is not None}
 
     def judge(self, limits: list[Limit]) -> Void | None:
         """Decides a tick's limits, in the order they were read: the first
         that is still a void, or None. A limit that waits on a break which
         came at or before it is a note instead, with its time."""
         for lim in limits:
-            b = self.break_at(lim.ip)
+            b = self.break_at(lim.waits)
             if lim.after_break and b is not None and b <= lim.t:
                 if lim.once is None or lim.once not in self._noted:
                     if lim.once is not None:
@@ -400,7 +440,7 @@ class Monitor:
             # break that voids, and after it, it is noted once.
             if self.consecutive[box.ip] == self.max_consecutive:
                 out.append(Limit(f"box unreachable: {key}: {self.consecutive[box.ip]} calls in a row failed; the last: {miss}",
-                                 box.role, t, box.ip, after_break=True))
+                                 box.role, t, box.role, after_break=True))
         else:
             self.consecutive[box.ip] = 0
         # Checked on every tick, not only on a miss: the share can cross the
@@ -408,7 +448,7 @@ class Monitor:
         n, m = self.ticks[box.ip], self.misses.get(box.ip, 0)
         if n >= self.min_ticks_for_pct and m * 100.0 > self.max_miss_pct * n:
             out.append(Limit(f"{key} missed {m} of {n} ticks, over the {self.max_miss_pct:g}% limit",
-                             box.role, t, box.ip, after_break=True, once=f"{box.ip} ticks"))
+                             box.role, t, box.role, after_break=True, once=f"{box.ip} ticks"))
         if sample is None:
             return self._settle(out, defer)
         got, want = sample["nft"]["hash"], self.expected.get(box.ip)
@@ -423,11 +463,18 @@ class Monitor:
         # relay is gone: only a listing that worked can show a relay break.
         listed = not any(str(e).startswith("docker ps:") for e in sample.get("errors") or [])
         if relay is None and sample.get("containers") is not None and "containers_absent" not in sample and listed:
-            self.relay_break(t, f"{key}: no relay container", box.ip)
+            self.relay_break(t, f"{key}: no relay container", box.role, "box")
         elif relay is not None and relay.get("oom_kill") is not None:
             base = self._relay_oom0.setdefault(box.ip, relay["oom_kill"])
             if relay["oom_kill"] > base:
-                self.relay_break(t, f"{key}: the relay was OOM-killed", box.ip)
+                self.relay_break(t, f"{key}: the relay was OOM-killed", box.role, "box")
+        # The service level: at least 10% of the box's memory free.
+        mem = (sample.get("box") or {}).get("mem") or {}
+        if _num(mem.get("MemTotal")) and _num(mem.get("MemAvailable")) and mem["MemTotal"] > 0:
+            if mem["MemAvailable"] * 100.0 < self.relay_mem_min_pct * mem["MemTotal"]:
+                share = 100.0 * mem["MemAvailable"] / mem["MemTotal"]
+                self.relay_break(t, f"{key}: MemAvailable was {share:.1f}% of MemTotal, under {self.relay_mem_min_pct:g}%",
+                                 box.role, "box")
         return self._settle(out, defer)
 
     def slow_tick(self, box: Box, t: float, miss: str | None, defer: list[Limit] | None = None) -> Void | None:
@@ -446,20 +493,19 @@ class Monitor:
             self.slow_consecutive[box.ip] = self.slow_consecutive.get(box.ip, 0) + 1
             run = self.slow_consecutive[box.ip]
             if run == self.max_consecutive:
-                out.append(Limit(f"{key}: {run} slow calls in a row failed; the last: {miss}", box.role, t, box.ip, after_break=True))
+                out.append(Limit(f"{key}: {run} slow calls in a row failed; the last: {miss}", box.role, t, box.role, after_break=True))
         else:
             self.slow_consecutive[box.ip] = 0
         n, m = self.slow_calls[box.ip], self.slow_misses.get(box.ip, 0)
         if n >= self.min_ticks_for_pct and m * 100.0 > self.max_miss_pct * n:
             out.append(Limit(f"{key} missed {m} of {n} slow calls, over the {self.max_miss_pct:g}% limit",
-                             box.role, t, box.ip, after_break=True, once=f"{box.ip} slow calls"))
+                             box.role, t, box.role, after_break=True, once=f"{box.ip} slow calls"))
         return self._settle(out, defer)
 
-    def gen_tick(self, t: float, sample: dict[str, Any], live: dict[str, Any] | None, live_err: str | None,
-                 live_t: float | None = None, defer: list[Limit] | None = None) -> Void | None:
-        """The generator box's own tick: its sample, and tenant_sim's live
-        counters (or why they can't be read), read at live_t (t if not
-        given). tenant_sim and the loop share this box's clock."""
+    def gen_box_tick(self, t: float, sample: dict[str, Any], defer: list[Limit] | None = None) -> Void | None:
+        """The generator box's own sample: its CPU, memory and OOM kills. An
+        overloaded load source spoils every relay that hasn't broken yet, so
+        each limit waits on every relay's break."""
         events: list[str] = []
         ticks = (sample.get("box") or {}).get("cpu", {}).get("ticks") or {}
         if ticks:
@@ -489,43 +535,93 @@ class Monitor:
             elif oom > self._gen_oom0:
                 events.append(f"an out-of-memory kill on the generator's box ({oom - self._gen_oom0})")
                 self._gen_oom0 = oom
+        return self._settle([Limit(e, "generator", t, ALL, after_break=True) for e in events], defer)
+
+    def live_tick(self, role: str | None, t: float, live: dict[str, Any] | None, live_err: str | None,
+                  live_t: float | None = None, defer: list[Limit] | None = None) -> Void | None:
+        """One live file's read: tenant_sim's live counters for the relay
+        `role` it drives (None: a file bound to no relay), or why they can't
+        be read, read at live_t (t if not given). tenant_sim and the loop
+        share the generator box's clock."""
+        name = "the generator's live counters" + (f" for {role}" if role else "")
+        waits = role or ANY
+        if live is None:
+            return self._settle([Limit(f"{name}: {live_err}", "generator", t)], defer)
+        ended = live.get("ended")
+        if ended is not None and LIVE_ENDED[ended] is not None:
+            run = "the generator's run" + (f" for {role}" if role else "")
+            return self._settle([Limit(f"{run} ended: {LIVE_ENDED[ended]}", "generator", t)], defer)
+        # tenant_sim logs a failed rewrite and carries on, so an old file
+        # with no errors in it must not pass as a live one. A run that ended
+        # on a stop wrote its last file, which ages.
+        last = self._lives.get(role)
+        lt, now = live["t_unix"], t if live_t is None else live_t
+        stale = None
+        if last is not None and lt < last["t_unix"]:
+            stale = f"went backwards: t_unix {lt}, after {last['t_unix']}"
+        elif now - lt > self.live_max_age_s and ended is None:
+            stale = f"are stale: t_unix {lt} is {now - lt:.1f} s old, over the {self.live_max_age_s:g} s limit"
+        elif lt - now > self.live_max_age_s:
+            stale = f"are ahead of this box's clock: t_unix {lt} is {lt - now:.1f} s ahead, over the {self.live_max_age_s:g} s limit"
+        if stale:
+            return self._settle([Limit(f"{name} {stale}", "generator", t)], defer)
+        out: list[Limit] = []
+        # Each read is compared with the one before, so one rise is
+        # reported once.
+        ce = live.get("client_errors") or {}
+        if last is not None:
+            c0 = last.get("client_errors") or {}
+            rose = {k: ce.get(k, 0) - c0.get(k, 0) for k in GEN_ERROR_KINDS if ce.get(k, 0) > c0.get(k, 0)}
+            rose.update({k: live[k] - last[k] for k in GEN_FAILURE_TOTALS if live[k] > last[k]})
+            if rose:
+                who = "the generator" + (f" for {role}" if role else "")
+                out.append(Limit(f"{who} reported its own errors: " + ", ".join(f"{k} +{v}" for k, v in sorted(rose.items())),
+                                 "generator", t, waits, after_break=True))
+            if live["rejected"] > last["rejected"]:
+                self.relay_break(t, f"the relay rejected {live['rejected'] - last['rejected']} events", role)
+            for k, why in RELAY_FAILURE_TOTALS.items():
+                if live[k] > last[k]:
+                    self.relay_break(t, why.format(n=live[k] - last[k]), role)
+            if ce.get("connection_dropped", 0) > c0.get("connection_dropped", 0):
+                self.relay_break(t, "the relay dropped connections", role)
+            if ce.get("join_failed", 0) > c0.get("join_failed", 0):
+                self.relay_break(t, f"{ce['join_failed'] - c0.get('join_failed', 0)} identities couldn't join the relay", role)
+            if live["lost"] > last["lost"]:
+                self.relay_break(t, f"the relay lost {live['lost'] - last['lost']} events", role)
+        self._lives[role] = live
+        return self._settle(out, defer)
+
+    def gen_tick(self, t: float, sample: dict[str, Any], live: dict[str, Any] | None, live_err: str | None,
+                 live_t: float | None = None, defer: list[Limit] | None = None) -> Void | None:
+        """The generator box's sample and, with live counters required, the
+        one live file bound to no relay: a run with one relay."""
+        limits: list[Limit] = []
         if self.live_required:
-            if live is None:
-                return self._settle([Limit(f"the generator's live counters: {live_err}", "generator", t)], defer)
-            ended = live.get("ended")
-            if ended is not None and LIVE_ENDED[ended] is not None:
-                return self._settle([Limit(f"the generator's run ended: {LIVE_ENDED[ended]}", "generator", t)], defer)
-            # tenant_sim logs a failed rewrite and carries on, so an old
-            # file with no errors in it must not pass as a live one. A run
-            # that ended on a stop wrote its last file, which ages.
-            lt, now = live["t_unix"], t if live_t is None else live_t
-            stale = None
-            if self._live0 is not None and lt < self._live0["t_unix"]:
-                stale = f"went backwards: t_unix {lt}, after {self._live0['t_unix']}"
-            elif now - lt > self.live_max_age_s and ended is None:
-                stale = f"are stale: t_unix {lt} is {now - lt:.1f} s old, over the {self.live_max_age_s:g} s limit"
-            elif lt - now > self.live_max_age_s:
-                stale = f"are ahead of this box's clock: t_unix {lt} is {lt - now:.1f} s ahead, over the {self.live_max_age_s:g} s limit"
-            if stale:
-                return self._settle([Limit(f"the generator's live counters {stale}", "generator", t)], defer)
-            # Each tick is compared with the one before, so one rise is
-            # reported once.
-            ce = live.get("client_errors") or {}
-            if self._live0 is not None:
-                c0 = self._live0.get("client_errors") or {}
-                rose = {k: ce.get(k, 0) - c0.get(k, 0) for k in GEN_ERROR_KINDS if ce.get(k, 0) > c0.get(k, 0)}
-                rose.update({k: live[k] - self._live0[k] for k in GEN_FAILURE_TOTALS if live[k] > self._live0[k]})
-                if rose:
-                    events.append("the generator reported its own errors: " + ", ".join(f"{k} +{v}" for k, v in sorted(rose.items())))
-                if live["rejected"] > self._live0["rejected"]:
-                    self.relay_break(t, f"the relay rejected {live['rejected'] - self._live0['rejected']} events")
-                for k, why in RELAY_FAILURE_TOTALS.items():
-                    if live[k] > self._live0[k]:
-                        self.relay_break(t, why.format(n=live[k] - self._live0[k]))
-                if ce.get("connection_dropped", 0) > c0.get("connection_dropped", 0):
-                    self.relay_break(t, "the relay dropped connections")
-            self._live0 = live
-        return self._settle([Limit(e, "generator", t, after_break=True) for e in events], defer)
+            self.live_tick(None, t, live, live_err, live_t, limits)
+        self.gen_box_tick(t, sample, limits)
+        return self._settle(limits, defer)
+
+    def band_end(self, role: str | None, band: str, live0: dict[str, Any], live1: dict[str, Any],
+                 t: float) -> dict[str, Any]:
+        """A measured band (or ramp step) has ended: what the relay `role`'s
+        clients saw over its window (live0 to live1), and the service
+        level's ack test on it. Under SLO_ACK_SHARE % of at least
+        SLO_MIN_ACKS acks within SLO_ACK_MS is the relay breaking, at the
+        band's end."""
+        d = {k: live1[k] - live0[k] for k in ("sent", "accepted", "rejected", "rate_limited", "lost",
+                                               "read_refused", "read_unanswered", "read_rate_limited")}
+        le0, le1 = live0["ack_ms_le"], live1["ack_ms_le"]
+        acks, within = le1["+Inf"] - le0["+Inf"], le1[SLO_ACK_MS] - le0[SLO_ACK_MS]
+        out: dict[str, Any] = {**d, "acks": acks, f"acks_within_{SLO_ACK_MS}ms": within,
+                               "joined": live1["joined"], "from_t_unix": live0["t_unix"], "to_t_unix": live1["t_unix"]}
+        if acks:
+            out[f"share_within_{SLO_ACK_MS}ms_pct"] = round(100.0 * within / acks, 3)
+        if acks >= SLO_MIN_ACKS and within * 100.0 < SLO_ACK_SHARE * acks:
+            self.relay_break(t, f"{band}: {within} of {acks} acks within {SLO_ACK_MS} ms "
+                                f"({100.0 * within / acks:.1f}%), under {SLO_ACK_SHARE:g}%", role)
+        elif acks < SLO_MIN_ACKS:
+            out["ack_test"] = f"not judged: {acks} acks, fewer than {SLO_MIN_ACKS}"
+        return out
 
 
 def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -550,9 +646,14 @@ def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
             return None, f"{path} has no {k}"
     if "ended" in v and v["ended"] not in LIVE_ENDED:
         return None, f"{path}: ended {json.dumps(v['ended'])} is not one of {sorted(LIVE_ENDED)}"
-    counts = list(v["client_errors"].values()) + [v[k] for k in LIVE_TOTALS]
+    le = v.get("ack_ms_le")
+    if not isinstance(le, dict) or sorted(le) != sorted(ACK_BOUNDS):
+        return None, f"{path}: ack_ms_le is not the histogram with bounds {', '.join(ACK_BOUNDS)}"
+    counts = list(v["client_errors"].values()) + [v[k] for k in LIVE_TOTALS] + list(le.values())
     if not all(type(c) is int and c >= 0 for c in counts):
         return None, f"{path} has a counter that is not a whole number"
+    if any(le[a] > le[b] for a, b in zip(ACK_BOUNDS, ACK_BOUNDS[1:])):
+        return None, f"{path}: ack_ms_le is not cumulative"
     return v, None
 
 
@@ -713,6 +814,8 @@ class Settings:
     once: bool
     ring_files: int
     ring_bytes: int
+    # Live files bound to the relays they drive, by role (--live).
+    lives: list[tuple[str | None, str]] = field(default_factory=list)
 
 
 class Stop(Exception):
@@ -762,9 +865,21 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
     folder.mkdir(parents=True, exist_ok=True)
     roles = [b.role for b in s.boxes] + ([s.self_role] if s.self_role else [])
     rings = {r: Ring(folder / r, s.ring_files, s.ring_bytes) for r in roles}
-    mon = Monitor(expected=s.expected, live_required=bool(s.live_file))
+    # tenant_sim's live files: each bound to the relay it drives, or one
+    # bound to none (--live-file), which counts for every relay.
+    lives: list[tuple[str | None, str]] = list(s.lives) or ([(None, s.live_file)] if s.live_file else [])
+    relays = [b.role for b in s.boxes] + [r for r, _ in lives if r and r not in {b.role for b in s.boxes}]
+    mon = Monitor(expected=s.expected, live_required=bool(lives), relays=relays)
     band = "none"
     stats = {r: BandStats(band, r) for r in roles}
+    # A measured band's window, per live file: its live counters at the
+    # window's start (a ramp step's starts after it settles), and the last
+    # good read; band_end judges the service level on the two.
+    band_t0 = clock()
+    win0: dict[str | None, dict[str, Any]] = {}
+    last_live: dict[str | None, dict[str, Any]] = {}
+    clients: list[dict[str, Any]] = []
+    broken_written: dict[str, Any] | None = None
     start = clock()
     next_slow = start
     # In-process, the reader's getrusage counts the whole loop since it
@@ -776,10 +891,37 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, signal.SIG_IGN)
 
+    def measured(name: str) -> bool:
+        return name in MEASURED_BANDS or RAMP_STEP.fullmatch(name) is not None
+
+    def band_end(t: float) -> None:
+        """The band that is ending: each live file's clients over its
+        window, and the service level's ack test, before the summaries."""
+        if not measured(band):
+            return
+        for role, _ in lives:
+            if role in win0 and role in last_live:
+                block = mon.band_end(role, band, win0[role], last_live[role], t)
+                clients.append({"band": band, "role": role or "live", "client": block})
+
+    def write_breaks() -> None:
+        """Each relay that broke, and when, written whole as it changes:
+        what a band driver reads to end that relay's ramp."""
+        nonlocal broken_written
+        now = {"relays": mon.broken(), "first_t_unix": mon.relay_break_t}
+        if now != broken_written:
+            tmp = folder / "breaks.json.tmp"
+            tmp.write_text(json.dumps(now, indent=2) + "\n")
+            tmp.replace(folder / "breaks.json")
+            broken_written = now
+
     def flush() -> None:
         with open(folder / "bands.jsonl", "a") as fh:
             for r in roles:
                 fh.write(json.dumps(stats[r].summary(), separators=(",", ":")) + "\n")
+            for c in clients:
+                fh.write(json.dumps(c, separators=(",", ":")) + "\n")
+        clients.clear()
         with open(folder / "notes.jsonl", "a") as fh:
             for n in mon.notes:
                 fh.write(json.dumps(n, separators=(",", ":")) + "\n")
@@ -787,6 +929,8 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
 
     def void(v: Void) -> int:
         quiet()
+        band_end(v.t_unix)
+        write_breaks()
         flush()
         (folder / "void.json").write_text(json.dumps(v.__dict__, indent=2) + "\n")
         print(f"void: {v.reason}", file=sys.stderr)
@@ -806,9 +950,12 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
                 except OSError:
                     now_band = "none"
                 if now_band != band:
+                    band_end(t)
+                    write_breaks()
                     flush()
                     band = now_band
                     stats = {r: BandStats(band, r) for r in roles}
+                    band_t0, win0 = t, {}
             tiers = ["fast"] + (["slow"] if t >= next_slow else [])
             if "slow" in tiers:
                 next_slow = t + s.slow_every
@@ -831,31 +978,65 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
                         mon.box_tick(box, t, sample, miss, limits)
                     else:
                         mon.slow_tick(box, t, miss, limits)
+            read: dict[str | None, dict[str, Any]] = {}
+            for role, path in lives:
+                live, live_err = read_live(path)
+                mon.live_tick(role, t, live, live_err, clock(), limits)
+                if live is not None:
+                    read[role] = last_live[role] = live
+                    settle = STEP_SETTLE_S if RAMP_STEP.fullmatch(band) else 0.0
+                    if role not in win0 and measured(band) and t >= band_t0 + settle:
+                        win0[role] = live
             if s.self_role and s.self_config is not None:
-                live, live_err = read_live(s.live_file) if s.live_file else (None, None)
-                live_t = clock()
                 for tier in tiers:
                     sample = local(tier, s.self_config)
                     now_cpu = own_cpu_s()
                     sample["reader"] = {**(sample.get("reader") or {}), "cpu_s": round(now_cpu - cpu_mark, 4), "cpu_s_since_start": round(now_cpu, 4)}
                     cpu_mark = now_cpu
-                    rings[s.self_role].append(json.dumps({"t": t, "band": band, "tier": tier, "sample": sample, **({"live": live} if live else {})}, separators=(",", ":")))
+                    seen = {}
+                    if None in read:
+                        seen["live"] = read[None]
+                    if any(r is not None for r in read):
+                        seen["lives"] = {r: v for r, v in read.items() if r is not None}
+                    rings[s.self_role].append(json.dumps({"t": t, "band": band, "tier": tier, "sample": sample, **seen}, separators=(",", ":")))
                     stats[s.self_role].add(tier, sample)
                     if tier == "fast":
-                        mon.gen_tick(t, sample, live, live_err, live_t, limits)
+                        mon.gen_box_tick(t, sample, limits)
             v = mon.judge(limits)
             if v:
                 return void(v)
+            write_breaks()
             if s.once or (s.duration is not None and clock() - start >= s.duration):
+                band_end(clock())
+                write_breaks()
                 flush()
                 return EXIT_OK
             sleep(max(0.0, s.fast_every - (clock() - t)))
     except Stop as e:
+        band_end(clock())
+        write_breaks()
         flush()
         return e.code
     finally:
         for sig, h in old.items():
             signal.signal(sig, h)
+
+
+def check_lives(specs: list[str], live_file: str | None) -> list[tuple[str | None, str]]:
+    """Each --live is RELAY=PATH: a plain relay role (the box it names, or
+    one with no box) and tenant_sim's live.json for the generator that
+    drives it. Each relay once; not with --live-file, a file bound to none."""
+    out: list[tuple[str | None, str]] = []
+    for spec in specs:
+        role, sep, path = spec.partition("=")
+        if not sep or not role.isidentifier() or len(role) > 32 or not path:
+            raise Refused(f"--live {spec!r} is not RELAY=PATH. Nothing was run.")
+        out.append((role, path))
+    if len({r for r, _ in out}) != len(out):
+        raise Refused("two --live values name the same relay. Nothing was run.")
+    if out and live_file:
+        raise Refused("--live binds each live file to its relay; --live-file binds one to none: give one or the other. Nothing was run.")
+    return out
 
 
 def cmd_remote_sample(args: Any, guard: Any, parse_ip: Callable[[str], Any]) -> int:
@@ -880,8 +1061,9 @@ def cmd_remote_sample(args: Any, guard: Any, parse_ip: Callable[[str], Any]) -> 
         missing = [b.ip for b in boxes if b.ip not in expected]
         if missing:
             raise Refused(f"--expected-hashes has no hash for {missing}. Nothing was run.")
-    if not boxes and not args.self_role:
-        raise Refused("give at least one --box or --self. Nothing was run.")
+    lives = check_lives(args.live, args.live_file)
+    if not boxes and not args.self_role and not lives and not args.live_file:
+        raise Refused("give at least one --box, --self or --live. Nothing was run.")
     self_cfg = None
     if args.self_role:
         try:
@@ -890,7 +1072,8 @@ def cmd_remote_sample(args: Any, guard: Any, parse_ip: Callable[[str], Any]) -> 
             raise Refused(f"--self-config {args.self_config}: {e}. Nothing was run.") from e
     fast, slow = (30.0, 300.0) if args.soak else (float(args.fast_every), float(args.slow_every))
     s = Settings(boxes, args.ssh_key, args.known_hosts, Path(args.out_dir), expected, args.self_role, self_cfg,
-                 args.live_file, args.band_file, fast, slow, args.duration, args.once, args.ring_files, args.ring_bytes)
+                 args.live_file, args.band_file, fast, slow, args.duration, args.once, args.ring_files, args.ring_bytes,
+                 lives)
     return run_loop(s)
 
 
@@ -904,7 +1087,9 @@ def add_parser(sub: Any) -> None:
     p.add_argument("--expected-hashes", default=None, help="JSON {ip: sha256} of each box's rule set, recorded at its lockdown")
     p.add_argument("--self", dest="self_role", default=None, help="the role this box is sampled as (in-process)")
     p.add_argument("--self-config", default=None, help="box_sampler config for this box")
-    p.add_argument("--live-file", default=None, help="tenant_sim's <out-dir>/live.json; missing or unreadable voids")
+    p.add_argument("--live-file", default=None, help="tenant_sim's <out-dir>/live.json, for every relay; missing or unreadable voids")
+    p.add_argument("--live", action="append", default=[],
+                   help="RELAY=PATH: the live.json of the tenant_sim that drives that relay (repeatable)")
     p.add_argument("--band-file", default=None, help="a file holding the current band's name")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--fast-every", type=float, default=5.0)

@@ -510,6 +510,12 @@ python3 perf/tenant_cogs.py remote-sample \
   --live-file <tenant_sim out-dir>/live.json --band-file <file> --out-dir <dir>
 ```
 
+- **One generator per relay:** `--live <relay>=<path>` (repeatable) binds
+  each `tenant_sim`'s live file to the relay it drives, instead of one
+  `--live-file` for every relay. A live file may name a relay with no
+  `--box` (on a workstation, with no SSH at all). The loop reads every live
+  file each tick, with or without `--self`.
+
 - **Every SSH destination passes the target guard:** a literal IP, inside
   `--allow-cidr`, off `--deny-list`. The argv is fixed: only `--ssh-key`,
   no agent, `-F /dev/null`, a strict `--known-hosts`, `--` before the
@@ -525,7 +531,8 @@ python3 perf/tenant_cogs.py remote-sample \
 - **Output:** `<out-dir>/samples/<role>/ring-*.jsonl`, at most
   `--ring-files` x `--ring-bytes` (8 x 4 MiB) per box, and a restarted loop
   carries on from the newest file; `bands.jsonl`, one line per band per
-  box; `notes.jsonl`. A slow reply that isn't whole is kept in the ring as
+  box, and for each live file a `client` line per measured band (below);
+  `notes.jsonl`; `breaks.json`. A slow reply that isn't whole is kept in the ring as
   `partial`, beside its `miss` reason. A band line has `ticks` and `missed`
   (fast), `slow_calls` and `slow_missed`, percentiles of memory used, CPU busy and
   each container's working set, steal (or why it is unknown), drops, WAL
@@ -571,23 +578,47 @@ python3 perf/tenant_cogs.py remote-sample \
     last write says the run lost its driver (`"ended": "lease"` or
     `"eof"`). A last write that ended on a stop is final: it is never
     stale. The writer and the loop share the generator box's clock.
-  - "The relay breaks" is the first of: relay rejects (not rate limits)
-    or dropped connections rising in the live counters; media uploads the relay
-    refused (`media_refused`, an answer that isn't 2xx) or didn't answer
-    (`media_unanswered`, a transport error or a timeout); git pushes that
-    failed (`git_push_failed`, the 90 s timeout included); agent reads the
-    relay refused (`read_refused`) or didn't answer (`read_unanswered`); a
-    relay OOM
-    kill; or no relay container in a `docker ps` that worked (a failed
-    listing is not a break). At its limit a relay usually fails by timing
-    out, so a timeout is the relay's; a stalled generator still shows in
-    its CPU, its memory and a stale live file. A generator event after
-    the break is a note, not a void, written once.
-  - **Whose break.** A relay box's missed calls wait on that box's own
-    break (its relay OOM-killed or gone) or a break in the live counters,
-    whichever came first; another box's break doesn't count for it. The
-    generator's own limits wait on the first break of any relay. Each
-    source's first break is a note.
+  - **"The relay broke" has one definition, here, per relay:** the first
+    of these, and a band driver reads it (`breaks.json`) rather than
+    computing its own. It is the service level (95% of events acknowledged
+    within 500 ms, at least 10% of memory free, nothing lost or rejected,
+    rate limits apart), and the signals the loop already had:
+    - **acks:** under 95% of a measured band's or ramp step's acks within
+      500 ms, judged at its end on at least 20 acks, from `live.json`'s
+      histogram;
+    - **memory:** the relay box's MemAvailable under 10% of MemTotal, on
+      any fast sample;
+    - **lost or rejected:** events found lost after a recheck (`lost`);
+      relay rejects (not rate limits); media uploads, git pushes or agent
+      reads the relay refused or didn't answer (`media_refused`,
+      `media_unanswered`, `git_push_failed`, `read_refused`,
+      `read_unanswered`; a timeout included);
+    - **connections:** dropped connections, or identities that couldn't
+      join (`join_failed`);
+    - **the relay itself:** an OOM kill, or no relay container in a
+      `docker ps` that worked (a failed listing is not a break).
+
+    At its limit a relay usually fails by timing out, so a timeout is the
+    relay's; a stalled generator still shows in its CPU, its memory and a
+    stale live file. Rate limits are counted apart: never a break. A
+    generator event after the break is a note, not a void, written once.
+  - **Whose break.** A relay's break is its box's own signals, those in the
+    live file bound to it, or those in a live file bound to no relay
+    (`--live-file`), whichever came first; another relay's doesn't count
+    for it. A relay box's missed calls, and a generator's own errors in a
+    relay's live file, wait on that relay's break. The generator box's own
+    limits (CPU, memory, an OOM kill) wait on every relay's: an
+    overloaded load source spoils every relay that hasn't broken yet.
+    Each source's first break is a note, naming its relay.
+  - **Measured bands** are `floor`, `steady`, `peak` and ramp steps
+    (`ramp-<n>`) in the band file. A band's window, per live file, runs
+    from its first read in the band to the last before the band changed;
+    **a ramp step's starts 60 s in,** once its joiners have connected and
+    run their backfill. Each window's client line in `bands.jsonl` holds
+    its sends, accepts, rejects, rate limits, lost events, reads, acks
+    and the share within 500 ms, and `joined`, the population so far.
+  - **`breaks.json`** holds each relay that broke and when, and the first
+    break, rewritten whole as soon as a break comes.
   - **The same tick.** Every limit a tick crosses is decided at the tick's
     end, once all of that tick's break signals are in. A limit and a break
     on the same tick count as after the break: one tick can't order them,

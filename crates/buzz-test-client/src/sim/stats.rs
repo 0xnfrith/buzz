@@ -581,6 +581,44 @@ impl Stats {
 
 #[cfg(test)]
 mod tests {
+    /// The fields live.json holds, typed out here and in the sampler's row
+    /// test_the_loop_reads_what_tenant_sim_writes: the loop requires every
+    /// total, so a field renamed on one side fails both.
+    #[test]
+    fn live_json_holds_the_fields_the_sampler_reads() {
+        let v = serde_json::to_value(super::Stats::new().live(1)).expect("json");
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut want = vec![
+            "t_unix",
+            "sent",
+            "accepted",
+            "rejected",
+            "rate_limited",
+            "received",
+            "client_errors",
+            "media_client_failed",
+            "media_refused",
+            "media_unanswered",
+            "git_local_failed",
+            "git_push_failed",
+            "read_client_failed",
+            "read_refused",
+            "read_unanswered",
+            "read_rate_limited",
+            "ack_ms_le",
+            "lost",
+            "joined",
+        ];
+        want.sort_unstable();
+        assert_eq!(keys, want, "\"ended\" is only on the last write");
+    }
+
     /// The ack histogram is cumulative, and 500 ms is one of its bounds.
     #[test]
     fn the_ack_histogram() {

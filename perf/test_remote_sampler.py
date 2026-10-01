@@ -45,15 +45,24 @@ def relay_sample(t: float, h: str = H1, ws: int = 100, busy: int = 0, oom: int =
     return row
 
 
-TOTALS = ("rate_limited", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed",
-          "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited")
+TOTALS = ("sent", "accepted", "rate_limited", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed",
+          "git_push_failed", "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "lost", "joined")
 
 
-def live_counters(t: int = 1, rejected: int = 0, **counts: int) -> dict:
+def acks(within: int = 0, over: int = 0) -> dict:
+    """An ack histogram: `within` acks at 500 ms or less, `over` past it."""
+    out = {b: 0 for b in rs.ACK_BOUNDS}
+    out["500"] = within
+    for b in ("1000", "2500", "5000", "10000", "+Inf"):
+        out[b] = within + over
+    return out
+
+
+def live_counters(t: int = 1, rejected: int = 0, ack_ms_le: dict | None = None, **counts: int) -> dict:
     """tenant_sim's live.json, with every field it writes. Keyword counts
     named in TOTALS set those totals; the rest are client error kinds."""
     totals = {k: counts.pop(k, 0) for k in TOTALS}
-    return {"t_unix": t, "sent": 0, "accepted": 0, "rejected": rejected, "received": 0,
+    return {"t_unix": t, "rejected": rejected, "received": 0, "ack_ms_le": ack_ms_le or acks(),
             "client_errors": counts, **totals}
 
 
@@ -103,7 +112,13 @@ class Guard(unittest.TestCase):
             (["--box", "relay1=10.77.0.3", *k, "--expected-hashes", str(self.eh)], "refused: --known-hosts is required with --box. Nothing was run.\n"),
             (["--box", "relay1=10.77.0.3", *k, "--known-hosts", str(self.kh) + ".gone", "--expected-hashes", str(self.eh)], f"refused: --known-hosts {self.kh}.gone: No such file or directory. Nothing was run.\n"),
             (["--box", "a=10.77.0.3", "--box", "a=10.77.0.4", *k, *kh], "refused: two --box values share a role. Nothing was run.\n"),
-            ([], "refused: give at least one --box or --self. Nothing was run.\n"),
+            ([], "refused: give at least one --box, --self or --live. Nothing was run.\n"),
+            (["--live", "relay1"], "refused: --live 'relay1' is not RELAY=PATH. Nothing was run.\n"),
+            (["--live", "relay 1=/x"], "refused: --live 'relay 1=/x' is not RELAY=PATH. Nothing was run.\n"),
+            (["--live", "relay1="], "refused: --live 'relay1=' is not RELAY=PATH. Nothing was run.\n"),
+            (["--live", "relay1=/a", "--live", "relay1=/b"], "refused: two --live values name the same relay. Nothing was run.\n"),
+            (["--live", "relay1=/a", "--live-file", "/b"],
+             "refused: --live binds each live file to its relay; --live-file binds one to none: give one or the other. Nothing was run.\n"),
         ]
         for extra, want in rows:
             with self.subTest(extra=extra):
@@ -419,7 +434,7 @@ class Voids(unittest.TestCase):
         for t in (7, 8, 9):
             self.assertIsNone(m.box_tick(self.BOX, t, None, "ssh exit 255: Connection refused"), t)
         self.assertEqual(m.notes, [
-            {"t_unix": 1, "relay_break": "relay1 (10.77.0.3): no relay container"},
+            {"t_unix": 1, "relay_break": "relay1 (10.77.0.3): no relay container", "relay": "relay1"},
             {"t_unix": 4, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: ssh exit 255: Connection timed out", "relay_break_t": 1},
             {"t_unix": 9, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: ssh exit 255: Connection refused", "relay_break_t": 1},
         ])
@@ -438,7 +453,7 @@ class Voids(unittest.TestCase):
         s = relay_sample(1)
         s["containers"] = {}
         self.assertIsNone(m.box_tick(other, 1, s, None))
-        self.assertEqual(m.box_break_t, {"10.77.0.4": 1})
+        self.assertEqual(m.breaks, {("box", "relay2"): 1})
         self.assertIsNone(m.box_tick(self.BOX, 2, None, "x"))
         self.assertIsNone(m.box_tick(self.BOX, 3, None, "x"))
         v = m.box_tick(self.BOX, 4, None, "x")
@@ -455,7 +470,7 @@ class Voids(unittest.TestCase):
         """Only a break at or before a limit's own time makes it a note."""
         m = self.mon()
         m.relay_break(5, "the relay rejected 3 events")
-        v = m.judge([rs.Limit("box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: x", "relay1", 4, "10.77.0.3", after_break=True)])
+        v = m.judge([rs.Limit("box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: x", "relay1", 4, "relay1", after_break=True)])
         self.assertEqual((v.reason, v.t_unix), ("box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: x", 4))
 
     def test_a_changed_rule_set_after_a_break_still_voids(self) -> None:
@@ -503,7 +518,7 @@ class Voids(unittest.TestCase):
         s = relay_sample(5)
         s["containers"] = {"postgres": {"working_set": 10, "oom_kill": 0}}
         self.assertIsNone(m.box_tick(self.BOX, 5, s, None))
-        self.assertEqual((m.relay_break_t, m.notes), (5, [{"t_unix": 5, "relay_break": "relay1 (10.77.0.3): no relay container"}]))
+        self.assertEqual((m.relay_break_t, m.notes), (5, [{"t_unix": 5, "relay_break": "relay1 (10.77.0.3): no relay container", "relay": "relay1"}]))
 
     def test_rising_drop_counters_are_reported_not_fatal(self) -> None:
         m = self.mon()
@@ -680,6 +695,89 @@ class Voids(unittest.TestCase):
         self.assertEqual([n.get("after_relay_break") for n in m.notes], [None, "an out-of-memory kill on the generator's box (1)",
                                                                          "the generator's MemAvailable was under 10% of MemTotal for 3 ticks"])
 
+    def test_a_relay_box_under_ten_percent_free_memory_is_a_break(self) -> None:
+        m = self.mon()
+        s = relay_sample(1)
+        s["box"]["mem"] = {"MemTotal": 1000, "MemAvailable": 100}
+        self.assertIsNone(m.box_tick(self.BOX, 1, s, None))
+        self.assertEqual(m.notes, [], "exactly 10% free holds")
+        s["box"]["mem"]["MemAvailable"] = 99
+        self.assertIsNone(m.box_tick(self.BOX, 2, s, None))
+        self.assertEqual(m.notes, [{"t_unix": 2, "relay_break": "relay1 (10.77.0.3): MemAvailable was 9.9% of MemTotal, under 10%", "relay": "relay1"}])
+
+    def test_lost_events_and_failed_joins_are_a_break(self) -> None:
+        for kw, why in ((dict(lost=2), "the relay lost 2 events"), (dict(join_failed=3), "3 identities couldn't join the relay")):
+            with self.subTest(why):
+                m = rs.Monitor(expected={}, live_required=True)
+                self.assertIsNone(m.gen_tick(1, gen_sample(1, 0, 0), live_counters(1), None))
+                self.assertIsNone(m.gen_tick(2, gen_sample(2, 0, 0), live_counters(2, **kw), None))
+                self.assertEqual((m.relay_break_t, m.notes), (2, [{"t_unix": 2, "relay_break": why}]))
+
+    def test_the_ack_test_at_a_bands_end(self) -> None:
+        """95% of at least 20 acks within 500 ms; the share is exact, from
+        the histogram's 500 ms bound."""
+        m = rs.Monitor(expected={}, relays=["relay1"])
+        l0 = live_counters(100, ack_ms_le=acks(10, 2), sent=12, accepted=12)
+        held = m.band_end("relay1", "steady", l0, live_counters(400, ack_ms_le=acks(10 + 95, 2 + 5), sent=112, accepted=112), 400)
+        self.assertEqual((held["acks"], held["acks_within_500ms"], held["share_within_500ms_pct"], held["sent"]), (100, 95, 95.0, 100))
+        self.assertEqual(m.notes, [])
+        m.band_end("relay1", "ramp-007", l0, live_counters(400, ack_ms_le=acks(10 + 94, 2 + 6)), 400)
+        self.assertEqual(m.notes, [{"t_unix": 400, "relay_break": "ramp-007: 94 of 100 acks within 500 ms (94.0%), under 95%", "relay": "relay1"}])
+        self.assertEqual(m.broken(), {"relay1": 400})
+        few = rs.Monitor(expected={}).band_end(None, "floor", l0, live_counters(400, ack_ms_le=acks(10, 2 + 19)), 400)
+        self.assertEqual(few["ack_test"], "not judged: 19 acks, fewer than 20")
+
+    def test_each_live_file_counts_for_its_own_relay(self) -> None:
+        """relay1's generator sees the relay reject events: relay1 broke, not
+        relay2. A generator error waits on its own relay's break; the
+        generator box's own limits wait on every relay's."""
+        m = rs.Monitor(expected={}, live_required=True, relays=["relay1", "relay2"])
+        for role in ("relay1", "relay2"):
+            self.assertIsNone(m.live_tick(role, 1, live_counters(1), None))
+        self.assertIsNone(m.live_tick("relay1", 2, live_counters(2, rejected=4), None))
+        self.assertEqual(m.broken(), {"relay1": 2})
+        self.assertIsNone(m.live_tick("relay1", 3, live_counters(3, rejected=4, send_failed=1), None))
+        self.assertEqual(m.notes[-1], {"t_unix": 3, "after_relay_break": "the generator for relay1 reported its own errors: send_failed +1", "relay_break_t": 2})
+        v = m.live_tick("relay2", 3, live_counters(3, send_failed=1), None)
+        self.assertEqual((v.reason, v.box), ("the generator for relay2 reported its own errors: send_failed +1, before the relay broke", "generator"))
+        # The generator box's memory: relay2 hasn't broken, so it voids.
+        m2 = rs.Monitor(expected={}, relays=["relay1", "relay2"])
+        m2.relay_break(1, "x", "relay1")
+        for t in (2, 3):
+            self.assertIsNone(m2.gen_box_tick(t, gen_sample(t, 0, 0, avail=50)))
+        v = m2.gen_box_tick(4, gen_sample(4, 0, 0, avail=50))
+        self.assertEqual(v.reason, "the generator's MemAvailable was under 10% of MemTotal for 3 ticks, before the relay broke")
+        m2.relay_break(5, "y", "relay2")
+        m2._mem_low = 0
+        for t in (6, 7, 8):
+            self.assertIsNone(m2.gen_box_tick(t, gen_sample(t, 0, 0, avail=50)), t)
+        self.assertEqual(m2.notes[-1]["after_relay_break"], "the generator's MemAvailable was under 10% of MemTotal for 3 ticks")
+        m3 = rs.Monitor(expected={}, live_required=True, relays=["relay2"])
+        v = m3.live_tick("relay2", 1, None, "/x/live.json is missing")
+        self.assertEqual(v.reason, "the generator's live counters for relay2: /x/live.json is missing")
+
+    # The fields tenant_sim's live.json holds (stats.rs Live), typed out
+    # here and in the Rust row live_json_holds_the_fields_the_sampler_reads.
+    LIVE_FIELDS = {"t_unix", "sent", "accepted", "rejected", "rate_limited", "received", "client_errors",
+                   "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed",
+                   "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "ack_ms_le", "lost",
+                   "joined"}
+
+    def test_the_loop_reads_what_tenant_sim_writes(self) -> None:
+        """A live.json from a real tenant_sim run (testdata/live), read with
+        the loop's own read_live; and every field the loop needs is one
+        tenant_sim writes."""
+        import hashlib
+        folder = Path(__file__).resolve().parent / "testdata" / "live"
+        want = dict(reversed(l.split()) for l in (folder / "SHA256SUMS").read_text().splitlines())
+        path = folder / "ramp-stop.json"
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), want["ramp-stop.json"], "the fixture changed")
+        live, err = rs.read_live(str(path))
+        self.assertIsNone(err)
+        self.assertEqual((live["ended"], live["joined"]), ("stop", 18))
+        self.assertEqual(set(live) - {"ended"}, self.LIVE_FIELDS)
+        self.assertLessEqual(set(rs.LIVE_TOTALS) | {"t_unix", "client_errors", "ack_ms_le"}, self.LIVE_FIELDS)
+
     def test_read_live(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "live.json"
@@ -695,6 +793,12 @@ class Voids(unittest.TestCase):
                     p.write_text(json.dumps(live_counters(7)).replace('"t_unix": 7,', '"t_unix": %s,' % bad, 1))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p}: t_unix {bad} is not a whole number of seconds"))
             whole = live_counters(7)
+            for name, bad in (("missing", None), ("a bound short", {k: v for k, v in whole["ack_ms_le"].items() if k != "500"}),
+                              ("not cumulative", {**whole["ack_ms_le"], "250": 5})):
+                with self.subTest(ack_ms_le=name):
+                    p.write_text(json.dumps({k: v for k, v in {**whole, "ack_ms_le": bad}.items() if v is not None}))
+                    self.assertEqual(rs.read_live(str(p))[1], f"{p}: ack_ms_le is not cumulative" if name == "not cumulative"
+                                     else f"{p}: ack_ms_le is not the histogram with bounds {', '.join(rs.ACK_BOUNDS)}")
             p.write_text(json.dumps({**whole, "ended": "done"}))
             self.assertEqual(rs.read_live(str(p)), (None, f"{p}: ended \"done\" is not one of ['eof', 'lease', 'stop']"))
             p.write_text(json.dumps({**whole, "ended": "stop"}))
@@ -910,7 +1014,7 @@ class Loop(unittest.TestCase):
             self.assertFalse((Path(d) / "samples" / "void.json").exists())
             notes = [json.loads(l) for l in (Path(d) / "samples" / "notes.jsonl").read_text().splitlines()]
             self.assertEqual(notes, [
-                {"t_unix": 1005.0, "relay_break": "relay1 (10.77.0.3): no relay container"},
+                {"t_unix": 1005.0, "relay_break": "relay1 (10.77.0.3): no relay container", "relay": "relay1"},
                 {"t_unix": 1020.0, "after_relay_break": "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: no postgres container", "relay_break_t": 1005.0},
             ])
 
@@ -930,7 +1034,7 @@ class Loop(unittest.TestCase):
             self.assertFalse((Path(d) / "samples" / "void.json").exists())
             notes = [json.loads(l) for l in (Path(d) / "samples" / "notes.jsonl").read_text().splitlines()]
             self.assertEqual(notes, [
-                {"t_unix": 1005.0, "relay_break": "relay1 (10.77.0.3): no relay container"},
+                {"t_unix": 1005.0, "relay_break": "relay1 (10.77.0.3): no relay container", "relay": "relay1"},
                 {"t_unix": 1025.0, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: ssh exit 255: ssh: connect to host 10.77.0.3 port 22: Connection timed out", "relay_break_t": 1005.0},
             ])
 
@@ -998,7 +1102,7 @@ class Loop(unittest.TestCase):
             self.assertEqual(code, 0, self.stderr)
             notes = [json.loads(l) for l in (Path(d) / "samples" / "notes.jsonl").read_text().splitlines()]
             self.assertEqual(notes, [
-                {"t_unix": 1020.0, "relay_break": "relay1 (10.77.0.3): the relay was OOM-killed"},
+                {"t_unix": 1020.0, "relay_break": "relay1 (10.77.0.3): the relay was OOM-killed", "relay": "relay1"},
                 {"t_unix": 1020.0, "after_relay_break": "the generator reported its own errors: media_client_failed +1", "relay_break_t": 1020.0},
             ])
 
@@ -1027,6 +1131,91 @@ class Loop(unittest.TestCase):
             self.assertEqual(code, 0)
             bands = [json.loads(l) for l in (Path(d) / "samples" / "bands.jsonl").read_text().splitlines()]
             self.assertEqual((bands[0]["slow_calls"], bands[0]["slow_missed"]), (13, 0))
+
+    def run_lives(self, d: Path, write, bands: dict[float, str], duration: float):  # type: ignore[no-untyped-def]
+        """The loop with two live files and no box, as on a workstation:
+        `write(t, role)` gives each live file at time t, and `bands` the band
+        file's name from each time on. Returns the exit, bands.jsonl's client
+        lines, the notes, and breaks.json as read at each tick."""
+        clock = {"t": 1000.0}
+        band = d / "band"
+        paths = {r: d / f"live-{r}.json" for r in ("a", "b")}
+        seen: list[dict] = []
+
+        def tick() -> None:
+            name = [n for at, n in sorted(bands.items()) if at <= clock["t"]][-1]
+            band.write_text(name + "\n")
+            for r, p in paths.items():
+                p.write_text(json.dumps(write(int(clock["t"]), r)))
+
+        def sleep(sec: float) -> None:
+            br = d / "samples" / "breaks.json"
+            seen.append(json.loads(br.read_text()) if br.exists() else {})
+            clock["t"] += 5
+            tick()
+
+        tick()
+        s = self.settings(d, boxes=[], expected={}, self_role=None, self_config=None, band_file=str(band),
+                          duration=duration, lives=[(r, str(p)) for r, p in paths.items()])
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = rs.run_loop(s, runner=lambda argv: (255, "", ""), clock=lambda: clock["t"], sleep=sleep)
+        self.stderr = err.getvalue()
+        lines = [json.loads(l) for l in (d / "samples" / "bands.jsonl").read_text().splitlines()]
+        notes_path = d / "samples" / "notes.jsonl"
+        notes = [json.loads(l) for l in notes_path.read_text().splitlines()] if notes_path.exists() else []
+        return code, [l for l in lines if "client" in l], notes, seen
+
+    def test_each_relays_ack_test_at_its_bands_end(self) -> None:
+        """Relay a's acks slow down in steady: a broke at steady's end, b
+        didn't. Each band's clients are in bands.jsonl."""
+        def write(t: int, r: str) -> dict:
+            n = (t - 1000) // 5  # 4 acks a tick
+            slow = n if r == "a" else 0
+            return live_counters(t, ack_ms_le=acks(4 * n - slow, slow), sent=4 * n, accepted=4 * n)
+        with tempfile.TemporaryDirectory() as d:
+            code, clients, notes, seen = self.run_lives(Path(d), write, {0: "floor", 1100: "steady", 1200: "cooldown"}, 230.0)
+            self.assertEqual(code, 0, self.stderr)
+            self.assertEqual([(c["band"], c["role"]) for c in clients], [("floor", "a"), ("floor", "b"), ("steady", "a"), ("steady", "b")])
+            steady_a = clients[2]["client"]
+            # The window: the first read in the band (1100) to the last
+            # before it changed (1195), 19 ticks of 4 acks.
+            self.assertEqual((steady_a["acks"], steady_a["acks_within_500ms"], steady_a["share_within_500ms_pct"]), (76, 57, 75.0))
+            self.assertEqual((steady_a["from_t_unix"], steady_a["to_t_unix"]), (1100, 1195))
+            self.assertEqual(clients[3]["client"]["share_within_500ms_pct"], 100.0)
+            # The floor's slow acks broke a already, at the floor's end: one
+            # break per source, so steady's is in its client line only.
+            self.assertEqual(notes, [{"t_unix": 1100.0, "relay_break": "floor: 57 of 76 acks within 500 ms (75.0%), under 95%", "relay": "a"}])
+            self.assertEqual(json.loads((Path(d) / "samples" / "breaks.json").read_text()), {"relays": {"a": 1100.0}, "first_t_unix": 1100.0})
+
+    def test_a_ramp_steps_window_starts_once_it_settles(self) -> None:
+        """A step's joiners connect and backfill in its first 60 s; slow acks
+        there don't count, slow acks after do."""
+        for slow_after, broke in ((False, False), (True, True)):
+            def write(t: int, r: str, slow_after: bool = slow_after) -> dict:
+                n = (t - 1000) // 5
+                # The step starts at 1100: slow acks to 1160, then fast (or slow).
+                slow = min(n, 32) if r == "a" and t >= 1100 else 0
+                if slow_after and r == "a" and t > 1160:
+                    slow += n - 32
+                return live_counters(t, ack_ms_le=acks(4 * n - slow, slow), sent=4 * n, accepted=4 * n)
+            with self.subTest(slow_after=slow_after), tempfile.TemporaryDirectory() as d:
+                code, clients, notes, _ = self.run_lives(Path(d), write, {0: "pause", 1100: "ramp-001", 1300: "pause"}, 330.0)
+                self.assertEqual(code, 0, self.stderr)
+                step_a = [c for c in clients if c["band"] == "ramp-001" and c["role"] == "a"][0]["client"]
+                self.assertEqual(step_a["from_t_unix"], 1160, "the window starts 60 s into the step")
+                self.assertEqual(bool([n for n in notes if n.get("relay") == "a"]), broke, notes)
+
+    def test_breaks_json_comes_as_the_break_does(self) -> None:
+        """A relay that rejects events broke there and then: breaks.json has
+        it at the next tick, not only at the band's end."""
+        def write(t: int, r: str) -> dict:
+            return live_counters(t, rejected=5 if r == "b" and t >= 1050 else 0)
+        with tempfile.TemporaryDirectory() as d:
+            code, _, _, seen = self.run_lives(Path(d), write, {0: "steady"}, 100.0)
+            self.assertEqual(code, 0, self.stderr)
+            first = next(i for i, b in enumerate(seen) if b.get("relays"))
+            self.assertEqual(seen[first], {"relays": {"b": 1050.0}, "first_t_unix": 1050.0})
+            self.assertEqual(first, 10, "at the tick the break was read")
 
     def test_bands_and_the_end_of_a_run(self) -> None:
         with tempfile.TemporaryDirectory() as d:
