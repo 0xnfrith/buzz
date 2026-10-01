@@ -1593,6 +1593,85 @@ mod tests {
             assert_eq!(live_of(&out)["sent"], 0, "{name}: a band was measured");
         }
 
+        // The relay's limit texts in setup. A shed is waited out and the
+        // event resent, like the quota, and counted apart in setup-done's
+        // provision; setup fails only when the waits give up. A text the
+        // pinned relay doesn't send fails setup at once.
+        fn shed_9030_once(k: u64) -> Answer {
+            static SHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if k == 9030 && !SHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Answer::Notice("rate-limited: too many concurrent requests")
+            } else {
+                Answer::Accept
+            }
+        }
+        let relay = relay_with(shed_9030_once).await;
+        let (task, out) = start("setup-shed-once", &relay.url, &[]);
+        until(
+            "setup-shed-once: setup-done",
+            Duration::from_secs(60),
+            || read(&out.join("phases.jsonl")).contains("\"setup-done\""),
+        )
+        .await;
+        let done = phases_of(&out)
+            .into_iter()
+            .find(|p| p["phase"] == "setup-done")
+            .expect("setup-done");
+        assert_eq!(
+            (
+                done["provision"]["relay_shed"].as_u64(),
+                done["provision"]["rate_limited"].as_u64()
+            ),
+            (Some(1), Some(0)),
+            "{done}"
+        );
+        until("setup-shed-once: the fifo", Duration::from_secs(20), || {
+            out.join("band.fifo").exists()
+        })
+        .await;
+        send(&out, "stop").await.expect("writer");
+        assert_eq!(
+            ends("setup-shed-once", task, Duration::from_secs(30)).await,
+            0
+        );
+        fn always_shed_9030(k: u64) -> Answer {
+            if k == 9030 {
+                Answer::Notice("rate-limited: shared admission unavailable")
+            } else {
+                Answer::Accept
+            }
+        }
+        fn unknown_9030(k: u64) -> Answer {
+            if k == 9030 {
+                Answer::Notice("rate-limited: slow down")
+            } else {
+                Answer::Accept
+            }
+        }
+        for (name, answer, why, within) in [
+            (
+                "setup-always-shed",
+                always_shed_9030 as fn(u64) -> Answer,
+                "9030 h0: still shed after 21 waits: rate-limited: shared admission unavailable",
+                Duration::from_secs(60),
+            ),
+            (
+                "setup-unknown-limit",
+                unknown_9030,
+                "9030 h0: the relay sent a limit it doesn't send: rate-limited: slow down",
+                Duration::from_secs(15),
+            ),
+        ] {
+            let relay = relay_with(answer).await;
+            let (task, out) = start(name, &relay.url, &[]);
+            assert_eq!(ends(name, task, within).await, 3, "{name}");
+            assert_eq!(
+                phases_of(&out),
+                vec![serde_json::json!({"phase": "setup-failed", "why": why})],
+                "{name}"
+            );
+        }
+
         // A stop while setup waits out a rate limit (the relay names 60 s)
         // ends setup within seconds, with its own line.
         fn rate_limit_9030(k: u64) -> Answer {
