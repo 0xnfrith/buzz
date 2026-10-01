@@ -54,6 +54,11 @@ class World:
         self.never_setup: set[str] = set()
         self.at: list[tuple[float, Any]] = []  # (time, fn) run once time passes it
         self.lines: list[tuple[str, str]] = []
+        self.line_t: list[tuple[str, str, float]] = []
+        self.event_t: list[tuple[str, float]] = []
+        # A generator that ends this many seconds after its stop (its relay
+        # frozen, its sends waiting out their timeouts).
+        self.slow_stop: dict[str, float] = {}
 
     def clock(self) -> float:
         return self.t
@@ -67,6 +72,7 @@ class World:
 
     def hook(self, event: list[str]) -> tuple[int, str, str]:
         self.events.append(event)
+        self.event_t.append((" ".join(event), self.t))
         key = " ".join(event)
         for k, (code, err) in self.fail.items():
             if key == k:
@@ -86,9 +92,12 @@ class World:
         elif ev == "send":
             g, line = args
             self.lines.append((g, line))
+            self.line_t.append((g, line, self.t))
             if line.startswith("continue"):
                 self.phases[g].append({"phase": "ready", "identities": 6})
-            if line == "stop":
+            if line == "stop" and g in self.slow_stop:
+                self.at.append((self.t + self.slow_stop[g], lambda w, g=g: w.gens.__setitem__(g, "exited 0")))
+            elif line == "stop":
                 self.gens[g] = "exited 0"
         elif ev == "phases":
             return 0, "".join(json.dumps(p) + "\n" for p in self.phases[args[0]]), ""
@@ -271,6 +280,53 @@ class Ramps(unittest.TestCase):
         self.assertEqual([l.split()[1] for l in ramps_a], ["30", "45", "60", "75"])
         self.assertIn(("a", "stop"), w.lines)
         self.assertEqual(w.kinds()[-3:], ["boundary ramp", "sampler stop", "end"])
+
+    def test_the_last_steps_break_is_read_after_the_sampler_judged_it(self) -> None:
+        """The last step's ack test is judged at the sampler's first tick
+        after the pause: here 10 s after it, later than one cadence. The
+        clock waits for it, so the relay broke at the max, not held it."""
+        w = World(["a"])
+        # Step 3, the last, ends at 1010 + 3 * 300.
+        w.at.append((1010 + 3 * 300 + 10, lambda w: w.breaks.__setitem__(
+            "a", {"t_unix": 1920.0, "why": "ramp-003: 80 of 100 acks within 500 ms (80.0%), under 95%", "band": "ramp-003"})))
+        code, res = self.ramp(w, bc.Ramp(start=30, step=15, every_s=300, max=60, budget_s=36000))
+        self.assertEqual(code, 0)
+        a = res["items"][0]["ramp"]["relays"]["a"]
+        self.assertEqual((a["held_k"], a["broke_k"], a["broke_step"], "ended" in a), (45, 60, 3, False))
+
+    def test_a_generator_slow_to_stop_holds_no_other_generators_step(self) -> None:
+        """b's relay breaks in step 2, and b takes 800 s to end after its
+        stop, past the ramp's end. a gets step 3 as soon as step 2 ends,
+        inside its lease, and the item's end still waits for b before the
+        sampler stops."""
+        w = World(["a", "b"])
+        w.slow_stop["b"] = 800
+        w.at.append((1010 + 300 + 30, lambda w: w.breaks.__setitem__(
+            "b", {"t_unix": 1340.0, "why": "the relay didn't answer 4 sends", "band": "ramp-002"})))
+        code, res = self.ramp(w, bc.Ramp(start=30, step=15, every_s=300, max=75, budget_s=36000))
+        self.assertEqual(code, 0, res.get("stopped"))
+        stop_b = next(t for g, l, t in w.line_t if (g, l) == ("b", "stop"))
+        step3_a = next(t for g, l, t in w.line_t if g == "a" and l.startswith("ramp 60 "))
+        self.assertLess(step3_a - stop_b, 10, "a's next step waited for b to end")
+        sampler_stop = next(t for e, t in w.event_t if e == "sampler stop")
+        self.assertGreaterEqual(sampler_stop, stop_b + 800, "the item ended before b did")
+        self.assertEqual(w.kinds()[-4:], ["boundary ramp", "send a stop", "sampler stop", "end"])
+        r = res["items"][0]["ramp"]["relays"]
+        self.assertEqual((r["b"]["broke_k"], r["a"]["held_k"], r["a"]["ended"]), (45, 75, "held at the max"))
+
+    def test_a_void_mid_ramp_keeps_the_steps_and_the_breaks_before_it(self) -> None:
+        """b broke in step 2; the run voids in step 4. clock.json keeps the
+        steps run and b's break; a has no result past its last held step."""
+        w = World(["a", "b"])
+        w.at.append((1010 + 300 + 30, lambda w: w.breaks.__setitem__(
+            "b", {"t_unix": 1340.0, "why": "the relay didn't answer 4 sends", "band": "ramp-002"})))
+        w.at.append((1010 + 3 * 300 + 60, lambda w: setattr(w, "void", {"reason": "the generator box's CPU averaged 85%"})))
+        code, res = self.ramp(w, bc.Ramp(start=30, step=15, every_s=300, max=660, budget_s=36000))
+        self.assertEqual((code, res["stopped"]), (bc.EXIT_VOID, "void: the generator box's CPU averaged 85%"))
+        r = res["items"][0]["ramp"]
+        self.assertEqual([s["k"] for s in r["steps"]], [30, 45, 60, 75])
+        self.assertEqual((r["relays"]["b"]["held_k"], r["relays"]["b"]["broke_k"], r["relays"]["b"]["why"]), (30, 45, "the relay didn't answer 4 sends"))
+        self.assertEqual(r["relays"]["a"], {"held_k": None})
 
     def test_a_ramp_that_holds_to_the_max(self) -> None:
         w = World(["a"])

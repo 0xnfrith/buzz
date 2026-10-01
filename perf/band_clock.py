@@ -93,6 +93,10 @@ class Options:
     ready_timeout_s: float = 300.0
     stop_timeout_s: float = 300.0
     setup_must_not_rate_limit: bool = False
+    # The sampler judges a band at its first tick after the band changes:
+    # the ramp's last step is read this long after the pause, three of the
+    # sampler's 5 s ticks.
+    judge_wait_s: float = 15.0
 
 
 Hook = Callable[[list[str]], tuple[int, str, str]]
@@ -147,6 +151,8 @@ class Clock:
     log: Callable[[str], None] = lambda line: print(f"clock: {line}", flush=True)
     result: dict[str, Any] = field(default_factory=dict)
     _running: set[str] = field(default_factory=set)
+    # Generators sent a stop whose end hasn't been seen yet.
+    _stopping: set[str] = field(default_factory=set)
     _sampler_on: bool = False
     _next_rules: float = 0.0
 
@@ -293,17 +299,26 @@ class Clock:
         self._sampler_on = True
         return provision
 
-    def stop_gens(self, gens: list[str]) -> None:
-        """Stops the generators given and waits for them to end."""
+    def stop_gens(self, gens: list[str], wait: bool = True) -> None:
+        """Stops the generators given. With wait, waits for them and for
+        every generator stopped before to end. Mid-ramp a broken relay's
+        generator is stopped without waiting: one that is slow to end (its
+        relay frozen, its sends waiting out their timeouts) must not hold
+        the other generators' next step past their leases."""
         for g in sorted(gens):
             self.send(g, "stop")
             self._running.discard(g)
+            self._stopping.add(g)
+        if not wait:
+            return
+        gens = sorted(self._stopping)
         end = self.clock() + self.opts.stop_timeout_s
         while True:
             st = self.status()
             states = st.get("gens") or {}
             left = [g for g in gens if states.get(g) == "active"]
             if not left:
+                self._stopping.clear()
                 return
             if self.clock() >= end:
                 raise Stop(EXIT_HOOK, f"the generators {', '.join(sorted(left))} were still running {self.opts.stop_timeout_s:g} s after stop")
@@ -328,6 +343,9 @@ class Clock:
             self.band(name, seconds)
         steps: list[dict[str, Any]] = []
         res: dict[str, dict[str, Any]] = {g: {"held_k": None} for g in self.gens}
+        # In the record from the start: a void or a failed hook mid-ramp
+        # still leaves the steps run and each break found before it.
+        rec["ramp"] = {"steps": steps, "relays": res}
         started = self.clock()
         k, n = ramp.start, 1
         for g in sorted(self._running):
@@ -349,19 +367,18 @@ class Clock:
             if not self._running:
                 break
             k, n = min(k + ramp.step, ramp.max), n + 1
-        # The last step is judged when the band changes: pause, read once
-        # more, then the boundary.
+        # The last step is judged when the band changes: pause, give the
+        # sampler time to judge it, read once more, then the boundary.
         for g in sorted(self._running):
             self.send(g, f"band pause {math.ceil(self.opts.pause_lease_s)}")
         self.call("band", "pause")
-        self.sleep(self.opts.cadence_s)
+        self.hold(self.opts.judge_wait_s)
         self.settle_breaks(steps, res)
         for g, r in res.items():
             if "broke_k" not in r:
                 last = steps[-1] if steps else None
                 r["held_k"] = last["k"] if last else None
                 r["ended"] = "held at the max" if last and last["k"] >= ramp.max else "the ramp's time ran out"
-        rec["ramp"] = {"steps": steps, "relays": res}
         self.call("rules")
         self.call("boundary", "ramp")
         self.log("boundary ramp: passed")
@@ -387,7 +404,7 @@ class Clock:
             if g in self._running:
                 broke.append(g)
         if broke:
-            self.stop_gens(broke)
+            self.stop_gens(broke, wait=False)
 
     def write_result(self) -> None:
         self.out.mkdir(parents=True, exist_ok=True)
@@ -455,6 +472,8 @@ def parse(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     p.add_argument("--setup-timeout", type=float, default=3600.0)
     p.add_argument("--ready-timeout", type=float, default=300.0)
     p.add_argument("--stop-timeout", type=float, default=300.0)
+    p.add_argument("--judge-wait", type=float, default=15.0,
+                   help="seconds after the ramp's last step before its result is read: the sampler judges a step at its next tick")
     p.add_argument("--setup-must-not-rate-limit", action="store_true",
                    help="refuse a setup that met any rate limit: for a relay whose setup limits are raised")
     try:
@@ -480,8 +499,9 @@ def build(args: argparse.Namespace) -> tuple[list[str], list[Item], Options]:
     if len(set(names)) != len(names):
         raise Stop(EXIT_REFUSED, f"refused: two items share a name: {names}")
     opts = Options(args.cadence, args.rules_every, args.lease_slack, args.pause_lease, args.setup_timeout,
-                   args.ready_timeout, args.stop_timeout, args.setup_must_not_rate_limit)
-    if min(opts.cadence_s, opts.rules_every_s, opts.setup_timeout_s, opts.ready_timeout_s, opts.stop_timeout_s) <= 0:
+                   args.ready_timeout, args.stop_timeout, args.setup_must_not_rate_limit, args.judge_wait)
+    if min(opts.cadence_s, opts.rules_every_s, opts.setup_timeout_s, opts.ready_timeout_s, opts.stop_timeout_s,
+           opts.judge_wait_s) <= 0:
         raise Stop(EXIT_REFUSED, "refused: every period and timeout must be above 0")
     return gens, items, opts
 
