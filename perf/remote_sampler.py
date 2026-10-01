@@ -10,9 +10,10 @@ the conditions that void a run:
   lockdown;
 - a box misses too many ticks: 3 calls in a row, or over 1% of the ticks
   once there are 100;
-- a relay box's slow calls fail as often, counted apart from its ticks: a
-  slow call fails when its reply is not a whole slow sample (an error from
-  `docker system df` or `psql`, or a disk figure missing);
+- before the relay breaks, a relay box's slow calls fail as often,
+  counted apart from its ticks: a slow call fails when its reply is not a
+  whole slow sample (an error from `docker system df` or `psql`, or a disk
+  figure missing). After the break, that is a note;
 - the generator overloads before the relay breaks: CPU averaging over 70% on
   two 60 s windows in a row, MemAvailable under 10% of MemTotal for 3 ticks,
   an out-of-memory kill on its box, or its own errors rising in tenant_sim's
@@ -281,6 +282,7 @@ class Monitor:
     _gen_oom0: int | None = None
     _relay_oom0: dict[str, int] = field(default_factory=dict)
     _live0: dict[str, Any] | None = None
+    _slow_pct_noted: set[str] = field(default_factory=set)
 
     def relay_break(self, t: float, why: str) -> None:
         if self.relay_break_t is None:
@@ -329,20 +331,34 @@ class Monitor:
         """One relay box's slow call: miss is None for a whole slow sample,
         else why it isn't one. The same two limits as the ticks, counted
         apart from them: a good fast call between two failed slow ones must
-        not reset the count."""
+        not reset the count. Before the relay breaks, a limit voids. After,
+        it is a note with its time: a crash-looping Postgres is the relay
+        breaking, and the result stands. Each run of misses reaching the
+        limit is noted once, and the share once."""
         key = f"{box.role} ({box.ip})"
+        broke = self.relay_break_t is not None and self.relay_break_t <= t
         self.slow_calls[box.ip] = self.slow_calls.get(box.ip, 0) + 1
+        why = None
         if miss is not None:
             self.slow_misses[box.ip] = self.slow_misses.get(box.ip, 0) + 1
             self.slow_consecutive[box.ip] = self.slow_consecutive.get(box.ip, 0) + 1
-            if self.slow_consecutive[box.ip] >= self.max_consecutive:
-                return Void(f"{key}: {self.slow_consecutive[box.ip]} slow calls in a row failed; the last: {miss}", box.role, t)
+            run = self.slow_consecutive[box.ip]
+            if run >= self.max_consecutive and not (broke and run > self.max_consecutive):
+                why = f"{key}: {run} slow calls in a row failed; the last: {miss}"
         else:
             self.slow_consecutive[box.ip] = 0
         n, m = self.slow_calls[box.ip], self.slow_misses.get(box.ip, 0)
-        if n >= self.min_ticks_for_pct and m * 100.0 > self.max_miss_pct * n:
-            return Void(f"{key} missed {m} of {n} slow calls, over the {self.max_miss_pct:g}% limit", box.role, t)
-        return None
+        if why is None and n >= self.min_ticks_for_pct and m * 100.0 > self.max_miss_pct * n:
+            if not (broke and box.ip in self._slow_pct_noted):
+                why = f"{key} missed {m} of {n} slow calls, over the {self.max_miss_pct:g}% limit"
+                if broke:
+                    self._slow_pct_noted.add(box.ip)
+        if why is None:
+            return None
+        if broke:
+            self.notes.append({"t_unix": t, "after_relay_break": why, "relay_break_t": self.relay_break_t})
+            return None
+        return Void(why, box.role, t)
 
     def gen_tick(self, t: float, sample: dict[str, Any], live: dict[str, Any] | None, live_err: str | None,
                  live_t: float | None = None) -> Void | None:

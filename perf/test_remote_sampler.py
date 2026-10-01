@@ -381,6 +381,30 @@ class Voids(unittest.TestCase):
                 self.assertIsNone(out, n)
         self.assertEqual(out.reason, "relay1 (10.77.0.3) missed 2 of 100 slow calls, over the 1% limit")
 
+    def test_slow_calls_three_in_a_row_after_a_relay_break_are_a_note(self) -> None:
+        """Each run reaching the limit is noted once, with its time."""
+        m = self.mon()
+        m.relay_break(1, "relay1 (10.77.0.3): no relay container")
+        for t in (2, 3):
+            self.assertIsNone(m.slow_tick(self.BOX, t, "the slow sample has errors: psql: no postgres container"))
+        self.assertIsNone(m.slow_tick(self.BOX, 4, "the slow sample has errors: psql: no postgres container"))
+        self.assertIsNone(m.slow_tick(self.BOX, 5, "x"))
+        self.assertIsNone(m.slow_tick(self.BOX, 6, None))
+        for t in (7, 8, 9):
+            self.assertIsNone(m.slow_tick(self.BOX, t, "y"))
+        self.assertEqual(m.notes, [
+            {"t_unix": 1, "relay_break": "relay1 (10.77.0.3): no relay container"},
+            {"t_unix": 4, "after_relay_break": "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: no postgres container", "relay_break_t": 1},
+            {"t_unix": 9, "after_relay_break": "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: y", "relay_break_t": 1},
+        ])
+
+    def test_slow_calls_over_one_percent_after_a_relay_break_are_a_note_once(self) -> None:
+        m = self.mon()
+        m.relay_break(0, "the relay rejected 3 events")
+        for n in range(1, 121):
+            self.assertIsNone(m.slow_tick(self.BOX, n, "x" if n in (10, 50, 110) else None), n)
+        self.assertEqual(m.notes[1:], [{"t_unix": 100, "after_relay_break": "relay1 (10.77.0.3) missed 2 of 100 slow calls, over the 1% limit", "relay_break_t": 0}])
+
     def test_slow_and_fast_are_counted_apart(self) -> None:
         m = self.mon()
         for t in (1, 2):
@@ -762,6 +786,43 @@ class Loop(unittest.TestCase):
             self.assertEqual(code, 3)
             void = json.loads((Path(d) / "samples" / "void.json").read_text())
             self.assertEqual((void["reason"], void["t_unix"]), ("relay1 (10.77.0.3) missed 2 of 100 slow calls, over the 1% limit", 1495.0))
+
+    def test_slow_failures_after_a_relay_break_are_a_note_through_the_loop(self) -> None:
+        """The relay container is gone from t=1005, a break; Postgres's
+        slow calls fail from t=1010. The run ends at its duration, exit 0,
+        with both in notes.jsonl."""
+        with tempfile.TemporaryDirectory() as d:
+            def answer(t: float, tier: str) -> tuple[int, str, str]:
+                row = relay_sample(t, tier=tier)
+                if t >= 1005:
+                    row["containers"] = {"postgres": {"working_set": 10, "oom_kill": 0}}
+                if tier == "slow" and t >= 1010:
+                    row["errors"] = ["psql: no postgres container"]
+                    row["wal"] = None
+                return 0, json.dumps(row), ""
+            code, _ = self.drive(self.settings(Path(d), slow_every=5.0, duration=40.0), answer)
+            self.assertEqual(code, 0)
+            self.assertFalse((Path(d) / "samples" / "void.json").exists())
+            notes = [json.loads(l) for l in (Path(d) / "samples" / "notes.jsonl").read_text().splitlines()]
+            self.assertEqual(notes, [
+                {"t_unix": 1005.0, "relay_break": "relay1 (10.77.0.3): no relay container"},
+                {"t_unix": 1020.0, "after_relay_break": "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: no postgres container", "relay_break_t": 1005.0},
+            ])
+
+    def test_slow_failures_before_a_relay_break_void_through_the_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            def answer(t: float, tier: str) -> tuple[int, str, str]:
+                row = relay_sample(t, tier=tier)
+                if tier == "slow" and t >= 1010:
+                    row["errors"] = ["psql: no postgres container"]
+                if t >= 1025:
+                    row["containers"] = {"postgres": {"working_set": 10, "oom_kill": 0}}
+                return 0, json.dumps(row), ""
+            code, _ = self.drive(self.settings(Path(d), slow_every=5.0, duration=60.0), answer)
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual((void["reason"], void["t_unix"], void["relay_break_t"]),
+                             ("relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: no postgres container", 1020.0, None))
 
     def test_a_restarting_relay_in_a_slow_sample_is_not_a_miss(self) -> None:
         with tempfile.TemporaryDirectory() as d:

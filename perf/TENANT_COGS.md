@@ -425,8 +425,10 @@ python3 perf/tenant_cogs.py remote-sample \
   - a relay's rule-set hash differs from `--expected-hashes`;
   - a box misses 3 ticks in a row ("box unreachable"), or over 1% of its
     ticks once it has 100;
-  - a relay box's slow calls fail 3 in a row, or over 1% of them once
-    there are 100, counted apart from its ticks. A slow call fails when the
+  - before the relay breaks, a relay box's slow calls fail 3 in a row, or
+    over 1% of them once there are 100, counted apart from its ticks.
+    After the break each is a note with its time instead: a crash-looping
+    Postgres is the relay breaking. A slow call fails when the
     reply is not a whole slow sample: an error from `docker system df` or
     `psql`, or a figure missing (the filesystem's used and free; on a box
     with Docker, Postgres data, WAL, MinIO, Redis, git, container logs,
