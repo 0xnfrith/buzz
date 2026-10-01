@@ -130,6 +130,18 @@ struct Args {
     #[arg(long)]
     pause_after_setup: bool,
 
+    /// A ramp: provision this many identities in setup (a whole number of
+    /// the profile's teams: a human and their agents), and switch them on in
+    /// steps with `ramp <k>` band signals. The world (channels, repos) stays
+    /// the profile's, and every identity joins every channel.
+    #[arg(long, default_value_t = 0)]
+    ramp_max: u32,
+
+    /// With --ramp-max: how many identities are on before the first `ramp`
+    /// signal (default: the profile's population).
+    #[arg(long)]
+    ramp_start: Option<u32>,
+
     /// Exit after setup (provisioning and seed); no population run.
     #[arg(long)]
     setup_only: bool,
@@ -264,6 +276,109 @@ async fn clone_setup_repo(
         clone_url: repo.url.clone(),
         worktree: repo.worktree.clone(),
     })
+}
+
+/// A ramp's shape: how many identities it provisions, how many are on at
+/// the start, and the population it draws them from.
+struct Ramp {
+    max: usize,
+    start: usize,
+}
+
+/// Checks --ramp-max and --ramp-start against the profile: the max a whole
+/// number of the profile's teams, at least the profile's population, and
+/// the start within it.
+fn check_ramp(profile: &Profile, args: &Args) -> Result<Option<Ramp>> {
+    if args.ramp_max == 0 {
+        if args.ramp_start.is_some() {
+            bail!("--ramp-start needs --ramp-max");
+        }
+        return Ok(None);
+    }
+    let team = 1 + profile.agents_per_human;
+    if !args.ramp_max.is_multiple_of(team) {
+        bail!(
+            "--ramp-max {} is not a whole number of teams of {team} (a human and {} agents)",
+            args.ramp_max,
+            profile.agents_per_human
+        );
+    }
+    if args.ramp_max < profile.identity_count() {
+        bail!(
+            "--ramp-max {} is under the profile's population, {}",
+            args.ramp_max,
+            profile.identity_count()
+        );
+    }
+    let start = args.ramp_start.unwrap_or(profile.identity_count());
+    if start == 0 || start > args.ramp_max {
+        bail!(
+            "--ramp-start {start} is not 1 to --ramp-max {}",
+            args.ramp_max
+        );
+    }
+    Ok(Some(Ramp {
+        max: args.ramp_max as usize,
+        start: start as usize,
+    }))
+}
+
+/// The ramp's population: the profile's, with as many teams as --ramp-max
+/// holds. Humans' keys come before agents' from one stream, so a ramp's
+/// population is generated whole, at its maximum, never grown.
+fn ramp_profile(profile: &Profile, ramp: &Ramp) -> Profile {
+    let mut p = profile.clone();
+    p.humans = (ramp.max as u32) / (1 + profile.agents_per_human);
+    p
+}
+
+/// Where each identity sits in the ramp's order: team by team, a human
+/// then their agents, so every step of whole teams keeps the profile's mix
+/// and every agent's owner is on before it.
+fn ramp_index(role: Role, i: usize, agents_per_human: usize) -> usize {
+    let team = 1 + agents_per_human;
+    match role {
+        Role::Human => i * team,
+        Role::Agent => (i / agents_per_human.max(1)) * team + 1 + i % agents_per_human.max(1),
+    }
+}
+
+/// Linux: the open-file limit must hold a ramp's sockets (a websocket, the
+/// HTTP pool, git) or joiners fail on the generator's side and look like
+/// the relay refusing them. Elsewhere there is no /proc to read; the local
+/// proofs ramp small.
+fn check_open_files(ramp: &Ramp) -> Result<()> {
+    check_open_files_in(
+        std::fs::read_to_string("/proc/self/limits").ok().as_deref(),
+        ramp,
+    )
+}
+
+/// [`check_open_files`] on the text of /proc/self/limits, if there is one.
+fn check_open_files_in(limits: Option<&str>, ramp: &Ramp) -> Result<()> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    let need = ramp.max as u64 * 4 + 256;
+    for line in limits.lines() {
+        if let Some(rest) = line.strip_prefix("Max open files") {
+            let soft = rest.split_whitespace().next().unwrap_or("");
+            if soft == "unlimited" {
+                return Ok(());
+            }
+            let soft: u64 = soft
+                .parse()
+                .map_err(|_| anyhow::anyhow!("/proc/self/limits: open files {soft:?}"))?;
+            if soft < need {
+                bail!(
+                    "the open-file limit is {soft}; a ramp to {} identities needs at least {need} (raise LimitNOFILE)",
+                    ramp.max
+                );
+            }
+            return Ok(());
+        }
+    }
+    bail!("/proc/self/limits has no open-file limit")
 }
 
 /// How many events the volume seed writes: `--seed-days` of the profile's
@@ -438,15 +553,25 @@ async fn run(args: Args) -> Result<i32> {
         .ok_or_else(|| anyhow::anyhow!("--out-dir is required for a run"))?;
     std::fs::create_dir_all(&out_dir)?;
 
+    let ramp = check_ramp(&profile, &args)?;
+    if let Some(r) = &ramp {
+        check_open_files(r)?;
+    }
     let pop = if let Some(path) = &args.identities {
         load_population(path)?
+    } else if let Some(r) = &ramp {
+        generate_population(&ramp_profile(&profile, r))
     } else {
         generate_population(&profile)
     };
     save_population(&out_dir.join("identities.json"), &pop)?;
 
     sim::phase::set_file(out_dir.join("phases.jsonl"))?;
-    let mut control = signal::spawn(&args.band_signal, &out_dir, usize::MAX)?;
+    let mut control = signal::spawn(
+        &args.band_signal,
+        &out_dir,
+        ramp.as_ref().map_or(usize::MAX, |r| r.start),
+    )?;
     let band_rx = control.band.clone();
 
     let stats = Arc::new(Stats::new());
@@ -540,12 +665,23 @@ async fn run(args: Args) -> Result<i32> {
     });
 
     let profile = Arc::new(profile);
-    let expected = profile.identity_count() as usize;
-    let (ready_tx, mut ready_rx) = mpsc::channel::<Result<(), String>>(expected);
+    let expected = ramp
+        .as_ref()
+        .map_or(profile.identity_count() as usize, |r| r.start);
+    let everyone = pop.humans.len() + pop.agents.len();
+    let (ready_tx, mut ready_rx) = mpsc::channel::<Result<(), String>>(everyone.max(1));
+    let aph = profile.agents_per_human as usize;
+    let slot = |role: Role, i: usize| {
+        ramp.as_ref().map(|_| sim::identity::RampSlot {
+            on: control.ramp.clone(),
+            index: ramp_index(role, i, aph),
+        })
+    };
     let mut tasks = Vec::new();
     let mut salt = 10u32;
-    for rec in pop.humans.iter().cloned() {
+    for (i, rec) in pop.humans.iter().cloned().enumerate() {
         salt += 1;
+        let slot = slot(Role::Human, i);
         let keys = pop.keys_of(&rec)?;
         let profile = profile.clone();
         let world = world.clone();
@@ -565,12 +701,14 @@ async fn run(args: Args) -> Result<i32> {
                 None,
                 salt,
                 ready_tx,
+                slot,
             )
             .await
         }));
     }
-    for rec in pop.agents.iter().cloned() {
+    for (i, rec) in pop.agents.iter().cloned().enumerate() {
         salt += 1;
+        let slot = slot(Role::Agent, i);
         let keys = pop.keys_of(&rec)?;
         let owner_keys = owner_of(&pop, &rec);
         let auth_tag = owner_keys
@@ -607,6 +745,7 @@ async fn run(args: Args) -> Result<i32> {
                 git_repo,
                 salt,
                 ready_tx,
+                slot,
             )
             .await
         }));
@@ -617,7 +756,10 @@ async fn run(args: Args) -> Result<i32> {
     let wait = timeout(Duration::from_secs(180), async {
         while ready < expected {
             match ready_rx.recv().await {
-                Some(Ok(())) => ready += 1,
+                Some(Ok(())) => {
+                    ready += 1;
+                    stats.record_joined();
+                }
                 Some(Err(e)) => return Err(e),
                 None => {
                     return Err(format!(
@@ -643,7 +785,28 @@ async fn run(args: Args) -> Result<i32> {
         }
     }
 
-    emit(&serde_json::json!({"phase": "ready", "identities": expected}));
+    emit(&serde_json::json!({
+        "phase": "ready",
+        "identities": expected,
+        "ramp_max": ramp.as_ref().map(|r| r.max),
+    }));
+    // Ramp joiners, later: each one that connects counts as joined; one that
+    // can't is a join the relay failed (the generator's own limits are
+    // checked above).
+    {
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            while let Some(r) = ready_rx.recv().await {
+                match r {
+                    Ok(()) => stats.record_joined(),
+                    Err(e) => {
+                        warn!("ramp join: {e}");
+                        stats.record_client_error("join_failed");
+                    }
+                }
+            }
+        });
+    }
 
     let mut join_err = false;
     for t in tasks {
@@ -1076,6 +1239,219 @@ mod tests {
             };
             assert_eq!(names, want, "{name}");
         }
+
+        // A ramp: 3 teams provisioned, 1 on at the start, switched on by
+        // `ramp` signals, each joiner counted as it connects.
+        let out = dir.join("ramp");
+        let args = Args::try_parse_from([
+            "tenant_sim".to_string(),
+            "--profile".into(),
+            profile.to_string_lossy().into_owned(),
+            "--relay-url".into(),
+            relay.clone(),
+            "--http-url".into(),
+            "http://127.0.0.1:1".into(),
+            "--allow-cidr".into(),
+            "127.0.0.0/8".into(),
+            "--deny-list".into(),
+            deny.to_string_lossy().into_owned(),
+            "--out-dir".into(),
+            out.to_string_lossy().into_owned(),
+            "--band-signal".into(),
+            "fifo".into(),
+            "--git-credential-helper".into(),
+            "/usr/bin/true".into(),
+            "--ramp-max".into(),
+            "18".into(),
+            "--ramp-start".into(),
+            "6".into(),
+        ])
+        .expect("args");
+        let task = tokio::spawn(run(args));
+        let phases = out.join("phases.jsonl");
+        let started = Instant::now();
+        while !read(&phases).contains("\"phase\":\"ready\"") {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "ramp: never ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pop: serde_json::Value =
+            serde_json::from_str(&read(&out.join("identities.json"))).expect("identities");
+        assert_eq!(
+            (
+                pop["humans"].as_array().map(Vec::len),
+                pop["agents"].as_array().map(Vec::len)
+            ),
+            (Some(3), Some(15)),
+            "the whole ramp is provisioned"
+        );
+        let fifo = out.join("band.fifo");
+        let send = |l: &'static str| {
+            let fifo = fifo.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open fifo");
+                writeln!(f, "{l}").expect("write");
+            })
+        };
+        let joined = |out: &std::path::Path| {
+            serde_json::from_str::<serde_json::Value>(&read(&out.join("live.json")))
+                .ok()
+                .and_then(|v| v["joined"].as_u64())
+        };
+        // Only the start is on at first; live.json is rewritten every 2 s.
+        for (line, want) in [
+            (None, 6),
+            (Some("band steady 60"), 6),
+            (Some("ramp 12 60"), 12),
+            (Some("ramp 18 60"), 18),
+        ] {
+            if let Some(line) = line {
+                send(line).await.expect("writer");
+            }
+            let started = Instant::now();
+            while joined(&out) != Some(want) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "{line:?}: joined {:?}, not {want}",
+                    joined(&out)
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        send("stop").await.expect("writer");
+        let code = timeout(Duration::from_secs(60), task)
+            .await
+            .expect("the ramp ended")
+            .expect("join")
+            .expect("run");
+        let live: serde_json::Value =
+            serde_json::from_str(&read(&out.join("live.json"))).expect("live.json");
+        assert_eq!(
+            (code, live["ended"].as_str(), live["joined"].as_u64()),
+            (0, Some("stop"), Some(18))
+        );
+    }
+
+    #[test]
+    fn a_ramps_shape_is_checked() {
+        let solo = load_profile(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../perf/profiles/1h-5a.toml"),
+        )
+        .expect("solo");
+        let args = |extra: &[&str]| {
+            let mut v = vec!["tenant_sim", "--profile", "x.toml"];
+            v.extend_from_slice(extra);
+            Args::try_parse_from(v).expect("args")
+        };
+        let err = |extra: &[&str]| {
+            check_ramp(&solo, &args(extra))
+                .map(|_| ())
+                .expect_err("refused")
+                .to_string()
+        };
+        assert!(check_ramp(&solo, &args(&[])).expect("none").is_none());
+        assert_eq!(
+            err(&["--ramp-max", "20"]),
+            "--ramp-max 20 is not a whole number of teams of 6 (a human and 5 agents)"
+        );
+        assert_eq!(
+            err(&["--ramp-max", "0", "--ramp-start", "6"]),
+            "--ramp-start needs --ramp-max"
+        );
+        let team = load_profile(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../perf/profiles/10h-20a.toml"),
+        )
+        .expect("team");
+        assert_eq!(
+            check_ramp(&team, &args(&["--ramp-max", "15"]))
+                .map(|_| ())
+                .expect_err("under")
+                .to_string(),
+            "--ramp-max 15 is under the profile's population, 30"
+        );
+        assert_eq!(
+            err(&["--ramp-max", "18", "--ramp-start", "0"]),
+            "--ramp-start 0 is not 1 to --ramp-max 18"
+        );
+        assert_eq!(
+            err(&["--ramp-max", "18", "--ramp-start", "19"]),
+            "--ramp-start 19 is not 1 to --ramp-max 18"
+        );
+        let r = check_ramp(&team, &args(&["--ramp-max", "660"]))
+            .expect("ok")
+            .expect("a ramp");
+        assert_eq!(
+            (r.max, r.start),
+            (660, 30),
+            "starts at the profile's population"
+        );
+        let p = ramp_profile(&team, &r);
+        assert_eq!(
+            (p.humans, p.agent_count(), p.identity_count()),
+            (220, 440, 660)
+        );
+        assert_eq!(
+            (p.channels, p.repos),
+            (team.channels, team.repos),
+            "the world stays the profile's"
+        );
+    }
+
+    /// Team by team: a human, then their agents; the first 15 are 5 teams.
+    #[test]
+    fn the_ramp_order() {
+        let order: Vec<(Role, usize, usize)> = (0..5)
+            .map(|i| (Role::Human, i, ramp_index(Role::Human, i, 2)))
+            .chain((0..10).map(|i| (Role::Agent, i, ramp_index(Role::Agent, i, 2))))
+            .collect();
+        let mut by_index: Vec<_> = order.iter().map(|(r, i, at)| (*at, *r, *i)).collect();
+        by_index.sort_by_key(|x| x.0);
+        let want: Vec<(usize, Role, usize)> = (0..5)
+            .flat_map(|t| {
+                [
+                    (3 * t, Role::Human, t),
+                    (3 * t + 1, Role::Agent, 2 * t),
+                    (3 * t + 2, Role::Agent, 2 * t + 1),
+                ]
+            })
+            .collect();
+        assert_eq!(by_index, want);
+    }
+
+    /// The open-file limit, from /proc/self/limits' text.
+    #[test]
+    fn the_open_file_limit_must_hold_the_ramp() {
+        let ramp = Ramp {
+            max: 660,
+            start: 30,
+        };
+        let limits = |soft: &str| {
+            format!("Limit                     Soft Limit           Hard Limit           Units\nMax cpu time              unlimited            unlimited            seconds\nMax open files            {soft:<21}524288               files\n")
+        };
+        assert_eq!(
+            check_open_files_in(Some(&limits("1024")), &ramp).map(|_| ()).expect_err("low").to_string(),
+            "the open-file limit is 1024; a ramp to 660 identities needs at least 2896 (raise LimitNOFILE)"
+        );
+        assert!(check_open_files_in(Some(&limits("65536")), &ramp).is_ok());
+        assert!(check_open_files_in(Some(&limits("unlimited")), &ramp).is_ok());
+        assert!(
+            check_open_files_in(None, &ramp).is_ok(),
+            "no /proc: not Linux"
+        );
+        assert_eq!(
+            check_open_files_in(Some("Max cpu time unlimited\n"), &ramp)
+                .map(|_| ())
+                .expect_err("none")
+                .to_string(),
+            "/proc/self/limits has no open-file limit"
+        );
     }
 
     #[test]

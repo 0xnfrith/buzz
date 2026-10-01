@@ -267,6 +267,51 @@ not start the relay and cannot restart it.
 - Reactions target the newest received channel event, never a DM or turn
   metric from the `#p` stream.
 
+## The ramp
+
+The ramp finds how many people and agents a relay carries before it breaks
+the service level. `tenant_sim --ramp-max 660` provisions 660 identities
+in setup, at the raised limits: relay membership and every channel join.
+Then `ramp <k> <lease>` band signals switch them on, k at a time; nothing is
+provisioned while a band is measured.
+
+- **The order is team by team:** a human, then their agents, so each step
+  of whole teams keeps the profile's mix, and an agent's owner is on before
+  it. `--ramp-max` must be a whole number of teams, at least the profile's
+  population. The population is generated once, at its maximum: humans'
+  keys come before agents' from one stream, so a smaller population would
+  give different agent keys.
+- **`--ramp-start`** identities are on before the first `ramp` signal: the
+  profile's population unless given. A lower k changes nothing.
+- **A step adds load the way growth does:** each new identity connects and
+  runs its join backfill, then acts at the band's rates. Its duty cycle
+  starts when it joins, so steps are staggered.
+- **A step is not a band.** The band's clock (and its duty cycles) runs on;
+  at each step every identity rechecks for lost events since the step
+  before, which costs nothing when none is missing.
+- **A sizing ramp, as planned:** the team profile on a fresh stack
+  seeded with the team's 90 days (`--seed-days 90`), from its 30 identities,
+  15 more (5 teams) every 300 s, at steady-band rates with no storm, up to
+  660. A box's ramp ends at its first broken step, when it reaches 660, at
+  the run's time limit, or on a void. The result records the last step that
+  held (the ceiling) and the first that broke, with what broke it and when.
+- **The world stays the profile's:** its channels and repos, and every
+  identity joins every channel. So every message fans out to the whole
+  population, and fan-out grows with the square of the population; channel
+  member lists are full size from the first step. **The ceiling is
+  therefore a lower bound for an organisation whose people don't all share
+  every channel.** The report must say so.
+- **The generator's own limits:** on Linux, `tenant_sim` refuses a ramp its
+  open-file limit can't hold (4 per identity, plus 256), so a joiner never
+  fails on the generator's side and looks like the relay refusing it. An
+  identity that can't join counts as `join_failed` in the live counters.
+
+`live.json` carries what the ramp needs: `joined` (identities connected so
+far), `lost` (events found lost after a recheck), and `ack_ms_le`, the
+accepted sends of the sampled bands by ack time, cumulative like a
+Prometheus histogram, with 500 ms as one of its bounds (10, 25, 50, 100,
+250, 500, 1000, 2500, 5000, 10000 ms and `+Inf`).
+
 ## The volume seed in a run
 
 An empty database flatters memory and backfill, so a run can seed history

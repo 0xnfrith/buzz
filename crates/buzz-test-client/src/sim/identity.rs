@@ -184,6 +184,39 @@ fn reaction_target(seen: &VecDeque<(String, String)>) -> Option<(String, String)
 /// the channel is closed and tokio's `has_changed` returns an error even when
 /// an unseen value is waiting; the last value sent (normally `Stop`) still
 /// stands and must be acted on, or the identity never stops.
+/// A ramp identity's place: it connects once the ramp has switched on more
+/// identities than its index; every identity in a ramp rechecks for lost
+/// events at each step, without restarting its band.
+pub struct RampSlot {
+    pub on: watch::Receiver<usize>,
+    pub index: usize,
+}
+
+/// Waits until the ramp has switched this identity on: true, or false if
+/// the run stopped first.
+async fn wait_switched_on(slot: &mut RampSlot, band: &mut watch::Receiver<Band>) -> bool {
+    loop {
+        if *slot.on.borrow_and_update() > slot.index {
+            return true;
+        }
+        if *band.borrow() == Band::Stop {
+            return false;
+        }
+        tokio::select! {
+            r = slot.on.changed() => {
+                if r.is_err() {
+                    return *slot.on.borrow() > slot.index;
+                }
+            }
+            r = band.changed() => {
+                if r.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 pub fn next_band(rx: &mut watch::Receiver<Band>, current: Band) -> Option<Band> {
     match rx.has_changed() {
         Ok(true) => Some(*rx.borrow_and_update()),
@@ -777,7 +810,13 @@ pub async fn run_identity(
     git_repo: Option<GitRepo>,
     rng_salt: u32,
     ready: mpsc::Sender<Result<(), String>>,
+    mut ramp: Option<RampSlot>,
 ) -> Result<()> {
+    if let Some(slot) = ramp.as_mut() {
+        if !wait_switched_on(slot, &mut band_rx).await {
+            return Ok(());
+        }
+    }
     let auth_tag = match (role, oa_owner.as_ref()) {
         (Role::Agent, Some(owner)) => Some(nip_oa_json(owner, &keys)?),
         _ => None,
@@ -850,11 +889,25 @@ pub async fn run_identity(
     let mut band = *band_rx.borrow();
     let mut band_started = Instant::now();
     let mut band_unix = unix_now();
+    let mut step_unix = band_unix;
     let mut next_action = Instant::now();
     let mut stormed = false;
     let mut blink_closes: Vec<u64> = Vec::new();
 
     loop {
+        // A ramp step: look for lost events since the step before (a
+        // little earlier, for a gap seen late), without restarting the
+        // band, whose duty cycles count from its start.
+        if let Some(slot) = ramp.as_mut() {
+            if slot.on.has_changed().unwrap_or(false) {
+                slot.on.borrow_and_update();
+                if band.sampled() {
+                    sess.gap_recheck(&mut client, step_unix.saturating_sub(30))
+                        .await;
+                }
+                step_unix = unix_now();
+            }
+        }
         if let Some(new_band) = next_band(&mut band_rx, band) {
             if band.sampled() {
                 sess.gap_recheck(&mut client, band_unix).await;
@@ -862,6 +915,7 @@ pub async fn run_identity(
             band = new_band;
             band_started = Instant::now();
             band_unix = unix_now();
+            step_unix = band_unix;
             if band.sampled() {
                 sess.stats.band_start(band.as_str(), band_unix);
             }

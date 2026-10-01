@@ -32,6 +32,11 @@ pub fn percentiles(mut xs: Vec<f64>) -> Percentiles {
     }
 }
 
+/// The ack-time histogram's upper bounds, in ms. The service level is "95%
+/// of events acknowledged within 500 ms", so 500 is a bound: the share
+/// within it is exact, not interpolated.
+pub const ACK_MS_BOUNDS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BandClient {
     pub start_unix: u64,
@@ -137,6 +142,12 @@ struct Inner {
     git_failed: u64,
     git_failed_by: BTreeMap<GitFailure, u64>,
     git_push_ms: Vec<f64>,
+    /// Accepted sends by ack time, one count per bound in ACK_MS_BOUNDS
+    /// and one past the last; cumulative in live.json.
+    ack_ms_buckets: [u64; ACK_MS_BOUNDS.len() + 1],
+    /// Identities connected and subscribed: the population, then each ramp
+    /// joiner.
+    joined: u64,
     reads: u64,
     read_ms: Vec<f64>,
     reads_by_what: BTreeMap<String, u64>,
@@ -218,6 +229,14 @@ pub struct Live {
     pub read_refused: u64,
     pub read_unanswered: u64,
     pub read_rate_limited: u64,
+    /// Accepted sends (in sampled bands) acknowledged within each bound,
+    /// in ms, cumulative like a Prometheus histogram: `"500": n` is every
+    /// ack within 500 ms; `"+Inf"` is every ack.
+    pub ack_ms_le: BTreeMap<String, u64>,
+    /// Events found lost after a recheck, at a band's end or a ramp step.
+    pub lost: u64,
+    /// Identities connected and subscribed so far.
+    pub joined: u64,
     /// On the last write only: why the run ended (`stop`, `lease` or
     /// `eof`). A file that has it is final, never stale.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -296,6 +315,11 @@ impl Stats {
             if accepted {
                 b.accepted += 1;
                 b.ok_ms.push(ok_ms);
+                let i = ACK_MS_BOUNDS
+                    .iter()
+                    .position(|&le| ok_ms <= le as f64)
+                    .unwrap_or(ACK_MS_BOUNDS.len());
+                s.ack_ms_buckets[i] += 1;
             } else {
                 b.rejected += 1;
                 *s.rejects_by_message.entry(message.to_string()).or_default() += 1;
@@ -304,6 +328,11 @@ impl Stats {
     }
 
     /// A send the relay's per-key rate limiter turned away.
+    /// An identity connected and subscribed.
+    pub fn record_joined(&self) {
+        self.with(|s| s.joined += 1);
+    }
+
     pub fn record_rate_limited(&self, band: &str, kind: u16) {
         self.with(|s| {
             *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
@@ -447,6 +476,20 @@ impl Stats {
                 read_refused: count(&s.read_failed_by, ReadFailure::Refused),
                 read_unanswered: count(&s.read_failed_by, ReadFailure::Unanswered),
                 read_rate_limited: s.reads_rate_limited,
+                ack_ms_le: {
+                    let mut out = BTreeMap::new();
+                    let mut total = 0;
+                    for (i, n) in s.ack_ms_buckets.iter().enumerate() {
+                        total += n;
+                        let key = ACK_MS_BOUNDS
+                            .get(i)
+                            .map_or_else(|| "+Inf".to_string(), |b| b.to_string());
+                        out.insert(key, total);
+                    }
+                    out
+                },
+                lost: s.lost_after_backfill,
+                joined: s.joined,
                 ended: None,
             }
         })
@@ -538,6 +581,30 @@ impl Stats {
 
 #[cfg(test)]
 mod tests {
+    /// The ack histogram is cumulative, and 500 ms is one of its bounds.
+    #[test]
+    fn the_ack_histogram() {
+        let s = super::Stats::new();
+        for ms in [3.0, 500.0, 500.5, 20_000.0] {
+            s.record_send("steady", 9, true, "", ms);
+        }
+        s.record_send("steady", 9, false, "blocked", 1.0);
+        let le = s.live(1).ack_ms_le;
+        let at = |k: &str| le[k];
+        assert_eq!(
+            (
+                at("10"),
+                at("250"),
+                at("500"),
+                at("1000"),
+                at("10000"),
+                at("+Inf")
+            ),
+            (1, 1, 2, 3, 3, 4)
+        );
+        assert_eq!(le.len(), super::ACK_MS_BOUNDS.len() + 1);
+    }
+
     use super::*;
 
     #[test]
