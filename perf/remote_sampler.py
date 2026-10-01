@@ -352,6 +352,12 @@ class Monitor:
     # to that relay; ("live", None) from a live file bound to none, which
     # counts for every relay.
     breaks: dict[tuple[str, str | None], float] = field(default_factory=dict)
+    # Each break signal's first: its time, what it was, and the band it
+    # came in (for the ack test, the band judged), so a driver can tell
+    # which ramp step broke.
+    break_info: dict[tuple[str, str | None], dict[str, Any]] = field(default_factory=dict)
+    # The band the loop is in now.
+    band: str = "none"
     notes: list[dict[str, Any]] = field(default_factory=list)
     _win: tuple[float, dict[str, int]] | None = None
     _over: list[float] = field(default_factory=list)
@@ -362,12 +368,15 @@ class Monitor:
     _lives: dict[str | None, dict[str, Any]] = field(default_factory=dict)
     _noted: set[str] = field(default_factory=set)
 
-    def relay_break(self, t: float, why: str, role: str | None = None, source: str = "live") -> None:
+    def relay_break(self, t: float, why: str, role: str | None = None, source: str = "live",
+                    band: str | None = None) -> None:
         """A break signal for relay `role` (None: a live file bound to no
-        relay, so every relay). Each source's first is noted."""
+        relay, so every relay), in `band` (the loop's band now if not
+        given). Each source's first is noted."""
         key = (source, role)
         if key not in self.breaks:
             self.breaks[key] = t
+            self.break_info[key] = {"t_unix": t, "why": why, "band": band or self.band}
             self.notes.append({"t_unix": t, "relay_break": why, **({"relay": role} if role else {})})
         if self.relay_break_t is None:
             self.relay_break_t = t
@@ -390,10 +399,15 @@ class Monitor:
             return None if any(x is None for x in ts) else max(ts)  # type: ignore[type-var]
         return self.relay_broke(waits)
 
-    def broken(self) -> dict[str, float]:
-        """Each relay that has broken, and when: what a band driver reads."""
-        out = {r: self.relay_broke(r) for r in self.relays}
-        return {r: t for r, t in out.items() if t is not None}
+    def broken(self) -> dict[str, dict[str, Any]]:
+        """Each relay that has broken: when, what, and in which band, from
+        its first break signal. What a band driver reads."""
+        out: dict[str, dict[str, Any]] = {}
+        for r in self.relays:
+            infos = [self.break_info[k] for k in (("box", r), ("live", r), ("live", None)) if k in self.break_info]
+            if infos:
+                out[r] = min(infos, key=lambda i: i["t_unix"])
+        return out
 
     def judge(self, limits: list[Limit]) -> Void | None:
         """Decides a tick's limits, in the order they were read: the first
@@ -618,7 +632,7 @@ class Monitor:
             out[f"share_within_{SLO_ACK_MS}ms_pct"] = round(100.0 * within / acks, 3)
         if acks >= SLO_MIN_ACKS and within * 100.0 < SLO_ACK_SHARE * acks:
             self.relay_break(t, f"{band}: {within} of {acks} acks within {SLO_ACK_MS} ms "
-                                f"({100.0 * within / acks:.1f}%), under {SLO_ACK_SHARE:g}%", role)
+                                f"({100.0 * within / acks:.1f}%), under {SLO_ACK_SHARE:g}%", role, band=band)
         elif acks < SLO_MIN_ACKS:
             out["ack_test"] = f"not judged: {acks} acks, fewer than {SLO_MIN_ACKS}"
         return out
@@ -953,7 +967,7 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
                     band_end(t)
                     write_breaks()
                     flush()
-                    band = now_band
+                    band = mon.band = now_band
                     stats = {r: BandStats(band, r) for r in roles}
                     band_t0, win0 = t, {}
             tiers = ["fast"] + (["slow"] if t >= next_slow else [])

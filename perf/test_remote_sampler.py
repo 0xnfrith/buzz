@@ -723,7 +723,7 @@ class Voids(unittest.TestCase):
         self.assertEqual(m.notes, [])
         m.band_end("relay1", "ramp-007", l0, live_counters(400, ack_ms_le=acks(10 + 94, 2 + 6)), 400)
         self.assertEqual(m.notes, [{"t_unix": 400, "relay_break": "ramp-007: 94 of 100 acks within 500 ms (94.0%), under 95%", "relay": "relay1"}])
-        self.assertEqual(m.broken(), {"relay1": 400})
+        self.assertEqual(m.broken(), {"relay1": {"t_unix": 400, "why": "ramp-007: 94 of 100 acks within 500 ms (94.0%), under 95%", "band": "ramp-007"}})
         few = rs.Monitor(expected={}).band_end(None, "floor", l0, live_counters(400, ack_ms_le=acks(10, 2 + 19)), 400)
         self.assertEqual(few["ack_test"], "not judged: 19 acks, fewer than 20")
 
@@ -735,7 +735,7 @@ class Voids(unittest.TestCase):
         for role in ("relay1", "relay2"):
             self.assertIsNone(m.live_tick(role, 1, live_counters(1), None))
         self.assertIsNone(m.live_tick("relay1", 2, live_counters(2, rejected=4), None))
-        self.assertEqual(m.broken(), {"relay1": 2})
+        self.assertEqual(m.broken(), {"relay1": {"t_unix": 2, "why": "the relay rejected 4 events", "band": "none"}})
         self.assertIsNone(m.live_tick("relay1", 3, live_counters(3, rejected=4, send_failed=1), None))
         self.assertEqual(m.notes[-1], {"t_unix": 3, "after_relay_break": "the generator for relay1 reported its own errors: send_failed +1", "relay_break_t": 2})
         v = m.live_tick("relay2", 3, live_counters(3, send_failed=1), None)
@@ -1185,7 +1185,9 @@ class Loop(unittest.TestCase):
             # The floor's slow acks broke a already, at the floor's end: one
             # break per source, so steady's is in its client line only.
             self.assertEqual(notes, [{"t_unix": 1100.0, "relay_break": "floor: 57 of 76 acks within 500 ms (75.0%), under 95%", "relay": "a"}])
-            self.assertEqual(json.loads((Path(d) / "samples" / "breaks.json").read_text()), {"relays": {"a": 1100.0}, "first_t_unix": 1100.0})
+            self.assertEqual(json.loads((Path(d) / "samples" / "breaks.json").read_text()),
+                             {"relays": {"a": {"t_unix": 1100.0, "why": "floor: 57 of 76 acks within 500 ms (75.0%), under 95%", "band": "floor"}},
+                              "first_t_unix": 1100.0})
 
     def test_a_ramp_steps_window_starts_once_it_settles(self) -> None:
         """A step's joiners connect and backfill in its first 60 s; slow acks
@@ -1204,6 +1206,10 @@ class Loop(unittest.TestCase):
                 step_a = [c for c in clients if c["band"] == "ramp-001" and c["role"] == "a"][0]["client"]
                 self.assertEqual(step_a["from_t_unix"], 1160, "the window starts 60 s into the step")
                 self.assertEqual(bool([n for n in notes if n.get("relay") == "a"]), broke, notes)
+                # The break names the step it was judged on, not the band
+                # the loop had moved to: what a driver attributes it by.
+                br = json.loads((Path(d) / "samples" / "breaks.json").read_text())["relays"]
+                self.assertEqual(br.get("a", {}).get("band"), "ramp-001" if broke else None, br)
 
     def test_breaks_json_comes_as_the_break_does(self) -> None:
         """A relay that rejects events broke there and then: breaks.json has
@@ -1214,7 +1220,8 @@ class Loop(unittest.TestCase):
             code, _, _, seen = self.run_lives(Path(d), write, {0: "steady"}, 100.0)
             self.assertEqual(code, 0, self.stderr)
             first = next(i for i, b in enumerate(seen) if b.get("relays"))
-            self.assertEqual(seen[first], {"relays": {"b": 1050.0}, "first_t_unix": 1050.0})
+            self.assertEqual(seen[first], {"relays": {"b": {"t_unix": 1050.0, "why": "the relay rejected 5 events", "band": "steady"}},
+                                           "first_t_unix": 1050.0})
             self.assertEqual(first, 10, "at the tick the break was read")
 
     def test_bands_and_the_end_of_a_run(self) -> None:
