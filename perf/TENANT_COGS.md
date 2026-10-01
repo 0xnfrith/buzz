@@ -764,6 +764,51 @@ report's `rate_limited` and `shed`.
 | Agent read: the relay full or unable to admit | `read_refused` | a relay break |
 | Agent read: any other `rate-limited:` text | `limit_unknown` | a void |
 
+## The humans' home-feed poll
+
+Each human runs Buzz Desktop, whose home feed polls the relay in the
+background (`desktop/src/features/home/hooks.ts:10-23`). `tenant_sim` sends
+that poll for each human, from the moment it joins.
+
+**One poll is the desktop's `get_feed`** (`desktop/src-tauri/src/commands/messages.rs`):
+up to four `POST /query` calls with NIP-98, one after another, with the
+desktop's exact filters (`sim/feed.rs` cites each line):
+
+| Query | Filter | Sent |
+|---|---|---|
+| mentions | `{"kinds": [9, 40002, 1, 45001, 45003, 1618, 1619, 1621, 1630, 1631, 1632, 1633], "#p": [me], "limit": 50}`, no `since` | always |
+| approvals | `{"kinds": [46010, 46011, 46012], "#p": [me], "limit": 20}` | always |
+| edits | `{"kinds": [40003], "#e": [<the mentions' ids>]}` | only if mentions came back |
+| profiles | `{"kinds": [0], "authors": [<the mentions' authors, each once>]}` | only if mentions came back |
+
+**When:** at connect; every 30 s while connected (`refetchInterval`), a
+tick that comes while a poll is in flight skipped, never queued; and on a
+reconnect (the peak storm, a drop, a blink), at once, at most once every
+15 s (`desktop/src/shared/api/useRelayAutoHeal.ts:16`), the 30 s ticks
+starting again from it. None while disconnected. Polls go on in every band,
+the pause included, as an open desktop does, until the run stops.
+
+**Counting:** a query the relay refused, or didn't answer within 30 s, is
+the relay's break, through the read counters (`read_refused`,
+`read_unanswered`); the quota is apart (`read_rate_limited`). A failed query
+doesn't end the poll: the desktop turns it into an empty answer and goes on.
+A slow poll that is answered is not a break: there is no latency target.
+**The 30 s is stricter than the desktop,** whose HTTP client has no timeout
+(`desktop/src-tauri/src/app_state.rs:198-202`) and which shows a failed poll
+as an empty feed.
+
+**Recorded:** `polls` and `poll_ms_le` (whole polls, cumulative, in ms) in
+`live.json`; each band's `polls` and `poll_ms` (p50, p95, p99, max) in
+`summary.json`; and in `bands.jsonl`'s client line, each window's `polls`
+and `poll_ms_p50_le`, `poll_ms_p95_le` and `poll_ms_max_le`: the smallest of
+the histogram's bounds that holds half, 95% and all of them.
+
+**Not modelled: the unread observer.** The desktop also polls the channels
+of its *inactive* communities (`desktop/src/features/communities/useCommunityUnread.ts`,
+`communityUnreadObserver.ts:264-270`). The population is one community per
+relay, so a human here has no inactive community and the observer sends
+nothing. A person in several communities on one box would add it.
+
 ## Agent per-turn reads
 
 Reads are the database's main cost, so agents read as well as write. On
@@ -924,7 +969,7 @@ proof checks nothing is left by label.
 
 | Row | What it forces | What must happen |
 |---|---|---|
-| `reads` | nothing: two generators through every band | exit 0; both sent every band in order, paused after each measured one; the rules every minute and at each boundary; fleet read back no raised limit; **every agent read answered, none refused or dropped** |
+| `reads` | nothing: two generators through every band | exit 0; both sent every band in order, paused after each measured one; the rules every minute and at each boundary; fleet read back no raised limit; **every agent read and every human's home-feed poll answered, none refused or dropped; the humans polled** |
 | `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and the ack test breaks it on a step after at least one held; a holds to the max |
 | `ramp-freeze` | relay b frozen (`docker pause`) at the second step | exit 0; b broke at step 2 because its sends went unanswered (`send_unanswered`, none `send_failed`): a break, never a void; a holds to the max |
 | `ramp-starved` | relay b cut to 0.01 CPU (`docker update --cpus`) at the second step | exit 0; b broke at step 2 because it shed sends (`relay_shed`, none `limit_unknown`): a break, never counted apart; a holds to the max; the texts b got, counted |

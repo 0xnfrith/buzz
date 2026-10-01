@@ -84,7 +84,7 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 LIVE_TOTALS = ("sent", "accepted", "rejected", "rate_limited", "media_client_failed", "media_refused",
                "media_unanswered", "git_local_failed", "git_push_failed",
                "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-               "relay_shed", "lost", "joined")
+               "relay_shed", "polls", "lost", "joined")
 # Two maps the loop reads besides: `rate-limited:` texts the pinned relay
 # doesn't send, by text, and identities whose task ended on its own, by
 # name. Either one voids the run.
@@ -92,6 +92,10 @@ LIVE_MAPS = ("limit_unknown", "identities_ended")
 # tenant_sim's ack-time histogram: accepted sends within each bound, in ms,
 # cumulative. 500 ms is a bound, so the service level's share is exact.
 ACK_BOUNDS = ("10", "25", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf")
+# The humans' home-feed polls' time histogram, whole polls, in ms,
+# cumulative. A band's poll times in bands.jsonl are its bounds: the
+# smallest bound that holds half, 95% or all of the band's polls.
+POLL_BOUNDS = ("50", "100", "250", "500", "1000", "2500", "5000", "10000", "30000", "120000", "+Inf")
 # The service level: 95% of events acknowledged within
 # 500 ms, judged on a measured band or ramp step with at least 20 acks.
 SLO_ACK_MS, SLO_ACK_SHARE, SLO_MIN_ACKS = "500", 95.0, 20
@@ -661,12 +665,25 @@ class Monitor:
                                "joined": live1["joined"], "from_t_unix": live0["t_unix"], "to_t_unix": live1["t_unix"]}
         if acks:
             out[f"share_within_{SLO_ACK_MS}ms_pct"] = round(100.0 * within / acks, 3)
+        out.update(poll_band(live0["poll_ms_le"], live1["poll_ms_le"]))
         if acks >= SLO_MIN_ACKS and within * 100.0 < SLO_ACK_SHARE * acks:
             self.relay_break(t, f"{band}: {within} of {acks} acks within {SLO_ACK_MS} ms "
                                 f"({100.0 * within / acks:.1f}%), under {SLO_ACK_SHARE:g}%", role, band=band)
         elif acks < SLO_MIN_ACKS:
             out["ack_test"] = f"not judged: {acks} acks, fewer than {SLO_MIN_ACKS}"
         return out
+
+
+def poll_band(le0: dict[str, int], le1: dict[str, int]) -> dict[str, Any]:
+    """A window's home-feed polls from two reads of the cumulative
+    histogram: how many, and the smallest bound holding half, 95% and all of
+    them (in ms; "+Inf" past the last)."""
+    d = {b: le1[b] - le0[b] for b in POLL_BOUNDS}
+    n = d["+Inf"]
+    out: dict[str, Any] = {"polls": n}
+    for name, share in (("p50", 0.5), ("p95", 0.95), ("max", 1.0)):
+        out[f"poll_ms_{name}_le"] = next((b for b in POLL_BOUNDS if n and d[b] >= share * n), None)
+    return out
 
 
 def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -701,11 +718,16 @@ def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
     le = v.get("ack_ms_le")
     if not isinstance(le, dict) or sorted(le) != sorted(ACK_BOUNDS):
         return None, f"{path}: ack_ms_le is not the histogram with bounds {', '.join(ACK_BOUNDS)}"
-    counts = list(v["client_errors"].values()) + [v[k] for k in LIVE_TOTALS] + list(le.values())
+    ple = v.get("poll_ms_le")
+    if not isinstance(ple, dict) or sorted(ple) != sorted(POLL_BOUNDS):
+        return None, f"{path}: poll_ms_le is not the histogram with bounds {', '.join(POLL_BOUNDS)}"
+    counts = list(v["client_errors"].values()) + [v[k] for k in LIVE_TOTALS] + list(le.values()) + list(ple.values())
     if not all(type(c) is int and c >= 0 for c in counts):
         return None, f"{path} has a counter that is not a whole number"
     if any(le[a] > le[b] for a, b in zip(ACK_BOUNDS, ACK_BOUNDS[1:])):
         return None, f"{path}: ack_ms_le is not cumulative"
+    if any(ple[a] > ple[b] for a, b in zip(POLL_BOUNDS, POLL_BOUNDS[1:])) or ple["+Inf"] != v["polls"]:
+        return None, f"{path}: poll_ms_le is not cumulative to polls"
     return v, None
 
 

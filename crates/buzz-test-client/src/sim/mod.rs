@@ -2,6 +2,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod admission;
+pub mod feed;
 pub mod git;
 pub mod guard;
 pub mod identity;

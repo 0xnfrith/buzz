@@ -24,15 +24,29 @@
  "media_client_failed": 0,
  "media_refused": 0,
  "media_unanswered": 0,
+ "poll_ms_le": {
+  "+Inf": 3,
+  "100": 3,
+  "1000": 3,
+  "10000": 3,
+  "120000": 3,
+  "250": 3,
+  "2500": 3,
+  "30000": 3,
+  "50": 3,
+  "500": 3,
+  "5000": 3
+ },
+ "polls": 3,
  "rate_limited": 0,
  "read_client_failed": 0,
  "read_rate_limited": 0,
  "read_refused": 0,
- "read_unanswered": 6,
+ "read_unanswered": 12,
  "received": 0,
  "rejected": 0,
  "relay_shed": 0,
  "send_unanswered": 0,
  "sent": 21,
- "t_unix": 1790896207
+ "t_unix": 1790898924
 }

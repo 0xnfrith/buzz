@@ -1596,6 +1596,10 @@ def client_from_summary(summary: dict[str, Any], band: str) -> dict[str, Any] | 
         # Agent per-turn reads the relay answered in this band, and their time.
         "reads": b.get("reads", 0),
         "read_ms": b.get("read_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
+        # Humans' home-feed polls begun in the band, and their whole times.
+        # A poll's failed queries are in the read failures.
+        "polls": b.get("polls", 0),
+        "poll_ms": b.get("poll_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
     }
     # Left out when tenant_sim did not report it, so the floor gate fails closed.
     if "sent_by_kind" in b:

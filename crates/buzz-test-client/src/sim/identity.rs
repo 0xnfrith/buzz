@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use super::admission::{self, Publish};
+use super::feed;
 use super::git::{self, GitRepo};
 use super::guard::{self, Target};
 use super::kinds;
@@ -242,6 +243,15 @@ pub fn next_band(rx: &mut watch::Receiver<Band>, current: Band) -> Option<Band> 
     }
 }
 
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -409,6 +419,9 @@ struct Session {
     p_last_seen: Option<u64>,
     git_repo: Option<GitRepo>,
     http: guard::HttpClient,
+    /// A human's home-feed poller's view of the connection
+    /// ([`feed::Link`]); None for an agent, which doesn't poll.
+    feed_link: Option<Arc<feed::Link>>,
 }
 
 impl Session {
@@ -836,6 +849,9 @@ impl Session {
         since: Option<u64>,
     ) -> Result<Option<BuzzTestClient>> {
         info!("{} reconnect ({reason})", self.rec.name);
+        if let Some(link) = &self.feed_link {
+            link.down();
+        }
         let mut delay = Duration::from_millis(250);
         let cap = Duration::from_secs(5);
         // Every attempt, its backoff and the subscribe after it end when the
@@ -879,6 +895,9 @@ impl Session {
                             start.elapsed().as_secs_f64() * 1e3,
                             n,
                         );
+                    }
+                    if let Some(link) = &self.feed_link {
+                        link.healed();
                     }
                     return Ok(Some(client));
                 }
@@ -1015,6 +1034,8 @@ async fn identity_task(
         last_seen_created_at: unix_now(),
         p_since: unix_now(),
         p_last_seen: None,
+        // Humans run Buzz Desktop, whose home feed polls; agents don't.
+        feed_link: (role == Role::Human).then(feed::Link::new),
         git_repo,
         http: guard::http_client(Duration::from_secs(30))?,
     };
@@ -1067,6 +1088,30 @@ async fn identity_task(
         return Ok(());
     }
     joined.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A human's home feed polls from here on, beside this task, until the
+    // run stops; it ends with this task.
+    let _poller = sess.feed_link.clone().map(|link| {
+        link.up();
+        let to = feed::PollTarget {
+            http: sess.http.clone(),
+            url: sess.world.http_url.clone(),
+            keys: sess.keys.clone(),
+        };
+        let stats = sess.stats.clone();
+        AbortOnDrop(tokio::spawn(feed::schedule(
+            link,
+            band_rx.clone(),
+            sess.stats.clone(),
+            feed::POLL_EVERY,
+            feed::HEAL_MIN,
+            move || {
+                let (to, stats) = (to.clone(), stats.clone());
+                async move {
+                    feed::poll(&to, &stats).await;
+                }
+            },
+        )))
+    });
 
     let mut band = *band_rx.borrow();
     let mut band_started = Instant::now();
@@ -1289,6 +1334,7 @@ mod tests {
             last_seen_created_at: unix_now(),
             p_since: unix_now(),
             p_last_seen: None,
+            feed_link: None,
             git_repo: None,
             http: guard::http_client(Duration::from_secs(5)).expect("http client"),
         }
@@ -1452,7 +1498,8 @@ mod tests {
     /// A reconnect resubscribes `#p` as the desktop's replay does: from the
     /// subscription's own start, or the newest event seen on it less 5 s,
     /// whichever is later. An event on a channel subscription doesn't move
-    /// it, nor does one older than the start.
+    /// it, nor does one older than the start. Each reconnect tells a human's
+    /// home-feed poller, which polls on it.
     #[tokio::test]
     async fn a_reconnect_resubscribes_p_as_the_desktop_replays() {
         let (url, log) = admission::testrelay::req_logging_relay(vec![]).await;
@@ -1461,6 +1508,10 @@ mod tests {
         let name = sess.rec.name.clone();
         let pk = sess.rec.pubkey.clone();
         sess.p_since = 1_790_000_000;
+        // A human: its home-feed poller hears each reconnect.
+        let link = feed::Link::new();
+        link.up();
+        sess.feed_link = Some(link.clone());
         let on = |sid: &str, t: u64| RelayMessage::Event {
             subscription_id: sid.to_string(),
             event: Box::new(p_event(&pk, t)),
@@ -1482,6 +1533,13 @@ mod tests {
                 .expect("reconnect")
                 .expect("a client");
             let _ = client.disconnect().await;
+            assert!(
+                *link.connected.borrow(),
+                "row {i}: the poller wasn't told it's back"
+            );
+            tokio::time::timeout(Duration::from_millis(100), link.healed.notified())
+                .await
+                .unwrap_or_else(|_| panic!("row {i}: the poller wasn't told of the reconnect"));
             let reqs = p_reqs(&log, &name);
             assert_eq!(reqs.len(), i + 1, "row {i}");
             assert_eq!(

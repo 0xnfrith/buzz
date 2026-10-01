@@ -10,7 +10,7 @@ and the proof exits 1 if any failed.
 
 | Row | What it forces | What must happen |
 |---|---|---|
-| `reads` | nothing: two generators through every band of a short profile | exit 0; both driven in lockstep; agents' reads all answered, none refused (the hard row) |
+| `reads` | nothing: two generators through every band of a short profile | exit 0; both driven in lockstep; agents' reads and humans' home-feed polls all answered, none refused (the hard row) |
 | `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and the ack test breaks it after at least one step held; a held to the max |
 | `ramp-freeze` | relay b frozen (`docker pause`) at the ramp's second step | exit 0; b broke at step 2 because its sends went unanswered, a break and never a void; a held to the max |
 | `ramp-starved` | relay b cut to 0.01 CPU at the ramp's second step | exit 0; b broke at step 2 because it shed sends (`rate-limited: too many concurrent requests` or `shared admission unavailable`), a break and never counted apart; a held to the max; the texts b got, counted |
@@ -206,6 +206,13 @@ class Proof:
                             f"reads {reads.get('reads')}, failed {reads.get('failed')}")
             ok &= self.eq(row, f"HARD: {g}'s relay refused or dropped no read", fails,
                           {"read_refused": 0, "read_unanswered": 0, "read_client_failed": 0})
+            # The humans' home-feed polls go through the same read counters:
+            # those were none refused, none unanswered, and they ran.
+            ok &= self.check(row, f"HARD: {g}'s humans polled their home feed", (live.get("polls") or 0) > 0,
+                             f"polls {live.get('polls')}")
+            steady = ((read_json(out / g / "summary.json").get("bands") or {}).get("steady") or {})
+            print(f"  {g}: polls {live.get('polls')}, steady polls {steady.get('polls')} "
+                  f"taking {json.dumps(steady.get('poll_ms'))} ms")
             print(f"  {g}: read_rate_limited {live.get('read_rate_limited')} (counted apart), "
                   f"turns {(read_json(out / g / 'summary.json').get('sent_by_kind') or {}).get('44200')}")
             if not ok and item.get("bands_done") == BANDS:

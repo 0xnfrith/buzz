@@ -36,6 +36,9 @@ pub fn percentiles(mut xs: Vec<f64>) -> Percentiles {
 /// of events acknowledged within 500 ms", so 500 is a bound: the share
 /// within it is exact, not interpolated.
 pub const ACK_MS_BOUNDS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+/// The home-feed poll's time bounds, in ms, for live.json's `poll_ms_le`:
+/// a poll is up to four queries, each up to 30 s.
+pub const POLL_MS_BOUNDS: [u64; 10] = [50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 120000];
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BandClient {
@@ -67,6 +70,10 @@ pub struct BandClient {
     /// Agent per-turn reads that the relay answered, and how long each took.
     pub reads: u64,
     pub read_ms: Percentiles,
+    /// Humans' home-feed polls begun in this band, and how long each took,
+    /// whole (its two to four queries).
+    pub polls: u64,
+    pub poll_ms: Percentiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storm_backfill_ms: Option<Percentiles>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,6 +144,8 @@ struct BandAcc {
     fanout_ms: Vec<f64>,
     reads: u64,
     read_ms: Vec<f64>,
+    polls: u64,
+    poll_ms: Vec<f64>,
     storm_backfill_ms: Vec<f64>,
     storm_events_returned: u64,
 }
@@ -165,6 +174,10 @@ struct Inner {
     limit_unknown: BTreeMap<String, u64>,
     /// Identities whose task ended on its own, by name: why.
     identities_ended: BTreeMap<String, String>,
+    /// Home-feed polls, in any band, by time: one count per bound in
+    /// POLL_MS_BOUNDS and one past the last.
+    polls: u64,
+    poll_ms_buckets: [u64; POLL_MS_BOUNDS.len() + 1],
     /// Accepted sends by ack time, one count per bound in ACK_MS_BOUNDS
     /// and one past the last; cumulative in live.json.
     ack_ms_buckets: [u64; ACK_MS_BOUNDS.len() + 1],
@@ -267,6 +280,11 @@ pub struct Live {
     /// Identities whose task ended on its own, not on a stop or a lease,
     /// by name: why. Any voids the run: a lost identity under-loads it.
     pub identities_ended: BTreeMap<String, String>,
+    /// Humans' home-feed polls, in any band, and their times, cumulative
+    /// like `ack_ms_le`: `"1000": n` is every poll done within 1 s. A
+    /// poll's failed queries are in the read failures.
+    pub polls: u64,
+    pub poll_ms_le: BTreeMap<String, u64>,
     /// Accepted sends (in sampled bands) acknowledged within each bound,
     /// in ms, cumulative like a Prometheus histogram: `"500": n` is every
     /// ack within 500 ms; `"+Inf"` is every ack.
@@ -317,6 +335,20 @@ pub fn spawn_live_writer(
             }
         }
     })
+}
+
+/// A histogram's buckets as cumulative counts by bound, `"+Inf"` last.
+fn cumulative(buckets: &[u64], bounds: &[u64]) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    let mut total = 0;
+    for (i, n) in buckets.iter().enumerate() {
+        total += n;
+        let key = bounds
+            .get(i)
+            .map_or_else(|| "+Inf".to_string(), |b| b.to_string());
+        out.insert(key, total);
+    }
+    out
 }
 
 fn count<K: Ord>(m: &BTreeMap<K, u64>, k: K) -> u64 {
@@ -525,6 +557,24 @@ impl Stats {
         self.with(|s| s.reads_rate_limited += 1);
     }
 
+    /// A home-feed poll that took `ms`, whole, begun in `band` (a sampled
+    /// band's name; others count in the totals only).
+    pub fn record_poll(&self, band: Option<&str>, ms: f64) {
+        self.with(|s| {
+            s.polls += 1;
+            let i = POLL_MS_BOUNDS
+                .iter()
+                .position(|&le| ms <= le as f64)
+                .unwrap_or(POLL_MS_BOUNDS.len());
+            s.poll_ms_buckets[i] += 1;
+            if let Some(band) = band {
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.polls += 1;
+                b.poll_ms.push(ms);
+            }
+        });
+    }
+
     pub fn record_git(&self, bytes: u64, push_ms: f64) {
         self.with(|s| {
             s.git_pushes += 1;
@@ -592,6 +642,8 @@ impl Stats {
                 relay_shed: s.relay_shed,
                 limit_unknown: s.limit_unknown.clone(),
                 identities_ended: s.identities_ended.clone(),
+                polls: s.polls,
+                poll_ms_le: cumulative(&s.poll_ms_buckets, &POLL_MS_BOUNDS),
                 ack_ms_le: {
                     let mut out = BTreeMap::new();
                     let mut total = 0;
@@ -640,6 +692,8 @@ impl Stats {
                     fanout_ms: percentiles(acc.fanout_ms.clone()),
                     reads: acc.reads,
                     read_ms: percentiles(acc.read_ms.clone()),
+                    polls: acc.polls,
+                    poll_ms: percentiles(acc.poll_ms.clone()),
                     storm_backfill_ms: None,
                     storm_events_returned: None,
                 };
@@ -735,6 +789,8 @@ mod tests {
             "relay_shed",
             "limit_unknown",
             "identities_ended",
+            "polls",
+            "poll_ms_le",
             "ack_ms_le",
             "lost",
             "joined",

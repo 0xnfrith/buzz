@@ -164,6 +164,20 @@ pub async fn read(
     auth_tag: Option<&str>,
     r: &Read,
 ) -> std::result::Result<f64, ReadError> {
+    query(http, http_url, keys, auth_tag, r)
+        .await
+        .map(|(ms, _)| ms)
+}
+
+/// [`read`], keeping what the relay answered: its time in ms, and the
+/// JSON it sent back (a `/query` answers with an array of events).
+pub async fn query(
+    http: &HttpClient,
+    http_url: &Target,
+    keys: &Keys,
+    auth_tag: Option<&str>,
+    r: &Read,
+) -> std::result::Result<(f64, Value), ReadError> {
     let client = |err: anyhow::Error| ReadError::Failed {
         at: ReadFailure::Client,
         err,
@@ -217,13 +231,13 @@ pub async fn read(
             err: anyhow!("{} HTTP {status}: {text}", r.what),
         });
     }
-    if serde_json::from_str::<Value>(&text).is_err() {
-        return Err(ReadError::Failed {
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => Ok((ms, v)),
+        Err(_) => Err(ReadError::Failed {
             at: ReadFailure::Refused,
             err: anyhow!("{} answered 2xx with a body that isn't JSON", r.what),
-        });
+        }),
     }
-    Ok(ms)
 }
 
 #[cfg(test)]

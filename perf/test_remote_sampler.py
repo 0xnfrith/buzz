@@ -47,8 +47,18 @@ def relay_sample(t: float, h: str = H1, ws: int = 100, busy: int = 0, oom: int =
 
 TOTALS = ("sent", "accepted", "rate_limited", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed",
           "git_push_failed", "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-          "relay_shed", "lost", "joined")
+          "relay_shed", "polls", "lost", "joined")
 MAPS = ("limit_unknown", "identities_ended")
+
+
+def polls_le(fast: int = 0, slow: int = 0) -> dict:
+    """A poll histogram: `fast` polls within 250 ms, `slow` in 5 to 10 s."""
+    out = {b: 0 for b in rs.POLL_BOUNDS}
+    for b in ("250", "500", "1000", "2500", "5000"):
+        out[b] = fast
+    for b in ("10000", "30000", "120000", "+Inf"):
+        out[b] = fast + slow
+    return out
 
 
 def acks(within: int = 0, over: int = 0) -> dict:
@@ -65,9 +75,12 @@ def live_counters(t: int = 1, rejected: int = 0, ack_ms_le: dict | None = None, 
     named in TOTALS set those totals, and those in MAPS those maps; the
     rest are client error kinds."""
     maps = {k: counts.pop(k, {}) for k in MAPS}
+    poll_ms_le = counts.pop("poll_ms_le", None)
     totals = {k: counts.pop(k, 0) for k in TOTALS}
+    if poll_ms_le is None:
+        poll_ms_le = polls_le(fast=totals["polls"])
     return {"t_unix": t, "rejected": rejected, "received": 0, "ack_ms_le": ack_ms_le or acks(),
-            "client_errors": counts, **totals, **maps}
+            "poll_ms_le": poll_ms_le, "client_errors": counts, **totals, **maps}
 
 
 def gen_sample(t: float, busy: int, idle: int, avail: int = 900, oom: int = 0) -> dict:
@@ -767,7 +780,8 @@ class Voids(unittest.TestCase):
     LIVE_FIELDS = {"t_unix", "sent", "accepted", "rejected", "rate_limited", "received", "client_errors",
                    "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed",
                    "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-                   "relay_shed", "limit_unknown", "identities_ended", "ack_ms_le", "lost", "joined"}
+                   "relay_shed", "limit_unknown", "identities_ended", "polls", "poll_ms_le", "ack_ms_le", "lost",
+                   "joined"}
 
     def test_the_loop_reads_what_tenant_sim_writes(self) -> None:
         """A live.json from a real tenant_sim run (testdata/live), read with
@@ -817,9 +831,19 @@ class Voids(unittest.TestCase):
             # never 0; a kind missing from client_errors is 0. The totals
             # are this file's own list, not the code's.
             for k in (*TOTALS, "rejected", *MAPS):
+                if k == "polls":
+                    continue  # its histogram's +Inf must match it: below
                 with self.subTest(missing=k):
                     p.write_text(json.dumps({x: v for x, v in whole.items() if x != k}))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no {k}"))
+            p.write_text(json.dumps({x: v for x, v in whole.items() if x != "poll_ms_le"}))
+            self.assertEqual(rs.read_live(str(p)), (None, f"{p}: poll_ms_le is not the histogram with bounds {', '.join(rs.POLL_BOUNDS)}"))
+            p.write_text(json.dumps({x: v for x, v in whole.items() if x != "polls"}))
+            self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no polls"))
+            for name, bad in (("not cumulative", {**polls_le(fast=3), "100": 5}), ("not to polls", polls_le(fast=2))):
+                with self.subTest(poll_ms_le=name):
+                    p.write_text(json.dumps({**whole, "polls": 3, "poll_ms_le": bad}))
+                    self.assertEqual(rs.read_live(str(p)), (None, f"{p}: poll_ms_le is not cumulative to polls"))
             for k, bad, why in (("limit_unknown", {"rate-limited: x": "2"}, "limit_unknown is not a count per text"),
                                 ("limit_unknown", {"rate-limited: x": 0}, "limit_unknown is not a count per text"),
                                 ("identities_ended", {"h1": 3}, "identities_ended is not a reason per identity")):
@@ -1201,6 +1225,24 @@ class Loop(unittest.TestCase):
             self.assertEqual(json.loads((Path(d) / "samples" / "breaks.json").read_text()),
                              {"relays": {"a": {"t_unix": 1100.0, "why": "floor: 57 of 76 acks within 500 ms (75.0%), under 95%", "band": "floor"}},
                               "first_t_unix": 1100.0})
+
+    def test_a_bands_home_feed_polls_in_its_client_line(self) -> None:
+        """Each band's client line holds its humans' polls: how many, and the
+        smallest bounds holding half, 95% and all of them."""
+        def write(t: int, r: str) -> dict:
+            n = (t - 1000) // 5
+            # Steady (from 1100): 3 fast polls a tick, and b one slow one.
+            fast, slow = 3 * n, (max(0, n - 20) if r == "b" else 0)
+            return live_counters(t, polls=fast + slow, poll_ms_le=polls_le(fast, slow))
+        with tempfile.TemporaryDirectory() as d:
+            code, clients, _, _ = self.run_lives(Path(d), write, {0: "floor", 1100: "steady", 1200: "cooldown"}, 230.0)
+            self.assertEqual(code, 0, self.stderr)
+            steady = {c["role"]: c["client"] for c in clients if c["band"] == "steady"}
+            pick = lambda c: (c["polls"], c["poll_ms_p50_le"], c["poll_ms_p95_le"], c["poll_ms_max_le"])  # noqa: E731
+            self.assertEqual(pick(steady["a"]), (57, "250", "250", "250"))
+            self.assertEqual(pick(steady["b"]), (76, "250", "10000", "10000"))
+            floor = {c["role"]: c["client"] for c in clients if c["band"] == "floor"}
+            self.assertEqual(pick(floor["a"]), (57, "250", "250", "250"))
 
     def test_a_ramp_steps_window_starts_once_it_settles(self) -> None:
         """A step's joiners connect and backfill in its first 60 s; slow acks
