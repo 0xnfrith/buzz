@@ -2359,6 +2359,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    # The band clock is its own file, stdlib only, so a wrapper can pin it
+    # by its sha256; `clock` runs it with the rest of the arguments.
+    if argv[:1] == ["clock"]:
+        import band_clock
+
+        return band_clock.main(argv[1:])
     args = build_parser().parse_args(argv)
     commands = {
         "fingerprint": cmd_fingerprint,
