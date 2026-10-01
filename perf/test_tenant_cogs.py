@@ -452,6 +452,22 @@ class SchemaTests(unittest.TestCase):
         line["bands"]["steady"]["client"]["rate_limited"] = 5
         self.assertEqual(tenant_cogs.acceptance_errors(line, self.summary_ok(), 0), [])
 
+    def test_sends_unanswered_or_not_sent_fail_acceptance(self) -> None:
+        """A send the relay never answered, and one that failed before it
+        was written, each fail a local run: neither is a reject, so the
+        rejected gate alone would pass them."""
+        rows = [
+            ({"unanswered": 0, "failed": 0}, []),
+            ({"unanswered": 3, "failed": 0}, ["steady client unanswered=3"]),
+            ({"unanswered": 0, "failed": 2}, ["steady client failed=2"]),
+        ]
+        for counts, want in rows:
+            with self.subTest(counts=counts):
+                summary = {"bands": {"steady": {"sent": 10, "accepted": 10 - sum(counts.values()), "rejected": 0, **counts}}}
+                line = self.fixture()
+                line["bands"]["steady"]["client"] = tenant_cogs.client_from_summary(summary, "steady")
+                self.assertEqual(tenant_cogs.acceptance_errors(line, self.summary_ok(), 0), want)
+
     def test_a_run_seeds_its_days_and_reads_what_the_seed_did(self) -> None:
         """--seed-days goes to tenant_sim; the run waits for seed-start,
         seed-done, then setup-done, and keeps what the seed asked and got."""

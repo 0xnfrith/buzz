@@ -23,18 +23,50 @@ pub enum Publish {
     RateLimited { retry_in: Duration },
 }
 
+/// Why a send got no answer, by whose it is.
+#[derive(Debug)]
+pub enum SendError {
+    /// Nothing was written: the socket was already closed, or the write
+    /// failed. The generator's own failure.
+    NotSent(TestClientError),
+    /// Written, then no OK within the window, or the socket failed before
+    /// it: the relay not answering.
+    Unanswered(TestClientError),
+}
+
+impl SendError {
+    pub fn into_inner(self) -> TestClientError {
+        match self {
+            Self::NotSent(e) | Self::Unanswered(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSent(e) => write!(f, "not sent: {e}"),
+            Self::Unanswered(e) => write!(f, "no answer: {e}"),
+        }
+    }
+}
+
 /// Sends `event` and waits up to `ok_timeout` for its answer: its OK, or the
 /// relay's per-key rate-limit NOTICE (relay-v0.2.1 sends that NOTICE instead
 /// of an OK, so waiting for the OK alone times out). Every other message
 /// that arrives meanwhile (a subscription's events, other notices) is
-/// returned, in order, for the caller to handle; none is dropped.
+/// returned, in order, for the caller to handle; none is dropped. A failure
+/// says whether the event was written ([`SendError`]).
 pub async fn send_tracked(
     client: &mut BuzzTestClient,
     event: &Event,
     ok_timeout: Duration,
-) -> Result<(Publish, Vec<RelayMessage>), TestClientError> {
+) -> Result<(Publish, Vec<RelayMessage>), SendError> {
     let id = event.id.to_hex();
-    client.send_raw(&json!(["EVENT", event])).await?;
+    client
+        .send_raw(&json!(["EVENT", event]))
+        .await
+        .map_err(SendError::NotSent)?;
     let deadline = tokio::time::Instant::now() + ok_timeout;
     let mut others = Vec::new();
     loop {
@@ -42,9 +74,13 @@ pub async fn send_tracked(
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or(Duration::ZERO);
         if remaining.is_zero() {
-            return Err(TestClientError::Timeout);
+            return Err(SendError::Unanswered(TestClientError::Timeout));
         }
-        match client.recv_event(remaining).await? {
+        match client
+            .recv_event(remaining)
+            .await
+            .map_err(SendError::Unanswered)?
+        {
             RelayMessage::Ok(ok) if ok.event_id == id => return Ok((Publish::Ok(ok), others)),
             RelayMessage::Notice { message } if rate_limit_retry(&message).is_some() => {
                 let retry_in = rate_limit_retry(&message).unwrap_or(DEFAULT_RETRY);
@@ -80,7 +116,10 @@ pub async fn publish(
     event: &Event,
     ok_timeout: Duration,
 ) -> Result<Publish, TestClientError> {
-    Ok(send_tracked(client, event, ok_timeout).await?.0)
+    send_tracked(client, event, ok_timeout)
+        .await
+        .map(|(answer, _)| answer)
+        .map_err(SendError::into_inner)
 }
 
 /// A fake relay for the rows that need a socket.
@@ -96,6 +135,8 @@ pub(crate) mod testrelay {
         Close,
         /// The per-key rate limit's NOTICE, no OK.
         RateLimit,
+        /// Nothing at all: the event is never answered.
+        Silent,
     }
 
     /// A test relay; `kill` drops it: every open socket closes, and new
@@ -155,6 +196,7 @@ pub(crate) mod testrelay {
                                     serde_json::json!(["OK", v[1]["id"], false, m])
                                 }
                                 Answer::Close => return,
+                                Answer::Silent => continue,
                                 Answer::RateLimit => serde_json::json!([
                                     "NOTICE",
                                     "rate-limited: quota exceeded; retry in 60s"
@@ -286,7 +328,10 @@ mod tests {
             .await
             .map(|_| ())
             .expect_err("no answer");
-        assert!(matches!(err, TestClientError::Timeout), "{err:?}");
+        assert!(
+            matches!(err, SendError::Unanswered(TestClientError::Timeout)),
+            "{err:?}"
+        );
     }
 
     #[test]

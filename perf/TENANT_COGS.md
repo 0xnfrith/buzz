@@ -585,7 +585,8 @@ python3 perf/tenant_cogs.py remote-sample \
     or branch that failed (`git_local_failed`), or an agent's read that
     failed before it went out (`read_client_failed`). A missing or unreadable
     `--live-file` is a void too, never "no errors", and so is a file
-    without `rejected`, `rate_limited`, `media_client_failed`, `media_refused`,
+    without `rejected`, `rate_limited`, `send_unanswered`,
+    `media_client_failed`, `media_refused`,
     `media_unanswered`, `git_local_failed`, `git_push_failed`,
     `read_client_failed`, `read_refused`, `read_unanswered` or
     `read_rate_limited`: a total missing is never read as 0.
@@ -606,7 +607,9 @@ python3 perf/tenant_cogs.py remote-sample \
     - **memory:** the relay box's MemAvailable under 10% of MemTotal, on
       any fast sample;
     - **lost or rejected:** events found lost after a recheck (`lost`);
-      relay rejects (not rate limits); media uploads, git pushes or agent
+      relay rejects (not rate limits); sends the relay didn't answer
+      (`send_unanswered`: written, then no OK in 30 s or the socket failed
+      before it); media uploads, git pushes or agent
       reads the relay refused or didn't answer (`media_refused`,
       `media_unanswered`, `git_push_failed`, `read_refused`,
       `read_unanswered`; a timeout included);
@@ -617,7 +620,12 @@ python3 perf/tenant_cogs.py remote-sample \
 
     At its limit a relay usually fails by timing out, so a timeout is the
     relay's; a stalled generator still shows in its CPU, its memory and a
-    stale live file. Rate limits are counted apart: never a break. A
+    stale live file. **`send_unanswered` is trusted as the relay's only
+    because the generator box's CPU and memory void exists:** without that
+    void, a generator too busy to read its sockets would look like a relay
+    that stopped answering. A send that failed before anything was written
+    (encoding, a socket already closed) is `send_failed`, the generator's
+    own error. Rate limits are counted apart: never a break. A
     generator event after the break is a note, not a void, written once.
   - **Whose break.** A relay's break is its box's own signals, those in the
     live file bound to it, or those in a live file bound to no relay
@@ -646,7 +654,8 @@ python3 perf/tenant_cogs.py remote-sample \
   second signal while the summaries or `void.json` are written is ignored.
 
 `tenant_sim` rewrites `<out-dir>/live.json` every 2 s for this: totals of
-sent, accepted, rejected, rate-limited and received, its own errors by kind
+sent, accepted, rejected, rate-limited, unanswered (`send_unanswered`) and
+received, its own errors by kind
 (`send_failed`, `recv_error`, `reconnect_failed`, `backfill_failed`,
 `connection_dropped`), and media and git failures by where they failed,
 stamped `t_unix`. If a rewrite fails, `tenant_sim` logs it and carries on;
@@ -659,8 +668,18 @@ never calls it stale, so the loop may outlive `tenant_sim`. One that ended
 on a lease or an eof lost its driver, and the loop voids on it. A crash
 writes neither, goes stale, and voids as before.
 
+Each send ends in exactly one of accepted, rejected, rate-limited,
+`send_unanswered` or `send_failed`. Any other `NOTICE` doesn't end a send:
+it is handled like any other message, and the send keeps waiting for its
+`OK`.
+
 | Failure | live.json total | Counts as |
 |---|---|---|
+| Send: encoding, or a socket already closed, before anything is written | `send_failed` | the generator's error |
+| Send: written, then no OK within 30 s | `send_unanswered` | a relay break |
+| Send: written, then the socket fails before the OK | `send_unanswered` | a relay break |
+| Send: a rate-limit NOTICE | `rate_limited` | apart: neither |
+| Send: an `OK` that rejects | `rejected` | a relay break |
 | Media: encoding the image or signing the auth, before the request goes out | `media_client_failed` | the generator's error |
 | Media: an answer that isn't 2xx | `media_refused` | a relay break |
 | Media: a transport error or a timeout, no answer | `media_unanswered` | a relay break |

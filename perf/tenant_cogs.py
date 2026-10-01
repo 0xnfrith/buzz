@@ -1581,6 +1581,10 @@ def client_from_summary(summary: dict[str, Any], band: str) -> dict[str, Any] | 
         # Turned away by the relay's per-key rate limits: counted apart from
         # rejected, never an acceptance error.
         "rate_limited": b.get("rate_limited", 0),
+        # Written and never answered (the relay's), and not written at all
+        # (the generator's): each fails acceptance.
+        "unanswered": b.get("unanswered", 0),
+        "failed": b.get("failed", 0),
         "received": b.get("received", 0),
         "ok_ms": b.get("ok_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
         "fanout_ms": b.get("fanout_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
@@ -2222,6 +2226,10 @@ def acceptance_errors(
             errs.append(f"{name} relay events_rejected={rejected}")
         if client_rej:
             errs.append(f"{name} client rejected={client_rej}")
+        for k in ("unanswered", "failed"):
+            n = int((band.get("client") or {}).get(k) or 0)
+            if n:
+                errs.append(f"{name} client {k}={n}")
     lost = int(summary.get("lost_after_backfill") or line.get("totals", {}).get("lost_after_backfill") or 0)
     if lost:
         errs.append(f"lost_after_backfill={lost}")

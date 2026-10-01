@@ -383,6 +383,8 @@ struct Session {
     authors: VecDeque<String>,
     /// This agent's turns so far: one in four also counts a thread.
     turns: u64,
+    /// How long a send waits for its OK.
+    ok_timeout: Duration,
     expected: HashMap<String, u64>,
     missing: HashSet<String>,
     last_seen_created_at: u64,
@@ -456,7 +458,7 @@ impl Session {
     async fn send(&mut self, client: &mut BuzzTestClient, band: Band, event: nostr::Event) -> bool {
         let kind = event.kind.as_u16();
         let start = Instant::now();
-        let answer = match admission::send_tracked(client, &event, OK_TIMEOUT).await {
+        let answer = match admission::send_tracked(client, &event, self.ok_timeout).await {
             Ok((answer, others)) => {
                 // A subscription's events that came in while this send
                 // waited, handled as they would have been.
@@ -496,12 +498,17 @@ impl Session {
                 }
                 ok.accepted
             }
-            Err(e) => {
-                if band.sampled() {
-                    self.stats
-                        .record_send(band.as_str(), kind, false, &e.to_string(), 0.0);
-                }
-                self.stats.record_client_error("send_failed");
+            // One counter per send: written and never answered is the
+            // relay's; not written at all is the generator's.
+            Err(admission::SendError::Unanswered(e)) => {
+                self.stats
+                    .record_send_unanswered(band.sampled().then(|| band.as_str()), kind);
+                warn!("{} kind {kind} got no answer: {e}", self.rec.name);
+                false
+            }
+            Err(admission::SendError::NotSent(e)) => {
+                self.stats
+                    .record_send_failed(band.sampled().then(|| band.as_str()), kind);
                 warn!("{} kind {kind} send failed: {e}", self.rec.name);
                 false
             }
@@ -873,6 +880,7 @@ pub async fn run_identity(
         seen: VecDeque::new(),
         authors: VecDeque::new(),
         turns: 0,
+        ok_timeout: OK_TIMEOUT,
         expected: HashMap::new(),
         missing: HashSet::new(),
         last_seen_created_at: unix_now(),
@@ -1140,6 +1148,7 @@ mod tests {
             seen: VecDeque::new(),
             authors: VecDeque::new(),
             turns: 0,
+            ok_timeout: OK_TIMEOUT,
             expected: HashMap::new(),
             missing: HashSet::new(),
             last_seen_created_at: unix_now(),
@@ -1210,6 +1219,100 @@ mod tests {
         assert_eq!((live.sent, live.accepted), (1, 1), "the turn metric");
         assert_eq!((live.read_refused, live.read_client_failed), (3, 0));
         assert_eq!(refusing.accepts(), 3);
+    }
+
+    /// One counter per send, never two and never none: accepted, rejected,
+    /// written and never answered (no OK in time, or the socket failing
+    /// after the write), or not written at all (the socket already closed).
+    #[tokio::test]
+    async fn each_send_ends_in_exactly_one_counter() {
+        use crate::sim::admission::testrelay::{relay_with, Answer};
+        fn accept(_: u64) -> Answer {
+            Answer::Accept
+        }
+        fn reject(_: u64) -> Answer {
+            Answer::Reject("blocked: test")
+        }
+        fn silent(_: u64) -> Answer {
+            Answer::Silent
+        }
+        fn close(_: u64) -> Answer {
+            Answer::Close
+        }
+        type Row = (
+            &'static str,
+            fn(u64) -> Answer,
+            bool,
+            (u64, u64, u64, u64, u64),
+        );
+        let rows: [Row; 5] = [
+            ("accepted", accept, false, (1, 0, 0, 0, 0)),
+            ("rejected", reject, false, (0, 1, 0, 0, 0)),
+            ("no OK in time", silent, false, (0, 0, 0, 1, 0)),
+            (
+                "the socket fails after the write",
+                close,
+                false,
+                (0, 0, 0, 1, 0),
+            ),
+            ("the socket already closed", accept, true, (0, 0, 0, 0, 1)),
+        ];
+        for (name, answer, closed_first, want) in rows {
+            let relay = relay_with(answer).await;
+            let stats = Arc::new(Stats::new());
+            let mut sess = test_session(stats.clone());
+            sess.ok_timeout = Duration::from_millis(500);
+            let mut client = BuzzTestClient::connect_unauthenticated(&relay.url)
+                .await
+                .expect("connect");
+            if closed_first {
+                relay.kill();
+                // Read until the close is seen: the socket is then closed on
+                // this side too, and nothing more can be written.
+                let started = Instant::now();
+                loop {
+                    match client.recv_event(Duration::from_millis(200)).await {
+                        Ok(_) => continue,
+                        Err(TestClientError::Timeout) => {
+                            assert!(
+                                started.elapsed() < Duration::from_secs(5),
+                                "{name}: never closed"
+                            );
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            let ev = kinds::presence(&sess.keys, &sess.profile.kinds).expect("event");
+            sess.send(&mut client, Band::Steady, ev).await;
+            let live = stats.live(1);
+            let failed = live.client_errors.get("send_failed").copied().unwrap_or(0);
+            assert_eq!(
+                (
+                    live.accepted,
+                    live.rejected,
+                    live.rate_limited,
+                    live.send_unanswered,
+                    failed
+                ),
+                want,
+                "{name}"
+            );
+            assert_eq!(live.sent, 1, "{name}: the send counted once");
+            // The band's line in summary.json, by the names a local run's
+            // acceptance reads (tenant_cogs.py client_from_summary).
+            let summary = stats.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
+            let band = serde_json::to_value(&summary.bands["steady"]).expect("band json");
+            assert_eq!(
+                (
+                    band["sent"].as_u64(),
+                    band["unanswered"].as_u64(),
+                    band["failed"].as_u64()
+                ),
+                (Some(1), Some(want.3), Some(want.4)),
+                "{name}"
+            );
+        }
     }
 
     /// A send the relay's per-key rate limiter turns away during a band

@@ -46,7 +46,8 @@ def relay_sample(t: float, h: str = H1, ws: int = 100, busy: int = 0, oom: int =
 
 
 TOTALS = ("sent", "accepted", "rate_limited", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed",
-          "git_push_failed", "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "lost", "joined")
+          "git_push_failed", "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
+          "lost", "joined")
 
 
 def acks(within: int = 0, over: int = 0) -> dict:
@@ -658,6 +659,7 @@ class Voids(unittest.TestCase):
             ("git_push_failed", "2 git pushes to the relay failed"),
             ("read_refused", "the relay refused 2 agent reads"),
             ("read_unanswered", "the relay didn't answer 2 agent reads"),
+            ("send_unanswered", "the relay didn't answer 2 sends"),
         ]
         for k, why in rows:
             with self.subTest(k):
@@ -760,8 +762,8 @@ class Voids(unittest.TestCase):
     # here and in the Rust row live_json_holds_the_fields_the_sampler_reads.
     LIVE_FIELDS = {"t_unix", "sent", "accepted", "rejected", "rate_limited", "received", "client_errors",
                    "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed",
-                   "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "ack_ms_le", "lost",
-                   "joined"}
+                   "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
+                   "ack_ms_le", "lost", "joined"}
 
     def test_the_loop_reads_what_tenant_sim_writes(self) -> None:
         """A live.json from a real tenant_sim run (testdata/live), read with
@@ -808,8 +810,9 @@ class Voids(unittest.TestCase):
             p.write_text(json.dumps(whole))
             self.assertEqual(rs.read_live(str(p)), (whole, None))
             # tenant_sim writes every total, so a missing one is an error,
-            # never 0; a kind missing from client_errors is 0.
-            for k in rs.LIVE_TOTALS:
+            # never 0; a kind missing from client_errors is 0. The totals
+            # are this file's own list, not the code's.
+            for k in (*TOTALS, "rejected"):
                 with self.subTest(missing=k):
                     p.write_text(json.dumps({x: v for x, v in whole.items() if x != k}))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no {k}"))
@@ -1235,6 +1238,28 @@ class Loop(unittest.TestCase):
             self.assertEqual(seen[first], {"relays": {"b": {"t_unix": 1050.0, "why": "the relay rejected 5 events", "band": "steady"}},
                                            "first_t_unix": 1050.0})
             self.assertEqual(first, 10, "at the tick the break was read")
+
+    def test_sends_the_relay_never_answered_are_its_break_not_a_void(self) -> None:
+        """A relay at its limit times out: written sends with no OK are its
+        break, and the run goes on. The same sends counted as the
+        generator's own (send_failed) void it: the split is what tells
+        them apart."""
+        def unanswered(t: int, r: str) -> dict:
+            return live_counters(t, send_unanswered=4 if r == "b" and t >= 1050 else 0)
+
+        def not_sent(t: int, r: str) -> dict:
+            return live_counters(t, send_failed=4 if r == "b" and t >= 1050 else 0)
+        with tempfile.TemporaryDirectory() as d:
+            code, _, _, seen = self.run_lives(Path(d), unanswered, {0: "steady"}, 100.0)
+            self.assertEqual(code, 0, self.stderr)
+            self.assertFalse((Path(d) / "samples" / "void.json").exists())
+            self.assertEqual(seen[-1], {"relays": {"b": {"t_unix": 1050.0, "why": "the relay didn't answer 4 sends", "band": "steady"}},
+                                        "first_t_unix": 1050.0})
+        with tempfile.TemporaryDirectory() as d:
+            code, _, _, _ = self.run_lives(Path(d), not_sent, {0: "steady"}, 100.0)
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual(void["reason"], "the generator for b reported its own errors: send_failed +4, before the relay broke")
 
     def test_bands_and_the_end_of_a_run(self) -> None:
         with tempfile.TemporaryDirectory() as d:

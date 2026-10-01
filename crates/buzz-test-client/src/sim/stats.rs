@@ -48,6 +48,11 @@ pub struct BandClient {
     /// counted apart from `rejected`, neither a break nor the generator's
     /// error.
     pub rate_limited: u64,
+    /// Sends written that got no OK in time, or whose socket failed before
+    /// it: the relay not answering.
+    pub unanswered: u64,
+    /// Sends that failed before anything was written: the generator's own.
+    pub failed: u64,
     pub received: u64,
     /// Sends in this band by event kind; acceptance checks the floor with it.
     pub sent_by_kind: BTreeMap<String, u64>,
@@ -116,6 +121,8 @@ struct BandAcc {
     accepted: u64,
     rejected: u64,
     rate_limited: u64,
+    unanswered: u64,
+    failed: u64,
     received: u64,
     sent_by_kind: BTreeMap<String, u64>,
     ok_ms: Vec<f64>,
@@ -142,6 +149,8 @@ struct Inner {
     git_failed: u64,
     git_failed_by: BTreeMap<GitFailure, u64>,
     git_push_ms: Vec<f64>,
+    /// Sends the relay never answered, in any band.
+    send_unanswered: u64,
     /// Accepted sends by ack time, one count per bound in ACK_MS_BOUNDS
     /// and one past the last; cumulative in live.json.
     ack_ms_buckets: [u64; ACK_MS_BOUNDS.len() + 1],
@@ -229,6 +238,11 @@ pub struct Live {
     pub read_refused: u64,
     pub read_unanswered: u64,
     pub read_rate_limited: u64,
+    /// Sends written that got no OK in time, or whose socket failed before
+    /// it, in any band: the relay not answering (a relay break). A send
+    /// that failed before anything was written is `send_failed` in
+    /// `client_errors`, the generator's own.
+    pub send_unanswered: u64,
     /// Accepted sends (in sampled bands) acknowledged within each bound,
     /// in ms, cumulative like a Prometheus histogram: `"500": n` is every
     /// ack within 500 ms; `"+Inf"` is every ack.
@@ -327,12 +341,43 @@ impl Stats {
         });
     }
 
-    /// A send the relay's per-key rate limiter turned away.
+    /// A send written that got no answer (`band`: a sampled band's name).
+    pub fn record_send_unanswered(&self, band: Option<&str>, kind: u16) {
+        self.with(|s| {
+            s.send_unanswered += 1;
+            if let Some(band) = band {
+                *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.sent += 1;
+                b.unanswered += 1;
+                *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        });
+    }
+
+    /// A send that failed before anything was written: the generator's own
+    /// error (`send_failed` in client_errors).
+    pub fn record_send_failed(&self, band: Option<&str>, kind: u16) {
+        self.with(|s| {
+            *s.client_errors
+                .entry("send_failed".to_string())
+                .or_default() += 1;
+            if let Some(band) = band {
+                *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.sent += 1;
+                b.failed += 1;
+                *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        });
+    }
+
     /// An identity connected and subscribed.
     pub fn record_joined(&self) {
         self.with(|s| s.joined += 1);
     }
 
+    /// A send the relay's per-key rate limiter turned away.
     pub fn record_rate_limited(&self, band: &str, kind: u16) {
         self.with(|s| {
             *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
@@ -476,6 +521,7 @@ impl Stats {
                 read_refused: count(&s.read_failed_by, ReadFailure::Refused),
                 read_unanswered: count(&s.read_failed_by, ReadFailure::Unanswered),
                 read_rate_limited: s.reads_rate_limited,
+                send_unanswered: s.send_unanswered,
                 ack_ms_le: {
                     let mut out = BTreeMap::new();
                     let mut total = 0;
@@ -514,6 +560,8 @@ impl Stats {
                     accepted: acc.accepted,
                     rejected: acc.rejected,
                     rate_limited: acc.rate_limited,
+                    unanswered: acc.unanswered,
+                    failed: acc.failed,
                     received: acc.received,
                     sent_by_kind: acc.sent_by_kind.clone(),
                     ok_ms: percentiles(acc.ok_ms.clone()),
@@ -611,6 +659,7 @@ mod tests {
             "read_refused",
             "read_unanswered",
             "read_rate_limited",
+            "send_unanswered",
             "ack_ms_le",
             "lost",
             "joined",

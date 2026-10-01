@@ -83,7 +83,8 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 # counted apart: neither the relay breaking nor the generator's own error.
 LIVE_TOTALS = ("sent", "accepted", "rejected", "rate_limited", "media_client_failed", "media_refused",
                "media_unanswered", "git_local_failed", "git_push_failed",
-               "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "lost", "joined")
+               "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
+               "lost", "joined")
 # tenant_sim's ack-time histogram: accepted sends within each bound, in ms,
 # cumulative. 500 ms is a bound, so the service level's share is exact.
 ACK_BOUNDS = ("10", "25", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf")
@@ -110,6 +111,11 @@ RELAY_FAILURE_TOTALS = {
     "git_push_failed": "{n} git pushes to the relay failed",
     "read_refused": "the relay refused {n} agent reads",
     "read_unanswered": "the relay didn't answer {n} agent reads",
+    # A send written that got no OK in time, or whose socket failed after
+    # the write. Trusted as the relay's only because a generator too busy
+    # to read its answers also shows in the generator box's own CPU and
+    # memory limits, which void the run.
+    "send_unanswered": "the relay didn't answer {n} sends",
 }
 # tenant_sim rewrites live.json every 2 s. Older than this (five writes
 # missed), or this far ahead of the clock, the file is no longer live.
@@ -622,7 +628,7 @@ class Monitor:
         level's ack test on it. Under SLO_ACK_SHARE % of at least
         SLO_MIN_ACKS acks within SLO_ACK_MS is the relay breaking, at the
         band's end."""
-        d = {k: live1[k] - live0[k] for k in ("sent", "accepted", "rejected", "rate_limited", "lost",
+        d = {k: live1[k] - live0[k] for k in ("sent", "accepted", "rejected", "rate_limited", "send_unanswered", "lost",
                                                "read_refused", "read_unanswered", "read_rate_limited")}
         le0, le1 = live0["ack_ms_le"], live1["ack_ms_le"]
         acks, within = le1["+Inf"] - le0["+Inf"], le1[SLO_ACK_MS] - le0[SLO_ACK_MS]
