@@ -451,6 +451,35 @@ class SchemaTests(unittest.TestCase):
         line["bands"]["steady"]["client"]["rate_limited"] = 5
         self.assertEqual(tenant_cogs.acceptance_errors(line, self.summary_ok(), 0), [])
 
+    def test_a_run_seeds_its_days_and_reads_what_the_seed_did(self) -> None:
+        """--seed-days goes to tenant_sim; the run waits for seed-start,
+        seed-done, then setup-done, and keeps what the seed asked and got."""
+        args = tenant_cogs.build_parser().parse_args(["run", "--substrate", "compose", "--seed-days", "90"])
+        self.assertEqual(tenant_cogs.seed_flags(args), ["--seed-days", "90", "--seed-max-seconds", "1800"])
+        none = tenant_cogs.build_parser().parse_args(["run", "--substrate", "compose"])
+        self.assertEqual(tenant_cogs.seed_flags(none), [])
+        lines = [
+            {"phase": "seed-start", "t_unix_ms": 1, "events": 207335, "days": 90},
+            {"other": "a log line"},
+            {"phase": "seed-done", "t_unix_ms": 2, "seed": {"requested": 207335, "acked": 207335, "rejected": 0, "errors": 0, "seconds": 61.5}},
+            {"phase": "setup-done", "provision": {"events": 300}},
+        ]
+        script = "".join(f"echo '{json.dumps(l)}'\n" for l in lines)
+        proc = subprocess.Popen(["/bin/sh", "-c", script], stdout=subprocess.PIPE)
+        try:
+            setup, seed = tenant_cogs.wait_setup(proc, True, 10, 10)
+        finally:
+            proc.wait()
+        self.assertEqual(setup["provision"], {"events": 300})
+        self.assertEqual((seed["days"], seed["events"], seed["acked"], seed["seconds"]), (90, 207335, 207335, 61.5))
+        self.assertEqual(tenant_cogs.seed_errors(seed), [])
+        self.assertEqual(tenant_cogs.seed_errors(None), [])
+
+    def test_a_short_seed_is_an_acceptance_error(self) -> None:
+        seed = {"days": 90, "events": 207335, "acked": 150000, "rejected": 0, "errors": 3}
+        self.assertEqual(tenant_cogs.seed_errors(seed),
+                         ["seed: 150000 of 207335 events acknowledged (rejected 0, errors 3)"])
+
     def summary_ok(self) -> dict:
         return {
             "identities": {"humans": 10, "agents": 20},

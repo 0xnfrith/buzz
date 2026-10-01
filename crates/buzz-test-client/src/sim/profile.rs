@@ -149,7 +149,68 @@ impl Rates {
     }
 }
 
+/// Working hours a day and working days a week behind a seed by days: a
+/// team's history comes from its working days, at the steady band's duty
+/// cycles. An assumption, until calibration measures real stored events a
+/// day.
+pub const SEED_HOURS_PER_DAY: f64 = 8.0;
+pub const SEED_DAYS_PER_WEEK: f64 = 5.0;
+
+/// How many stored events a seed of `days` days writes, and how.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SeedPlan {
+    pub days: u64,
+    /// Working hours in those days.
+    pub hours: f64,
+    /// Stored events per identity per working hour: the steady band's
+    /// rates of every stored kind, times the duty cycle.
+    pub per_human_hour: f64,
+    pub per_agent_hour: f64,
+    pub events: u64,
+    pub formula: String,
+}
+
 impl Profile {
+    /// Stored events per active hour for a role's rates: everything but
+    /// presence (ephemeral) and git pushes (no event). A media upload posts
+    /// one message.
+    fn stored_per_hour(rates: &Rates) -> f64 {
+        rates
+            .entries()
+            .iter()
+            .filter(|(name, _)| !matches!(*name, "presence" | "git_push"))
+            .map(|(_, v)| *v)
+            .sum()
+    }
+
+    /// The volume seed for `days` of history.
+    pub fn seed_plan(&self, days: u64) -> SeedPlan {
+        let hours = days as f64 * SEED_DAYS_PER_WEEK / 7.0 * SEED_HOURS_PER_DAY;
+        let human_duty = self.human.burst_len_s as f64
+            / (self.human.burst_len_s + self.human.burst_gap_s).max(1) as f64;
+        let agent_duty =
+            self.agent.active_s as f64 / (self.agent.active_s + self.agent.idle_s).max(1) as f64;
+        let per_human_hour = Self::stored_per_hour(&self.human.rates) * human_duty;
+        let per_agent_hour = Self::stored_per_hour(&self.agent.rates) * agent_duty;
+        let events = (hours
+            * (self.humans as f64 * per_human_hour + self.agent_count() as f64 * per_agent_hour))
+            .round() as u64;
+        SeedPlan {
+            days,
+            hours,
+            per_human_hour,
+            per_agent_hour,
+            events,
+            formula: format!(
+                "{days} days x {SEED_DAYS_PER_WEEK}/7 working days x {SEED_HOURS_PER_DAY} h = {hours:.1} h; \
+                 x ({} humans x {per_human_hour:.3} + {} agents x {per_agent_hour:.3} stored events \
+                 an active hour, the steady band's stored rates times its duty cycle)",
+                self.humans,
+                self.agent_count()
+            ),
+        }
+    }
+
     pub fn agent_count(&self) -> u32 {
         self.humans * self.agents_per_human
     }

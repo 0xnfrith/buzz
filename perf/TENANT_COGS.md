@@ -235,6 +235,40 @@ not start the relay and cannot restart it.
 - Reactions target the newest received channel event, never a DM or turn
   metric from the `#p` stream.
 
+## The volume seed in a run
+
+An empty database flatters memory and backfill, so a run can seed history
+first. The relay rejects events far from its own clock, so the seed writes
+the history's volume now, at current timestamps, from the population's own
+keys, before any identity subscribes. It writes channel messages only:
+no media in MinIO and no git history.
+
+`run --seed-days 90` (or `tenant_sim --seed-days 90`) writes the profile's
+stored events for 90 days. `tenant_sim --profile <p> --check` prints the
+count and its formula as `seed_90d`:
+
+- **Hours:** 90 days x 5/7 working days x 8 hours = 514.3 hours. **The 8
+  hours a day and 5 days a week are an assumption** (`SEED_HOURS_PER_DAY`,
+  `SEED_DAYS_PER_WEEK` in `profile.rs`): agents that work around the clock
+  would multiply the count several-fold. Calibration replaces it with real
+  stored events a day.
+- **Per identity per working hour:** the steady band's rates of every
+  stored kind (everything but presence and git pushes; a media upload posts
+  one message), times the steady duty cycle. The shipped profiles' rates
+  give a human 23.5 x 90/690 = 3.07 and an agent 74.5 x 300/1200 = 18.6.
+
+| Profile | Humans | Agents | 90-day seed |
+|---|---|---|---|
+| `1h-5a` (solo) | 1 | 5 | 49,469 |
+| `10h-20a` (team) | 10 | 20 | 207,335 |
+| `25h-75a` (heavy) | 25 | 75 | 757,803 |
+
+The run waits for `seed-start`, `seed-done` and `setup-done`, keeps what the
+seed asked for and what the client saw in the results line's `seed`, and
+fails acceptance if fewer events were acknowledged than asked for. Seed at
+raised limits (the default `--setup-rate-limit` on a run that owns its
+stack): the relay is restarted with its default limits before the bands.
+
 ## Seed throughput (`seed-bench`)
 
 How fast a fresh relay stores history written through its front door. The

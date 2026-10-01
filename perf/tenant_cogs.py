@@ -1318,6 +1318,38 @@ def wait_phase_line(
             return obj
 
 
+def seed_flags(args: argparse.Namespace) -> list[str]:
+    """tenant_sim's volume seed for a run: --seed-days of the profile's
+    history (tenant_sim --check prints the count and its formula)."""
+    if not getattr(args, "seed_days", 0):
+        return []
+    return ["--seed-days", str(args.seed_days), "--seed-max-seconds", str(args.seed_max_seconds)]
+
+
+def wait_setup(
+    proc: subprocess.Popen[Any], seeding: bool, setup_timeout: float, seed_max_seconds: float
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """tenant_sim's setup-done line, and with a seed, what the seed asked
+    for and what the client saw: seed-start, then seed-done."""
+    if not seeding:
+        return wait_phase_line(proc, "setup-done", setup_timeout), None
+    start = wait_phase_line(proc, "seed-start", setup_timeout)
+    done = wait_phase_line(proc, "seed-done", seed_max_seconds + 120)
+    seed = {"days": start.get("days"), "events": start.get("events"), **(done.get("seed") or {})}
+    return wait_phase_line(proc, "setup-done", 120), seed
+
+
+def seed_errors(seed: dict[str, Any] | None) -> list[str]:
+    """A run's seed must have written its whole history: a short one
+    flatters memory and backfill."""
+    if not seed:
+        return []
+    asked, acked = int(seed.get("events") or 0), int(seed.get("acked") or 0)
+    if acked < asked:
+        return [f"seed: {acked} of {asked} events acknowledged (rejected {seed.get('rejected')}, errors {seed.get('errors')})"]
+    return []
+
+
 def wait_ready_line(proc: subprocess.Popen[Any], timeout_s: float = 300) -> None:
     wait_phase_line(proc, "ready", timeout_s)
 
@@ -1632,6 +1664,8 @@ def write_results_line(
             "band_rate_limits": setup.get("band_rate_limits"),
         },
         "setup": setup.get("provision"),
+        # The volume seed: days, events asked for, and what the client saw.
+        "seed": setup.get("seed"),
         "bands": {"floor": floor, "steady": steady, "peak": peak},
         "totals": {
             "events": totals_events,
@@ -1851,6 +1885,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         if args.blink:
             sim_cmd.append("--blink")
+        sim_cmd.extend(seed_flags(args))
         if setup_limit:
             sim_cmd.append("--pause-after-setup")
         proc = subprocess.Popen(
@@ -1862,10 +1897,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             env=child_env(),
         )
         session.proc = proc
-        setup_line = wait_phase_line(proc, "setup-done", args.setup_timeout)
+        setup_line, seed = wait_setup(proc, bool(seed_flags(args)), args.setup_timeout, args.seed_max_seconds)
         setup: dict[str, Any] = {
             "rate_limit": setup_limit,
             "provision": setup_line.get("provision"),
+            "seed": seed,
             "compose_project": project,
         }
         if setup_limit:
@@ -1948,7 +1984,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             notes="; ".join(notes),
             setup=setup,
         )
-        errors = acceptance_errors(line, summary, proc.returncode)
+        errors = acceptance_errors(line, summary, proc.returncode) + seed_errors(seed)
         print(
             json.dumps(
                 {
@@ -2294,6 +2330,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_p = sub.add_parser("run")
     add_common(run_p)
+    run_p.add_argument(
+        "--seed-days",
+        type=int,
+        default=0,
+        help="seed this many days of the profile's history before the bands (0: none)",
+    )
+    run_p.add_argument("--seed-max-seconds", type=int, default=1800)
     fp = sub.add_parser("fingerprint")
     add_common(fp)
     sample = sub.add_parser("sample")

@@ -103,8 +103,13 @@ struct Args {
 
     /// After provisioning, write this many stored channel messages at
     /// current timestamps before any identity subscribes (volume seed).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, conflicts_with = "seed_days")]
     seed_events: u64,
+
+    /// The volume seed as days of history: the profile's stored events for
+    /// that many days (see `--check`'s `seed_90d` for the formula).
+    #[arg(long, default_value_t = 0)]
+    seed_days: u64,
 
     /// Stop the seed after this many seconds even if it is short of
     /// --seed-events.
@@ -323,6 +328,16 @@ async fn clone_setup_repo(
     })
 }
 
+/// How many events the volume seed writes: `--seed-days` of the profile's
+/// history, or `--seed-events` exactly.
+fn seed_count(profile: &Profile, args: &Args) -> u64 {
+    if args.seed_days > 0 {
+        profile.seed_plan(args.seed_days).events
+    } else {
+        args.seed_events
+    }
+}
+
 async fn provision(
     profile: &Profile,
     pop: &Population,
@@ -470,6 +485,7 @@ async fn run(args: Args) -> Result<i32> {
                     "cooldown": profile.bands.cooldown,
                 },
                 "event_budget_per_identity": budget,
+                "seed_90d": profile.seed_plan(90),
             })
         );
         return Ok(0);
@@ -517,14 +533,20 @@ async fn run(args: Args) -> Result<i32> {
     let provision_s = setup_started.elapsed().as_secs_f64();
 
     let mut seed_failed = false;
-    if args.seed_events > 0 {
-        emit(&serde_json::json!({"phase": "seed-start", "t_unix_ms": kinds::now_ms()}));
+    let seed_events = seed_count(&profile, &args);
+    if seed_events > 0 {
+        emit(&serde_json::json!({
+            "phase": "seed-start",
+            "t_unix_ms": kinds::now_ms(),
+            "events": seed_events,
+            "days": args.seed_days,
+        }));
         let report = seed::seed(
             &targets.relay,
             &pop,
             &profile.kinds,
             &channels,
-            args.seed_events,
+            seed_events,
             Duration::from_secs(args.seed_max_seconds),
         )
         .await?;
@@ -946,6 +968,54 @@ mod tests {
             refusing.accepts() >= 1,
             "git never reached the remote: {msg}"
         );
+    }
+
+    /// The 90-day seed of each shipped profile, from the formula --check
+    /// prints: the steady band's stored rates times its duty cycle, over 8
+    /// hours a day, 5 days a week. --seed-days gives the same count, and it
+    /// can't be given with --seed-events.
+    #[test]
+    fn the_90_day_seed_of_each_profile() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../perf/profiles");
+        for (file, events) in [
+            ("1h-5a.toml", 49_469),
+            ("10h-20a.toml", 207_335),
+            ("25h-75a.toml", 757_803),
+        ] {
+            let path = dir.join(file);
+            let p = load_profile(&path).expect(file);
+            let plan = p.seed_plan(90);
+            assert_eq!(plan.events, events, "{file}: {plan:?}");
+            assert!(
+                (plan.hours - 514.2857).abs() < 1e-3,
+                "{file}: {}",
+                plan.hours
+            );
+            assert!(
+                (plan.per_human_hour - 23.5 * 90.0 / 690.0).abs() < 1e-9,
+                "{file}"
+            );
+            assert!((plan.per_agent_hour - 74.5 * 0.25).abs() < 1e-9, "{file}");
+            let args = Args::try_parse_from([
+                "tenant_sim",
+                "--profile",
+                &path.to_string_lossy(),
+                "--seed-days",
+                "90",
+            ])
+            .expect("args");
+            assert_eq!(seed_count(&p, &args), events, "{file}");
+        }
+        let both = Args::try_parse_from([
+            "tenant_sim",
+            "--profile",
+            "x.toml",
+            "--seed-days",
+            "90",
+            "--seed-events",
+            "5",
+        ]);
+        assert!(both.is_err(), "--seed-days with --seed-events");
     }
 
     #[test]
