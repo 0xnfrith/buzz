@@ -645,7 +645,7 @@ class Loop(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             live = Path(d) / "live.json"
             live.write_text(json.dumps(live_counters(1000)))
-            code, _ = self.drive(self.settings(Path(d), live_file=str(live)),
+            code, _ = self.drive(self.settings(Path(d), live_file=str(live), duration=60.0),
                                  lambda t, tier: (0, json.dumps(relay_sample(t, tier=tier)), ""))
             self.assertEqual(code, 3)
             void = json.loads((Path(d) / "samples" / "void.json").read_text())
@@ -683,7 +683,7 @@ class Loop(unittest.TestCase):
                     row["errors"] = ["psql: exit 2: psql: error: connection to server failed"]
                     row["wal"] = None
                 return 0, json.dumps(row), ""
-            code, calls = self.drive(self.settings(Path(d), slow_every=15.0), answer)
+            code, calls = self.drive(self.settings(Path(d), slow_every=15.0, duration=120.0), answer)
             self.assertEqual(code, 3)
             want = "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: exit 2: psql: error: connection to server failed"
             void = json.loads((Path(d) / "samples" / "void.json").read_text())
@@ -706,7 +706,7 @@ class Loop(unittest.TestCase):
                 if tier == "slow":
                     row["disk"]["wal"] = None  # pg_wal not found: no error from the walk
                 return 0, json.dumps(row), ""
-            code, _ = self.drive(self.settings(Path(d), slow_every=5.0), answer)
+            code, _ = self.drive(self.settings(Path(d), slow_every=5.0, duration=60.0), answer)
             self.assertEqual(code, 3)
             void = json.loads((Path(d) / "samples" / "void.json").read_text())
             self.assertEqual((void["reason"], void["t_unix"]),
@@ -723,7 +723,7 @@ class Loop(unittest.TestCase):
                     if n["slow"] in (10, 50):
                         row["errors"] = ["docker system df: exit 124: timed out after 10s"]
                 return 0, json.dumps(row), ""
-            code, _ = self.drive(self.settings(Path(d), slow_every=5.0), answer)
+            code, _ = self.drive(self.settings(Path(d), slow_every=5.0, duration=600.0), answer)
             self.assertEqual(code, 3)
             void = json.loads((Path(d) / "samples" / "void.json").read_text())
             self.assertEqual((void["reason"], void["t_unix"]), ("relay1 (10.77.0.3) missed 2 of 100 slow calls, over the 1% limit", 1495.0))
