@@ -604,27 +604,20 @@ mod tests {
         assert_eq!(refusing.accepts(), 0, "a failed add still pushed");
     }
 
-    /// Two pushes to a remote that answers only after 12 s, at once, on a
-    /// 2-worker runtime: the generator box's 2 vCPUs. The live counters'
-    /// writer keeps running, so live.json is never more than a few seconds
-    /// old; the sampler voids at 10 s. Run on the workers, the pushes would
-    /// stall it for the whole 12 s.
-    #[test]
-    fn slow_pushes_do_not_stall_the_live_writer() {
+    /// Runs `work` on a 2-worker runtime, the generator box's 2 vCPUs, with
+    /// the live counters' writer beside it, as tenant_sim runs them, while a
+    /// plain thread off the runtime reads live.json's age every 200 ms.
+    /// Returns what `work` gave, the worst age seen, how many reads, and how
+    /// long `work` took. The sampler voids at 10 s.
+    fn live_age_while<T, F>(dir: &Path, work: impl FnOnce() -> F) -> (T, f64, u32, Duration)
+    where
+        F: std::future::Future<Output = T>,
+    {
         use crate::sim::stats::{spawn_live_writer, write_live, Stats};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let slow = Server::start_after(
-            "127.0.0.1:0",
-            testsrv::status(500, ""),
-            Duration::from_secs(12),
-        );
-        let dir = testsrv::tempdir();
-        let repos: Vec<GitRepo> = (0..2)
-            .map(|i| local_repo(dir.join(format!("wt{i}")), remote(&slow)))
-            .collect();
         let live = dir.join("live.json");
         let now = || {
             SystemTime::now()
@@ -636,7 +629,6 @@ mod tests {
         let stats = Arc::new(Stats::new());
         write_live(&live, &stats.live(now() as u64)).expect("first write");
         let done = Arc::new(AtomicBool::new(false));
-        // A plain thread, off the runtime, reads live.json's age throughout.
         let watcher = {
             let (live, done) = (live.clone(), done.clone());
             thread::spawn(move || {
@@ -661,8 +653,34 @@ mod tests {
             .build()
             .expect("runtime");
         let started = Instant::now();
-        let results = rt.block_on(async {
+        let out = rt.block_on(async {
             let writer = spawn_live_writer(stats.clone(), live.clone(), Duration::from_secs(2));
+            let out = work().await;
+            writer.abort();
+            out
+        });
+        let took = started.elapsed();
+        done.store(true, Ordering::SeqCst);
+        let (worst, reads) = watcher.join().expect("watcher");
+        (out, worst, reads, took)
+    }
+
+    /// Two pushes to a remote that answers only after 12 s, at once: the
+    /// live counters' writer keeps running, so live.json is never more than
+    /// a few seconds old. Run on the workers, the pushes would stall it for
+    /// the whole 12 s.
+    #[test]
+    fn slow_pushes_do_not_stall_the_live_writer() {
+        let slow = Server::start_after(
+            "127.0.0.1:0",
+            testsrv::status(500, ""),
+            Duration::from_secs(12),
+        );
+        let dir = testsrv::tempdir();
+        let repos: Vec<GitRepo> = (0..2)
+            .map(|i| local_repo(dir.join(format!("wt{i}")), remote(&slow)))
+            .collect();
+        let (results, worst, reads, took) = live_age_while(&dir, || async {
             let pushes: Vec<_> = repos
                 .into_iter()
                 .enumerate()
@@ -679,12 +697,8 @@ mod tests {
             for p in pushes {
                 out.push(p.await.expect("push task"));
             }
-            writer.abort();
             out
         });
-        let took = started.elapsed();
-        done.store(true, Ordering::SeqCst);
-        let (worst, reads) = watcher.join().expect("watcher");
         assert!(
             took >= Duration::from_secs(12),
             "the pushes didn't wait for the slow remote: {took:?}"
@@ -698,6 +712,54 @@ mod tests {
             worst < 5.0,
             "live.json was {worst:.1} s old while two slow pushes ran; the sampler voids at 10 s"
         );
+    }
+
+    /// The setup clones, the same way: two clones from a remote that
+    /// answers only after 12 s, at once, run on the blocking pool, so the
+    /// live counters stay fresh; each fails with its own error.
+    #[test]
+    fn slow_clones_do_not_stall_the_live_writer() {
+        let slow = Server::start_after(
+            "127.0.0.1:0",
+            testsrv::status(500, ""),
+            Duration::from_secs(12),
+        );
+        let dir = testsrv::tempdir();
+        let base = guard().check_url(&slow.http(), &["http"]).expect("allowed");
+        let (results, worst, reads, took) = live_age_while(&dir, || async {
+            let clones: Vec<_> = (0..2)
+                .map(|i| {
+                    tokio::spawn(clone_repo_async(
+                        base.clone(),
+                        OWNER.into(),
+                        format!("r{i}"),
+                        dir.join(format!("clone{i}")),
+                        PathBuf::from("/usr/bin/true"),
+                        NSEC.into(),
+                        None,
+                    ))
+                })
+                .collect();
+            let mut out = Vec::new();
+            for c in clones {
+                out.push(c.await.expect("clone task"));
+            }
+            out
+        });
+        assert!(
+            took >= Duration::from_secs(12),
+            "the clones didn't wait for the slow remote: {took:?}"
+        );
+        for r in results {
+            let e = r.map(|_| ()).expect_err("a clone from a 500");
+            assert!(format!("{e:#}").contains("clone"), "{e:#}");
+        }
+        assert!(reads >= 20, "live.json was read only {reads} times");
+        assert!(
+            worst < 5.0,
+            "live.json was {worst:.1} s old while two slow clones ran; the sampler voids at 10 s"
+        );
+        assert!(slow.accepts() >= 2, "the clones never reached the remote");
     }
 
     #[test]

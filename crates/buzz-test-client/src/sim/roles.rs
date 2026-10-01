@@ -48,6 +48,9 @@ pub enum Band {
     Steady,
     Peak,
     Cooldown,
+    /// A pause at a band boundary while the driver runs its checks: still
+    /// connected, nothing sent, not sampled.
+    Pause,
     Stop,
 }
 
@@ -59,6 +62,7 @@ impl Band {
             "steady" => Some(Self::Steady),
             "peak" => Some(Self::Peak),
             "cooldown" => Some(Self::Cooldown),
+            "pause" => Some(Self::Pause),
             "stop" => Some(Self::Stop),
             _ => None,
         }
@@ -71,6 +75,7 @@ impl Band {
             Self::Steady => "steady",
             Self::Peak => "peak",
             Self::Cooldown => "cooldown",
+            Self::Pause => "pause",
             Self::Stop => "stop",
         }
     }
@@ -102,7 +107,7 @@ pub fn scaled_rates(profile: &Profile, role: Role, band: Band) -> Rates {
             },
             ..Rates::default()
         },
-        Band::Cooldown | Band::Warmup | Band::Stop => Rates::default(),
+        Band::Cooldown | Band::Warmup | Band::Pause | Band::Stop => Rates::default(),
         Band::Steady | Band::Peak => Rates {
             msg: scale(base.msg),
             reaction: scale(base.reaction),
@@ -130,7 +135,7 @@ pub fn in_active_window(
     profile: &Profile,
 ) -> bool {
     match (role, band) {
-        (_, Band::Floor | Band::Warmup | Band::Cooldown | Band::Stop) => false,
+        (_, Band::Floor | Band::Warmup | Band::Cooldown | Band::Pause | Band::Stop) => false,
         (Role::Human, Band::Peak) => true,
         (Role::Agent, Band::Peak) if profile.agent.peak_all_active => true,
         (Role::Human, Band::Steady) => {

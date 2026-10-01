@@ -20,6 +20,8 @@ use super::guard::Target;
 use super::identity::{connect_identity, IdentityRecord, Population};
 use super::kinds;
 use super::profile::KindTable;
+use super::roles::Band;
+use tokio::sync::watch;
 
 const OK_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTENT_BYTES: usize = 200;
@@ -68,10 +70,13 @@ async fn writer(
     target: u64,
     deadline: Instant,
     c: Arc<Counters>,
+    stop: watch::Receiver<Band>,
 ) {
     let mut client = None;
     let mut pending: Option<(u64, nostr::Event)> = None;
-    while Instant::now() < deadline {
+    // Each step is bounded (an OK window, a 1 s retry, a rate-limit window
+    // cut to the deadline); between them, a stopped run seeds no more.
+    while Instant::now() < deadline && *stop.borrow() != Band::Stop {
         let (i, event) = match pending.take() {
             Some(p) => p,
             None => {
@@ -132,7 +137,8 @@ async fn writer(
 }
 
 /// Write `target` stored messages across the population, stopping early at
-/// `max`. Agents authenticate with their owner's NIP-OA tag, as in the run.
+/// `max`, or when the run stops. Agents authenticate with their owner's
+/// NIP-OA tag, as in the run.
 pub async fn seed(
     relay_url: &Target,
     pop: &Population,
@@ -140,6 +146,7 @@ pub async fn seed(
     channels: &[String],
     target: u64,
     max: Duration,
+    stop: watch::Receiver<Band>,
 ) -> Result<SeedReport> {
     let c = Arc::new(Counters::default());
     let next = Arc::new(AtomicU64::new(0));
@@ -165,6 +172,7 @@ pub async fn seed(
             target,
             deadline,
             c.clone(),
+            stop.clone(),
         )));
     }
     let writers = tasks.len() as u64;

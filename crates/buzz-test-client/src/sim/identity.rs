@@ -15,15 +15,20 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
+use super::admission::{self, Publish};
 use super::git::{self, GitRepo};
 use super::guard::{self, Target};
 use super::kinds;
 use super::media;
 use super::profile::{Profile, Rates};
+use super::reads;
 use super::roles::{
     in_active_window, next_any_wait, pick_action, rng_f64, rng_usize, scaled_rates, Band, Role,
 };
 use super::stats::Stats;
+
+/// How long a send waits for its OK: buzz-ws-client's own publish window.
+const OK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdentityRecord {
@@ -179,6 +184,53 @@ fn reaction_target(seen: &VecDeque<(String, String)>) -> Option<(String, String)
 /// the channel is closed and tokio's `has_changed` returns an error even when
 /// an unseen value is waiting; the last value sent (normally `Stop`) still
 /// stands and must be acted on, or the identity never stops.
+/// A ramp identity's place: it connects once the ramp has switched on more
+/// identities than its index; every identity in a ramp rechecks for lost
+/// events at each step, without restarting its band.
+pub struct RampSlot {
+    pub on: watch::Receiver<usize>,
+    pub index: usize,
+}
+
+/// Waits until the ramp has switched this identity on: true, or false if
+/// the run stopped first.
+async fn wait_switched_on(slot: &mut RampSlot, band: &mut watch::Receiver<Band>) -> bool {
+    loop {
+        if *slot.on.borrow_and_update() > slot.index {
+            return true;
+        }
+        if *band.borrow() == Band::Stop {
+            return false;
+        }
+        tokio::select! {
+            r = slot.on.changed() => {
+                if r.is_err() {
+                    return *slot.on.borrow() > slot.index;
+                }
+            }
+            r = band.changed() => {
+                if r.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// Resolves once the run is stopping: a `stop`, or a lease that ran out.
+/// Never resolves if the signal's sender is gone without a stop (it lives
+/// as long as the process).
+pub async fn until_stop(rx: &mut watch::Receiver<Band>) {
+    loop {
+        if *rx.borrow_and_update() == Band::Stop {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 pub fn next_band(rx: &mut watch::Receiver<Band>, current: Band) -> Option<Band> {
     match rx.has_changed() {
         Ok(true) => Some(*rx.borrow_and_update()),
@@ -326,6 +378,11 @@ struct Session {
     seq: u64,
     own: VecDeque<(String, String)>,
     seen: VecDeque<(String, String)>,
+    /// Recent distinct authors seen, newest last: a turn reads their
+    /// profiles.
+    authors: VecDeque<String>,
+    /// This agent's turns so far: one in four also counts a thread.
+    turns: u64,
     expected: HashMap<String, u64>,
     missing: HashSet<String>,
     last_seen_created_at: u64,
@@ -361,6 +418,12 @@ impl Session {
             if self.seen.len() > 64 {
                 self.seen.pop_front();
             }
+            let author = event.pubkey.to_hex();
+            self.authors.retain(|a| *a != author);
+            self.authors.push_back(author);
+            if self.authors.len() > 5 {
+                self.authors.pop_front();
+            }
             let fanout = tag_value(&event, "ts_ms").and_then(|t| t.parse::<u64>().ok());
             let fanout_ms = fanout.map(|ts| {
                 let now = kinds::now_ms();
@@ -393,8 +456,29 @@ impl Session {
     async fn send(&mut self, client: &mut BuzzTestClient, band: Band, event: nostr::Event) -> bool {
         let kind = event.kind.as_u16();
         let start = Instant::now();
-        match client.send_event(event.clone()).await {
-            Ok(ok) => {
+        let answer = match admission::send_tracked(client, &event, OK_TIMEOUT).await {
+            Ok((answer, others)) => {
+                // A subscription's events that came in while this send
+                // waited, handled as they would have been.
+                for msg in others {
+                    self.handle_msg(band, msg).await;
+                }
+                Ok(answer)
+            }
+            Err(e) => Err(e),
+        };
+        match answer {
+            Ok(Publish::RateLimited { retry_in }) => {
+                if band.sampled() {
+                    self.stats.record_rate_limited(band.as_str(), kind);
+                }
+                warn!(
+                    "{} kind {kind} rate-limited (retry in {retry_in:?})",
+                    self.rec.name
+                );
+                false
+            }
+            Ok(Publish::Ok(ok)) => {
                 let ms = start.elapsed().as_secs_f64() * 1e3;
                 if band.sampled() {
                     self.stats
@@ -508,6 +592,7 @@ impl Session {
                 let turn_seq = self.seq + 1;
                 let ev = kinds::turn_metric(&keys, &k, &owner_hex, &ch, turn_seq)?;
                 self.send(client, band, ev).await;
+                self.turn_reads(band, &ch, &owner_hex).await;
             }
             "dm" => {
                 if let Some(pk) = self
@@ -599,6 +684,53 @@ impl Session {
         Ok(())
     }
 
+    /// A turn's reads (see [`reads`]), one after another, as a harness
+    /// makes them, each counted by where it ended.
+    async fn turn_reads(&mut self, band: Band, channel: &str, owner_hex: &str) {
+        self.turns += 1;
+        let root = self
+            .seen
+            .iter()
+            .rev()
+            .find(|(_, ch)| ch == channel)
+            .map(|(id, _)| id.clone());
+        let authors: Vec<String> = self.authors.iter().cloned().collect();
+        let agent = self.rec.pubkey.clone();
+        let turn = reads::Turn {
+            channel,
+            root: root.as_deref(),
+            authors: &authors,
+            agent: &agent,
+            owner: Some(owner_hex),
+            n: self.turns,
+        };
+        for r in reads::turn_reads(&self.profile.kinds, &turn) {
+            // Each read is bounded by the client's timeout; between them, a
+            // stopped run reads no more.
+            if *self.band_rx.borrow() == Band::Stop {
+                break;
+            }
+            let res = reads::read(
+                &self.http,
+                &self.world.http_url,
+                &self.keys,
+                self.auth_tag.as_deref(),
+                &r,
+            )
+            .await;
+            match res {
+                Ok(ms) => self
+                    .stats
+                    .record_read(band.sampled().then(|| band.as_str()), r.what, ms),
+                Err(reads::ReadError::RateLimited) => self.stats.record_read_rate_limited(),
+                Err(reads::ReadError::Failed { at, err }) => {
+                    warn!("{} read {} ({at:?}): {err:#}", self.rec.name, r.what);
+                    self.stats.record_read_failed(at);
+                }
+            }
+        }
+    }
+
     async fn gap_recheck(&mut self, client: &mut BuzzTestClient, since: u64) {
         if self.missing.is_empty() {
             return;
@@ -635,35 +767,44 @@ impl Session {
         record_join: bool,
         storm_ms: bool,
         since: Option<u64>,
-    ) -> Result<BuzzTestClient> {
+    ) -> Result<Option<BuzzTestClient>> {
         info!("{} reconnect ({reason})", self.rec.name);
         let mut delay = Duration::from_millis(250);
         let cap = Duration::from_secs(5);
+        // Every attempt, its backoff and the subscribe after it end when the
+        // run stops (a `stop`, or a lease that ran out): None. A relay that
+        // is gone must not keep a stopped run alive.
+        let mut stop = self.band_rx.clone();
         loop {
-            match connect_identity(
-                &self.world.relay_url,
-                &self.rec,
-                &self.keys,
-                self.oa_owner.as_ref(),
-            )
-            .await
-            {
+            let attempt = tokio::select! {
+                r = connect_identity(
+                    &self.world.relay_url,
+                    &self.rec,
+                    &self.keys,
+                    self.oa_owner.as_ref(),
+                ) => r,
+                _ = until_stop(&mut stop) => return Ok(None),
+            };
+            match attempt {
                 Ok(mut client) => {
                     let start = Instant::now();
-                    let n = subscribe_all(
-                        &mut client,
-                        &self.rec.name,
-                        &self.rec.pubkey,
-                        &self.world.channels,
-                        &self.sub_kinds(),
-                        limit,
-                        &self.stats,
-                        record_join,
-                        since,
-                        EosePolicy::Tolerant,
-                    )
-                    .await
-                    .unwrap_or(0);
+                    let kinds = self.sub_kinds();
+                    let subscribed = tokio::select! {
+                        n = subscribe_all(
+                            &mut client,
+                            &self.rec.name,
+                            &self.rec.pubkey,
+                            &self.world.channels,
+                            &kinds,
+                            limit,
+                            &self.stats,
+                            record_join,
+                            since,
+                            EosePolicy::Tolerant,
+                        ) => n,
+                        _ = until_stop(&mut stop) => return Ok(None),
+                    };
+                    let n = subscribed.unwrap_or(0);
                     if storm_ms {
                         self.stats.record_storm_backfill(
                             "peak",
@@ -671,12 +812,15 @@ impl Session {
                             n,
                         );
                     }
-                    return Ok(client);
+                    return Ok(Some(client));
                 }
                 Err(e) => {
                     self.stats.record_client_error("reconnect_failed");
                     warn!("{} reconnect failed: {e}", self.rec.name);
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = until_stop(&mut stop) => return Ok(None),
+                    }
                     delay = (delay * 2).min(cap);
                 }
             }
@@ -697,7 +841,13 @@ pub async fn run_identity(
     git_repo: Option<GitRepo>,
     rng_salt: u32,
     ready: mpsc::Sender<Result<(), String>>,
+    mut ramp: Option<RampSlot>,
 ) -> Result<()> {
+    if let Some(slot) = ramp.as_mut() {
+        if !wait_switched_on(slot, &mut band_rx).await {
+            return Ok(());
+        }
+    }
     let auth_tag = match (role, oa_owner.as_ref()) {
         (Role::Agent, Some(owner)) => Some(nip_oa_json(owner, &keys)?),
         _ => None,
@@ -721,6 +871,8 @@ pub async fn run_identity(
         seq: 0,
         own: VecDeque::new(),
         seen: VecDeque::new(),
+        authors: VecDeque::new(),
+        turns: 0,
         expected: HashMap::new(),
         missing: HashSet::new(),
         last_seen_created_at: unix_now(),
@@ -728,14 +880,19 @@ pub async fn run_identity(
         http: guard::http_client(Duration::from_secs(30))?,
     };
 
-    let mut client = match connect_identity(
-        &sess.world.relay_url,
-        &sess.rec,
-        &sess.keys,
-        sess.oa_owner.as_ref(),
-    )
-    .await
-    {
+    // The first connect and subscribe end when the run stops, too: a
+    // joiner switched on just before a stop mustn't hold the run open.
+    let mut stop = band_rx.clone();
+    let connected = tokio::select! {
+        r = connect_identity(
+            &sess.world.relay_url,
+            &sess.rec,
+            &sess.keys,
+            sess.oa_owner.as_ref(),
+        ) => r,
+        _ = until_stop(&mut stop) => return Ok(()),
+    };
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("{} connect: {e:#}", sess.rec.name);
@@ -743,20 +900,23 @@ pub async fn run_identity(
             return Err(anyhow!(msg));
         }
     };
-    if let Err(e) = subscribe_all(
-        &mut client,
-        &sess.rec.name,
-        &sess.rec.pubkey,
-        &sess.world.channels,
-        &sess.sub_kinds(),
-        sess.profile.human.backfill_limit,
-        &sess.stats,
-        true,
-        None,
-        EosePolicy::Required,
-    )
-    .await
-    {
+    let kinds = sess.sub_kinds();
+    let subscribed = tokio::select! {
+        r = subscribe_all(
+            &mut client,
+            &sess.rec.name,
+            &sess.rec.pubkey,
+            &sess.world.channels,
+            &kinds,
+            sess.profile.human.backfill_limit,
+            &sess.stats,
+            true,
+            None,
+            EosePolicy::Required,
+        ) => r,
+        _ = until_stop(&mut stop) => return Ok(()),
+    };
+    if let Err(e) = subscribed {
         let msg = format!("{} subscribe: {e:#}", sess.rec.name);
         let _ = ready.send(Err(msg.clone())).await;
         return Err(anyhow!(msg));
@@ -768,11 +928,25 @@ pub async fn run_identity(
     let mut band = *band_rx.borrow();
     let mut band_started = Instant::now();
     let mut band_unix = unix_now();
+    let mut step_unix = band_unix;
     let mut next_action = Instant::now();
     let mut stormed = false;
     let mut blink_closes: Vec<u64> = Vec::new();
 
     loop {
+        // A ramp step: look for lost events since the step before (a
+        // little earlier, for a gap seen late), without restarting the
+        // band, whose duty cycles count from its start.
+        if let Some(slot) = ramp.as_mut() {
+            if slot.on.has_changed().unwrap_or(false) {
+                slot.on.borrow_and_update();
+                if band.sampled() {
+                    sess.gap_recheck(&mut client, step_unix.saturating_sub(30))
+                        .await;
+                }
+                step_unix = unix_now();
+            }
+        }
         if let Some(new_band) = next_band(&mut band_rx, band) {
             if band.sampled() {
                 sess.gap_recheck(&mut client, band_unix).await;
@@ -780,6 +954,7 @@ pub async fn run_identity(
             band = new_band;
             band_started = Instant::now();
             band_unix = unix_now();
+            step_unix = band_unix;
             if band.sampled() {
                 sess.stats.band_start(band.as_str(), band_unix);
             }
@@ -799,9 +974,13 @@ pub async fn run_identity(
             let stagger = Duration::from_secs_f64(
                 rng_f64(&mut sess.rng) * sess.profile.storm.stagger_s as f64,
             );
-            tokio::time::sleep(stagger).await;
+            let mut stop = band_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(stagger) => {}
+                _ = until_stop(&mut stop) => break,
+            }
             let _ = client.disconnect().await;
-            client = sess
+            match sess
                 .reconnect(
                     "storm",
                     sess.profile.storm.backfill_limit,
@@ -809,7 +988,17 @@ pub async fn run_identity(
                     true,
                     None,
                 )
-                .await?;
+                .await?
+            {
+                Some(c) => client = c,
+                // The old socket is already closed: nothing to disconnect.
+                None => {
+                    if sess.world.blink && !blink_closes.is_empty() {
+                        sess.stats.record_blink_closes(&blink_closes);
+                    }
+                    return Ok(());
+                }
+            }
         }
 
         let active = in_active_window(sess.role, band, band_started.elapsed(), &sess.profile);
@@ -850,7 +1039,7 @@ pub async fn run_identity(
                 if is_closed && sess.world.blink {
                     blink_closes.push(unix_now());
                     let since = sess.last_seen_created_at.saturating_sub(5);
-                    client = sess
+                    match sess
                         .reconnect(
                             "blink",
                             sess.profile.human.backfill_limit,
@@ -858,11 +1047,15 @@ pub async fn run_identity(
                             false,
                             Some(since),
                         )
-                        .await?;
+                        .await?
+                    {
+                        Some(c) => client = c,
+                        None => break,
+                    }
                 } else if is_closed {
                     sess.stats.record_client_error("connection_dropped");
                     warn!("{} connection dropped: {s}", sess.rec.name);
-                    client = sess
+                    match sess
                         .reconnect(
                             "drop",
                             sess.profile.human.backfill_limit,
@@ -870,7 +1063,11 @@ pub async fn run_identity(
                             false,
                             None,
                         )
-                        .await?;
+                        .await?
+                    {
+                        Some(c) => client = c,
+                        None => break,
+                    }
                 } else {
                     sess.stats.record_client_error("recv_error");
                     warn!("{} recv: {s}", sess.rec.name);
@@ -897,6 +1094,153 @@ pub fn uuid_v4(rng: &mut StdRng) -> uuid::Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::admission::testrelay::fake_relay;
+    use crate::sim::guard::{Cidr, TargetGuard};
+
+    /// A human's session in the team profile, its world on loopback.
+    fn test_session(stats: Arc<Stats>) -> Session {
+        test_session_at(stats, "http://127.0.0.1:1")
+    }
+
+    /// [`test_session`] with its HTTP base at `http`.
+    fn test_session_at(stats: Arc<Stats>, http: &str) -> Session {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../perf/profiles/10h-20a.toml");
+        let profile = Arc::new(crate::sim::profile::load_profile(&path).expect("profile"));
+        let pop = generate_population(&profile);
+        let rec = pop.humans[0].clone();
+        let keys = pop.keys_of(&rec).expect("keys");
+        let guard = TargetGuard::new(vec![Cidr::parse("127.0.0.0/8").expect("allow")], vec![])
+            .expect("guard");
+        let world = Arc::new(World {
+            relay_url: guard.check_url("ws://127.0.0.1:1", &["ws"]).expect("relay"),
+            http_url: guard.check_url(http, &["http"]).expect("http"),
+            channels: vec!["chan-a".into()],
+            human_pubkeys: pop.humans.iter().map(|h| h.pubkey.clone()).collect(),
+            repos: vec![],
+            git_helper: PathBuf::from("/usr/bin/true"),
+            out_dir: std::env::temp_dir(),
+            blink: false,
+        });
+        let (_tx, band_rx) = watch::channel(Band::Steady);
+        Session {
+            rng: std_rng(profile.seed, 1),
+            rec,
+            keys,
+            role: Role::Human,
+            oa_owner: None,
+            auth_tag: None,
+            git_push_scale: 0.0,
+            profile,
+            world,
+            stats,
+            band_rx,
+            seq: 0,
+            own: VecDeque::new(),
+            seen: VecDeque::new(),
+            authors: VecDeque::new(),
+            turns: 0,
+            expected: HashMap::new(),
+            missing: HashSet::new(),
+            last_seen_created_at: unix_now(),
+            git_repo: None,
+            http: guard::http_client(Duration::from_secs(5)).expect("http client"),
+        }
+    }
+
+    /// A turn against a relay that refuses every read: each of the turn's
+    /// reads counts as the relay's refusal in the live counters, none as
+    /// the generator's error.
+    #[tokio::test]
+    async fn a_turn_against_a_refusing_relay_counts_each_read_as_refused() {
+        use crate::sim::guard::testsrv::{self, Server};
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(503, r#"{"error":"down"}"#));
+        let stats = Arc::new(Stats::new());
+        let mut sess = test_session_at(stats.clone(), &refusing.http());
+        sess.seen.push_back(("ee".repeat(32), "chan-a".into()));
+        sess.authors.push_back("ab".repeat(32));
+        sess.turn_reads(Band::Steady, "chan-a", &"cd".repeat(32))
+            .await;
+        let live = stats.live(1);
+        assert_eq!(
+            (
+                live.read_refused,
+                live.read_unanswered,
+                live.read_client_failed,
+                live.read_rate_limited
+            ),
+            (5, 0, 0, 0)
+        );
+        assert_eq!(refusing.accepts(), 5);
+    }
+
+    /// An agent's turn, as `act` takes it: the turn metric is sent, then the
+    /// turn's reads are made (here with no root and no author seen yet:
+    /// memory, history and canvas), each counted where it ended.
+    #[tokio::test]
+    async fn an_agents_turn_sends_its_metric_then_reads() {
+        use crate::sim::guard::testsrv::{self, Server};
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(503, r#"{"error":"down"}"#));
+        let ws = fake_relay(vec![r#"["OK","{id}",true,""]"#.to_string()]).await;
+        let stats = Arc::new(Stats::new());
+        let mut sess = test_session_at(stats.clone(), &refusing.http());
+        let pop = generate_population(&sess.profile);
+        let agent = pop.agents[0].clone();
+        let owner = pop
+            .humans
+            .iter()
+            .find(|h| Some(&h.name) == agent.owner_name.as_ref())
+            .expect("owner");
+        sess.oa_owner = Some(pop.keys_of(owner).expect("owner keys"));
+        sess.keys = pop.keys_of(&agent).expect("agent keys");
+        sess.rec = agent;
+        sess.role = Role::Agent;
+        // Only turns, so the one action is a turn.
+        let mut profile = (*sess.profile).clone();
+        profile.agent.rates = Rates {
+            turn_metric: 1.0,
+            ..Rates::default()
+        };
+        sess.profile = Arc::new(profile);
+        let mut client = BuzzTestClient::connect_unauthenticated(&ws)
+            .await
+            .expect("connect");
+        sess.act(&mut client, Band::Steady).await.expect("act");
+        let live = stats.live(1);
+        assert_eq!((live.sent, live.accepted), (1, 1), "the turn metric");
+        assert_eq!((live.read_refused, live.read_client_failed), (3, 0));
+        assert_eq!(refusing.accepts(), 3);
+    }
+
+    /// A send the relay's per-key rate limiter turns away during a band
+    /// (a NOTICE, no OK) is counted as rate-limited: not rejected, and not a
+    /// send that failed, which the sampler would read as the generator's
+    /// own error and void on.
+    #[tokio::test]
+    async fn a_rate_limited_send_in_a_band_is_counted_apart() {
+        let url = fake_relay(vec![
+            r#"["NOTICE","rate-limited: quota exceeded; retry in 7s"]"#.to_string(),
+        ])
+        .await;
+        let stats = Arc::new(Stats::new());
+        let mut sess = test_session(stats.clone());
+        let mut client = BuzzTestClient::connect_unauthenticated(&url)
+            .await
+            .expect("connect");
+        let ev = kinds::presence(&sess.keys, &sess.profile.kinds).expect("event");
+        let started = Instant::now();
+        assert!(!sess.send(&mut client, Band::Steady, ev).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the send waited out the OK window"
+        );
+        let live = stats.live(1);
+        assert_eq!(
+            (live.sent, live.accepted, live.rejected, live.rate_limited),
+            (1, 0, 0, 1)
+        );
+        assert!(live.client_errors.is_empty(), "{:?}", live.client_errors);
+    }
 
     #[test]
     fn repo_owners_carry_the_populations_pushes() {

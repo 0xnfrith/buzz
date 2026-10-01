@@ -4,7 +4,6 @@
 mod sim;
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,11 +21,13 @@ use sim::identity::{
     IdentityRecord, Population, RepoRef, World,
 };
 use sim::kinds;
+use sim::phase::emit;
 use sim::profile::{load_profile, Profile};
-use sim::roles::{Band, Role};
+use sim::roles::Role;
 use sim::seed;
+use sim::signal::{self, Ended};
 use sim::stats::{spawn_live_writer, write_live, Stats};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::warn;
 
@@ -69,9 +70,15 @@ struct Args {
     #[arg(long)]
     out_dir: Option<PathBuf>,
 
-    /// Band signal source: stdin (default) or fifo.
+    /// Band signal source: stdin (default) or fifo (`<out-dir>/band.fifo`).
+    /// See `sim::signal` for the lines and their leases.
     #[arg(long, default_value = "stdin")]
     band_signal: String,
+
+    /// With --pause-after-setup, how long to wait for `continue` before
+    /// giving up (exit 3): a driver that died during setup.
+    #[arg(long, default_value_t = 3600)]
+    continue_within_s: u64,
 
     /// Send kind 9030 for every identity (closed-relay posture).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -103,8 +110,13 @@ struct Args {
 
     /// After provisioning, write this many stored channel messages at
     /// current timestamps before any identity subscribes (volume seed).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, conflicts_with = "seed_days")]
     seed_events: u64,
+
+    /// The volume seed as days of history: the profile's stored events for
+    /// that many days (see `--check`'s `seed_90d` for the formula).
+    #[arg(long, default_value_t = 0)]
+    seed_days: u64,
 
     /// Stop the seed after this many seconds even if it is short of
     /// --seed-events.
@@ -118,22 +130,46 @@ struct Args {
     #[arg(long)]
     pause_after_setup: bool,
 
+    /// A ramp: provision this many identities in setup (a whole number of
+    /// the profile's teams: a human and their agents), and switch them on in
+    /// steps with `ramp <k>` band signals. The world (channels, repos) stays
+    /// the profile's, and every identity joins every channel.
+    #[arg(long, default_value_t = 0)]
+    ramp_max: u32,
+
+    /// With --ramp-max: how many identities are on before the first `ramp`
+    /// signal (default: the profile's population).
+    #[arg(long)]
+    ramp_start: Option<u32>,
+
     /// Exit after setup (provisioning and seed); no population run.
     #[arg(long)]
     setup_only: bool,
 }
 
-/// What provisioning cost, for the `setup-done` line.
+/// What provisioning cost, for the `setup-done` line, and the band signal,
+/// so a stop ends setup's waits.
 #[derive(Debug, Default)]
 struct SetupStats {
     events: u64,
     rate_limited: u64,
+    stop: Option<tokio::sync::watch::Receiver<sim::roles::Band>>,
 }
 
-/// One JSON phase line on stdout, flushed so the orchestrator sees it now.
-fn emit(line: &serde_json::Value) {
-    println!("{line}");
-    let _ = std::io::stdout().flush();
+impl SetupStats {
+    /// Sleeps `d`, or until the run stops: Err then.
+    async fn sleep(&mut self, d: Duration, what: &str) -> Result<()> {
+        match self.stop.as_mut() {
+            Some(stop) => tokio::select! {
+                _ = tokio::time::sleep(d) => Ok(()),
+                _ = sim::identity::until_stop(stop) => bail!("{what}: the run was stopped during setup"),
+            },
+            None => {
+                tokio::time::sleep(d).await;
+                Ok(())
+            }
+        }
+    }
 }
 
 fn unix_now() -> u64 {
@@ -141,69 +177,6 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Read band signals (and the one-shot `continue` after setup) from stdin or
-/// a fifo. Started before provisioning so `continue` is never missed.
-fn spawn_band_reader(
-    kind: &str,
-    out_dir: &std::path::Path,
-    tx: watch::Sender<Band>,
-    go: oneshot::Sender<()>,
-) -> Result<()> {
-    let fifo = if kind == "fifo" {
-        let path = out_dir.join("band.fifo");
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        let status = std::process::Command::new("mkfifo").arg(&path).status()?;
-        if !status.success() {
-            bail!("mkfifo {} failed", path.display());
-        }
-        Some(path)
-    } else {
-        None
-    };
-    std::thread::spawn(move || {
-        // Opening a fifo blocks until a writer appears; do it off the main task.
-        let source: Box<dyn BufRead + Send> = match fifo {
-            Some(path) => match std::fs::File::open(&path) {
-                Ok(file) => Box::new(std::io::BufReader::new(file)),
-                Err(e) => {
-                    eprintln!("tenant_sim: open {}: {e}", path.display());
-                    return;
-                }
-            },
-            None => Box::new(std::io::BufReader::new(std::io::stdin())),
-        };
-        let mut go = Some(go);
-        for line in source.lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if line == "continue" {
-                if let Some(go) = go.take() {
-                    let _ = go.send(());
-                }
-                continue;
-            }
-            let token = line.strip_prefix("band ").unwrap_or(line);
-            if let Some(band) = Band::parse(token) {
-                let _ = tx.send(band);
-                if band == Band::Stop {
-                    break;
-                }
-            } else {
-                eprintln!("tenant_sim: unknown band signal {line:?}");
-            }
-        }
-        // End of input with no `stop` (the orchestrator went away) stops the
-        // run too. Identities read the last value of the closed channel.
-        let _ = tx.send(Band::Stop);
-    });
-    Ok(())
 }
 
 /// The human who attests for an agent (NIP-OA), if any.
@@ -249,13 +222,15 @@ async fn send_with_retry(
                 waits += 1;
                 setup.rate_limited += 1;
                 last = anyhow::anyhow!("{what}: still rate-limited after {waits} waits");
-                tokio::time::sleep(retry_in).await;
+                setup.sleep(retry_in, what).await?;
             }
             Err(e) => {
                 last = anyhow::anyhow!("{what}: {e}");
                 warn!("{what} attempt {attempt}: {e}");
                 attempt += 1;
-                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                setup
+                    .sleep(Duration::from_millis(200 * attempt as u64), what)
+                    .await?;
                 match BuzzTestClient::connect(relay_url.as_str(), keys).await {
                     Ok(c) => *client = c,
                     Err(ce) => warn!("reconnect after {what}: {ce}"),
@@ -282,6 +257,177 @@ fn check_targets(args: &Args) -> Result<Targets> {
     })
 }
 
+/// Clones one setup repo for its agent. A missing credential helper or a
+/// clone that fails fails setup, like a refused channel create: a run with
+/// fewer repos than its profile isn't that profile's run.
+async fn clone_setup_repo(
+    helper: &std::path::Path,
+    http: &Target,
+    out_dir: Option<&std::path::Path>,
+    agent: &IdentityRecord,
+    name: &str,
+    auth_tag: Option<String>,
+) -> Result<RepoRef> {
+    if !helper.exists() {
+        bail!(
+            "git-credential helper {} missing; setup can't clone {name}",
+            helper.display()
+        );
+    }
+    let dest = out_dir
+        .map(|p| p.join("git").join(name))
+        .unwrap_or_else(|| PathBuf::from("git").join(name));
+    let repo = git::clone_repo_async(
+        http.clone(),
+        agent.pubkey.clone(),
+        name.to_string(),
+        dest,
+        helper.to_path_buf(),
+        agent.nsec.clone(),
+        auth_tag,
+    )
+    .await
+    .with_context(|| format!("git clone {name} failed"))?;
+    Ok(RepoRef {
+        name: repo.name.clone(),
+        owner_hex: repo.owner_hex.clone(),
+        owner_nsec: repo.owner_nsec.clone(),
+        a_tag: format!("30617:{}:{}", repo.owner_hex, repo.name),
+        clone_url: repo.url.clone(),
+        worktree: repo.worktree.clone(),
+    })
+}
+
+/// A ramp's shape: how many identities it provisions, how many are on at
+/// the start, and the population it draws them from.
+struct Ramp {
+    max: usize,
+    start: usize,
+}
+
+/// Checks --ramp-max and --ramp-start against the profile: the max a whole
+/// number of the profile's teams, at least the profile's population, and
+/// the start within it.
+fn check_ramp(profile: &Profile, args: &Args) -> Result<Option<Ramp>> {
+    if args.ramp_max == 0 {
+        if args.ramp_start.is_some() {
+            bail!("--ramp-start needs --ramp-max");
+        }
+        return Ok(None);
+    }
+    let team = 1 + profile.agents_per_human;
+    if !args.ramp_max.is_multiple_of(team) {
+        bail!(
+            "--ramp-max {} is not a whole number of teams of {team} (a human and {} agents)",
+            args.ramp_max,
+            profile.agents_per_human
+        );
+    }
+    if args.ramp_max < profile.identity_count() {
+        bail!(
+            "--ramp-max {} is under the profile's population, {}",
+            args.ramp_max,
+            profile.identity_count()
+        );
+    }
+    let start = args.ramp_start.unwrap_or(profile.identity_count());
+    if start == 0 || start > args.ramp_max {
+        bail!(
+            "--ramp-start {start} is not 1 to --ramp-max {}",
+            args.ramp_max
+        );
+    }
+    Ok(Some(Ramp {
+        max: args.ramp_max as usize,
+        start: start as usize,
+    }))
+}
+
+/// The ramp's population: the profile's, with as many teams as --ramp-max
+/// holds. Humans' keys come before agents' from one stream, so a ramp's
+/// population is generated whole, at its maximum, never grown.
+fn ramp_profile(profile: &Profile, ramp: &Ramp) -> Profile {
+    let mut p = profile.clone();
+    p.humans = (ramp.max as u32) / (1 + profile.agents_per_human);
+    p
+}
+
+/// Where each identity sits in the ramp's order: team by team, a human
+/// then their agents, so every step of whole teams keeps the profile's mix
+/// and every agent's owner is on before it.
+fn ramp_index(role: Role, i: usize, agents_per_human: usize) -> usize {
+    let team = 1 + agents_per_human;
+    match role {
+        Role::Human => i * team,
+        Role::Agent => (i / agents_per_human.max(1)) * team + 1 + i % agents_per_human.max(1),
+    }
+}
+
+/// Linux: the open-file limit must hold a ramp's sockets (a websocket, the
+/// HTTP pool, git) or joiners fail on the generator's side and look like
+/// the relay refusing them. Elsewhere there is no /proc to read; the local
+/// proofs ramp small.
+fn check_open_files(ramp: &Ramp) -> Result<()> {
+    check_open_files_in(
+        std::fs::read_to_string("/proc/self/limits").ok().as_deref(),
+        ramp,
+    )
+}
+
+/// [`check_open_files`] on the text of /proc/self/limits, if there is one.
+fn check_open_files_in(limits: Option<&str>, ramp: &Ramp) -> Result<()> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    let need = ramp.max as u64 * 4 + 256;
+    for line in limits.lines() {
+        if let Some(rest) = line.strip_prefix("Max open files") {
+            let soft = rest.split_whitespace().next().unwrap_or("");
+            if soft == "unlimited" {
+                return Ok(());
+            }
+            let soft: u64 = soft
+                .parse()
+                .map_err(|_| anyhow::anyhow!("/proc/self/limits: open files {soft:?}"))?;
+            if soft < need {
+                bail!(
+                    "the open-file limit is {soft}; a ramp to {} identities needs at least {need} (raise LimitNOFILE)",
+                    ramp.max
+                );
+            }
+            return Ok(());
+        }
+    }
+    bail!("/proc/self/limits has no open-file limit")
+}
+
+/// A run stopped (a `stop`, or a lease that ran out) before its population
+/// was measured: the last live.json says why, and the exit is 0, or 5 for
+/// a lease.
+fn stopped_early(
+    control: &signal::Control,
+    stats: &Stats,
+    live_task: &tokio::task::JoinHandle<()>,
+    live_path: &std::path::Path,
+) -> Result<i32> {
+    live_task.abort();
+    let ended = control.ended().unwrap_or(Ended::Stop);
+    let mut last = stats.live(unix_now());
+    last.ended = Some(ended.as_str().to_string());
+    write_live(live_path, &last)?;
+    Ok(if ended == Ended::Lease { 5 } else { 0 })
+}
+
+/// How many events the volume seed writes: `--seed-days` of the profile's
+/// history, or `--seed-events` exactly.
+fn seed_count(profile: &Profile, args: &Args) -> u64 {
+    if args.seed_days > 0 {
+        profile.seed_plan(args.seed_days).events
+    } else {
+        args.seed_events
+    }
+}
+
 async fn provision(
     profile: &Profile,
     pop: &Population,
@@ -306,8 +452,10 @@ async fn provision(
                 setup,
             )
             .await?;
+            // An identity the relay didn't admit isn't in the population a
+            // run measures: setup fails, as for a refused channel create.
             if !ok.accepted {
-                warn!("9030 {} rejected: {}", rec.name, ok.message);
+                bail!("9030 {} rejected: {}", rec.name, ok.message);
             }
         }
     }
@@ -344,7 +492,9 @@ async fn provision(
     for rec in pop.humans.iter().chain(pop.agents.iter()) {
         for ch in &channels {
             let ev = kinds::member_add(&owner_keys, &profile.kinds, ch, &rec.pubkey)?;
-            match send_with_retry(
+            // Every identity joins every channel: a join the relay refused,
+            // or one that failed after its retries, fails setup.
+            let ok = send_with_retry(
                 &mut owner,
                 &owner_keys,
                 &targets.relay,
@@ -352,13 +502,9 @@ async fn provision(
                 &format!("9000 {} {ch}", rec.name),
                 setup,
             )
-            .await
-            {
-                Ok(ok) if !ok.accepted => {
-                    warn!("9000 {} {} rejected: {}", rec.name, ch, ok.message);
-                }
-                Ok(_) => {}
-                Err(e) => warn!("9000 {} {ch}: {e:#}", rec.name),
+            .await?;
+            if !ok.accepted {
+                bail!("9000 {} {ch} rejected: {}", rec.name, ok.message);
             }
         }
     }
@@ -384,41 +530,17 @@ async fn provision(
             }
             let _ = agent_client.disconnect().await;
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if helper.exists() {
-                let dest = args
-                    .out_dir
-                    .as_ref()
-                    .map(|p| p.join("git").join(&name))
-                    .unwrap_or_else(|| PathBuf::from("git").join(&name));
-                match git::clone_repo_async(
-                    targets.http.clone(),
-                    agent.pubkey.clone(),
-                    name.clone(),
-                    dest,
-                    helper.clone(),
-                    agent.nsec.clone(),
-                    auth_tag.clone(),
+            repos.push(
+                clone_setup_repo(
+                    helper,
+                    &targets.http,
+                    args.out_dir.as_deref(),
+                    agent,
+                    &name,
+                    auth_tag,
                 )
-                .await
-                {
-                    Ok(repo) => {
-                        repos.push(RepoRef {
-                            name: repo.name.clone(),
-                            owner_hex: repo.owner_hex.clone(),
-                            owner_nsec: repo.owner_nsec.clone(),
-                            a_tag: format!("30617:{}:{}", repo.owner_hex, repo.name),
-                            clone_url: repo.url.clone(),
-                            worktree: repo.worktree.clone(),
-                        });
-                    }
-                    Err(e) => warn!("git clone {name}: {e}"),
-                }
-            } else {
-                warn!(
-                    "git-credential helper {} missing; skipping clone",
-                    helper.display()
-                );
-            }
+                .await?,
+            );
         }
     }
     let _ = owner.disconnect().await;
@@ -453,6 +575,7 @@ async fn run(args: Args) -> Result<i32> {
                     "cooldown": profile.bands.cooldown,
                 },
                 "event_budget_per_identity": budget,
+                "seed_90d": profile.seed_plan(90),
             })
         );
         return Ok(0);
@@ -467,16 +590,26 @@ async fn run(args: Args) -> Result<i32> {
         .ok_or_else(|| anyhow::anyhow!("--out-dir is required for a run"))?;
     std::fs::create_dir_all(&out_dir)?;
 
+    let ramp = check_ramp(&profile, &args)?;
+    if let Some(r) = &ramp {
+        check_open_files(r)?;
+    }
     let pop = if let Some(path) = &args.identities {
         load_population(path)?
+    } else if let Some(r) = &ramp {
+        generate_population(&ramp_profile(&profile, r))
     } else {
         generate_population(&profile)
     };
     save_population(&out_dir.join("identities.json"), &pop)?;
 
-    let (band_tx, band_rx) = watch::channel(Band::Warmup);
-    let (go_tx, go_rx) = oneshot::channel();
-    spawn_band_reader(&args.band_signal, &out_dir, band_tx, go_tx)?;
+    sim::phase::set_file(out_dir.join("phases.jsonl"))?;
+    let mut control = signal::spawn(
+        &args.band_signal,
+        &out_dir,
+        ramp.as_ref().map_or(usize::MAX, |r| r.start),
+    )?;
+    let band_rx = control.band.clone();
 
     let stats = Arc::new(Stats::new());
     // The live counters (<out-dir>/live.json), rewritten every LIVE_EVERY,
@@ -487,28 +620,39 @@ async fn run(args: Args) -> Result<i32> {
     write_live(&live_path, &stats.live(unix_now()))?;
     let live_task = spawn_live_writer(stats.clone(), live_path.clone(), LIVE_EVERY);
     let setup_started = Instant::now();
-    let mut setup = SetupStats::default();
+    let mut setup = SetupStats {
+        stop: Some(control.band.clone()),
+        ..SetupStats::default()
+    };
     let (channels, repos) =
         match provision(&profile, &pop, &args, &targets, &stats, &mut setup).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("warm-up failed: {e:#}");
                 warn!("warm-up failed: {e:#}");
+                emit(&serde_json::json!({"phase": "setup-failed", "why": format!("{e:#}")}));
                 return Ok(3);
             }
         };
     let provision_s = setup_started.elapsed().as_secs_f64();
 
     let mut seed_failed = false;
-    if args.seed_events > 0 {
-        emit(&serde_json::json!({"phase": "seed-start", "t_unix_ms": kinds::now_ms()}));
+    let seed_events = seed_count(&profile, &args);
+    if seed_events > 0 {
+        emit(&serde_json::json!({
+            "phase": "seed-start",
+            "t_unix_ms": kinds::now_ms(),
+            "events": seed_events,
+            "days": args.seed_days,
+        }));
         let report = seed::seed(
             &targets.relay,
             &pop,
             &profile.kinds,
             &channels,
-            args.seed_events,
+            seed_events,
             Duration::from_secs(args.seed_max_seconds),
+            control.band.clone(),
         )
         .await?;
         seed_failed = report.rejected > 0 || report.errors > 0;
@@ -529,9 +673,35 @@ async fn run(args: Args) -> Result<i32> {
     if args.setup_only {
         return Ok(if seed_failed { 1 } else { 0 });
     }
-    if args.pause_after_setup && go_rx.await.is_err() {
-        eprintln!("band signal closed before continue");
-        return Ok(3);
+    if args.pause_after_setup {
+        let within = Duration::from_secs(args.continue_within_s);
+        let go = control
+            .go
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("continue taken twice"))?;
+        // A stop (or a lease that runs out) while setup waits for continue
+        // ends the run there: nobody connected, nothing to measure.
+        let mut stop = control.band.clone();
+        let waited = tokio::select! {
+            r = timeout(within, go) => r,
+            _ = sim::identity::until_stop(&mut stop) => {
+                return stopped_early(&control, &stats, &live_task, &live_path);
+            }
+        };
+        match waited {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                eprintln!("band signal closed before continue");
+                return Ok(3);
+            }
+            Err(_) => {
+                eprintln!(
+                    "no continue within {} s after setup; the driver is gone",
+                    within.as_secs()
+                );
+                return Ok(3);
+            }
+        }
     }
 
     let world = Arc::new(World {
@@ -546,12 +716,23 @@ async fn run(args: Args) -> Result<i32> {
     });
 
     let profile = Arc::new(profile);
-    let expected = profile.identity_count() as usize;
-    let (ready_tx, mut ready_rx) = mpsc::channel::<Result<(), String>>(expected);
+    let expected = ramp
+        .as_ref()
+        .map_or(profile.identity_count() as usize, |r| r.start);
+    let everyone = pop.humans.len() + pop.agents.len();
+    let (ready_tx, mut ready_rx) = mpsc::channel::<Result<(), String>>(everyone.max(1));
+    let aph = profile.agents_per_human as usize;
+    let slot = |role: Role, i: usize| {
+        ramp.as_ref().map(|_| sim::identity::RampSlot {
+            on: control.ramp.clone(),
+            index: ramp_index(role, i, aph),
+        })
+    };
     let mut tasks = Vec::new();
     let mut salt = 10u32;
-    for rec in pop.humans.iter().cloned() {
+    for (i, rec) in pop.humans.iter().cloned().enumerate() {
         salt += 1;
+        let slot = slot(Role::Human, i);
         let keys = pop.keys_of(&rec)?;
         let profile = profile.clone();
         let world = world.clone();
@@ -571,12 +752,14 @@ async fn run(args: Args) -> Result<i32> {
                 None,
                 salt,
                 ready_tx,
+                slot,
             )
             .await
         }));
     }
-    for rec in pop.agents.iter().cloned() {
+    for (i, rec) in pop.agents.iter().cloned().enumerate() {
         salt += 1;
+        let slot = slot(Role::Agent, i);
         let keys = pop.keys_of(&rec)?;
         let owner_keys = owner_of(&pop, &rec);
         let auth_tag = owner_keys
@@ -613,6 +796,7 @@ async fn run(args: Args) -> Result<i32> {
                 git_repo,
                 salt,
                 ready_tx,
+                slot,
             )
             .await
         }));
@@ -620,10 +804,14 @@ async fn run(args: Args) -> Result<i32> {
     drop(ready_tx);
 
     let mut ready = 0usize;
+    let mut stop = control.band.clone();
     let wait = timeout(Duration::from_secs(180), async {
         while ready < expected {
             match ready_rx.recv().await {
-                Some(Ok(())) => ready += 1,
+                Some(Ok(())) => {
+                    ready += 1;
+                    stats.record_joined();
+                }
                 Some(Err(e)) => return Err(e),
                 None => {
                     return Err(format!(
@@ -633,8 +821,17 @@ async fn run(args: Args) -> Result<i32> {
             }
         }
         Ok(())
-    })
-    .await;
+    });
+    // A stop while the population connects ends the run there too.
+    let wait = tokio::select! {
+        w = wait => w,
+        _ = sim::identity::until_stop(&mut stop) => {
+            for t in &tasks {
+                t.abort();
+            }
+            return stopped_early(&control, &stats, &live_task, &live_path);
+        }
+    };
     match wait {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -649,7 +846,28 @@ async fn run(args: Args) -> Result<i32> {
         }
     }
 
-    emit(&serde_json::json!({"phase": "ready", "identities": expected}));
+    emit(&serde_json::json!({
+        "phase": "ready",
+        "identities": expected,
+        "ramp_max": ramp.as_ref().map(|r| r.max),
+    }));
+    // Ramp joiners, later: each one that connects counts as joined; one that
+    // can't is a join the relay failed (the generator's own limits are
+    // checked above).
+    {
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            while let Some(r) = ready_rx.recv().await {
+                match r {
+                    Ok(()) => stats.record_joined(),
+                    Err(e) => {
+                        warn!("ramp join: {e}");
+                        stats.record_client_error("join_failed");
+                    }
+                }
+            }
+        });
+    }
 
     let mut join_err = false;
     for t in tasks {
@@ -667,7 +885,12 @@ async fn run(args: Args) -> Result<i32> {
     }
 
     live_task.abort();
-    write_live(&live_path, &stats.live(unix_now()))?;
+    // The last write says why the run ended, so a sampler never reads it
+    // as stale.
+    let ended = control.ended().unwrap_or(Ended::Eof);
+    let mut last = stats.live(unix_now());
+    last.ended = Some(ended.as_str().to_string());
+    write_live(&live_path, &last)?;
     let mut ends = HashMap::new();
     ends.insert("floor".into(), unix_now());
     ends.insert("steady".into(), unix_now());
@@ -685,7 +908,9 @@ async fn run(args: Args) -> Result<i32> {
     println!("{json}");
 
     let rejected: u64 = summary.bands.values().map(|b| b.rejected).sum();
-    if summary.lost_after_backfill > 0 {
+    if ended == Ended::Lease {
+        Ok(5)
+    } else if summary.lost_after_backfill > 0 {
         Ok(2)
     } else if join_err || rejected > 0 || summary.media.rejected > 0 || summary.git.failed > 0 {
         Ok(1)
@@ -720,6 +945,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn shipped_profile() -> Profile {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -879,6 +1105,694 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    /// A setup clone that can't happen fails setup with its own line,
+    /// never a warning and a smaller world: a missing credential helper
+    /// before any git runs, and a clone the remote refuses.
+    #[tokio::test]
+    async fn a_failed_setup_clone_fails_setup() {
+        use sim::guard::testsrv::{self, Server};
+        use sim::guard::{Cidr, TargetGuard};
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let guard = TargetGuard::new(vec![Cidr::parse("127.0.0.0/8").expect("allow")], vec![])
+            .expect("guard");
+        let http = guard
+            .check_url(&refusing.http(), &["http"])
+            .expect("allowed");
+        let pop = generate_population(&shipped_profile());
+        let agent = &pop.agents[0];
+        let dir = testsrv::tempdir();
+
+        let missing = dir.join("no-such-helper");
+        let err = clone_setup_repo(&missing, &http, Some(&dir), agent, "sim-repo-0", None)
+            .await
+            .map(|_| ())
+            .expect_err("no helper");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "git-credential helper {} missing; setup can't clone sim-repo-0",
+                missing.display()
+            )
+        );
+        assert_eq!(refusing.accepts(), 0, "git ran without a helper");
+
+        let err = clone_setup_repo(
+            std::path::Path::new("/usr/bin/true"),
+            &http,
+            Some(&dir),
+            agent,
+            "sim-repo-0",
+            None,
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a refused clone");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("git clone sim-repo-0 failed: "), "{msg}");
+        assert!(
+            refusing.accepts() >= 1,
+            "git never reached the remote: {msg}"
+        );
+    }
+
+    /// The 90-day seed of each shipped profile, from the formula --check
+    /// prints: the steady band's stored rates times its duty cycle, over 8
+    /// hours a day, 5 days a week. --seed-days gives the same count, and it
+    /// can't be given with --seed-events.
+    #[test]
+    fn the_90_day_seed_of_each_profile() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../perf/profiles");
+        for (file, events) in [
+            ("1h-5a.toml", 49_469),
+            ("10h-20a.toml", 207_335),
+            ("25h-75a.toml", 757_803),
+        ] {
+            let path = dir.join(file);
+            let p = load_profile(&path).expect(file);
+            let plan = p.seed_plan(90);
+            assert_eq!(plan.events, events, "{file}: {plan:?}");
+            assert!(
+                (plan.hours - 514.2857).abs() < 1e-3,
+                "{file}: {}",
+                plan.hours
+            );
+            assert!(
+                (plan.per_human_hour - 23.5 * 90.0 / 690.0).abs() < 1e-9,
+                "{file}"
+            );
+            assert!((plan.per_agent_hour - 74.5 * 0.25).abs() < 1e-9, "{file}");
+            let args = Args::try_parse_from([
+                "tenant_sim",
+                "--profile",
+                &path.to_string_lossy(),
+                "--seed-days",
+                "90",
+            ])
+            .expect("args");
+            assert_eq!(seed_count(&p, &args), events, "{file}");
+        }
+        let both = Args::try_parse_from([
+            "tenant_sim",
+            "--profile",
+            "x.toml",
+            "--seed-days",
+            "90",
+            "--seed-events",
+            "5",
+        ]);
+        assert!(both.is_err(), "--seed-days with --seed-events");
+    }
+
+    /// A whole run on a fifo, against a relay that accepts everything. Its
+    /// phases go to phases.jsonl. A band whose lease runs out with no newer
+    /// signal ends the run on its own, exit 5, and the last live.json says
+    /// "lease"; a `stop` ends it with "stop". One test, so two runs never
+    /// share the phases file at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_on_a_fifo_ends_on_stop_or_when_its_lease_runs_out() {
+        use sim::admission::testrelay::accepting_relay;
+        let relay = accepting_relay().await;
+        let dir = sim::guard::testsrv::tempdir();
+        let solo =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../perf/profiles/1h-5a.toml");
+        let text = std::fs::read_to_string(&solo)
+            .expect("solo")
+            .replace("repos            = 1", "repos            = 0");
+        assert!(text.contains("repos            = 0"), "no repos: no clone");
+        let profile = dir.join("solo-no-repos.toml");
+        std::fs::write(&profile, text).expect("profile");
+        let deny = dir.join("deny");
+        std::fs::write(&deny, "").expect("deny");
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+        for (name, lines, want_code, want_ended) in [
+            ("lease", vec!["band floor 2"], 5, "lease"),
+            ("stop", vec!["band floor 60", "stop"], 0, "stop"),
+        ] {
+            let out = dir.join(name);
+            let args = Args::try_parse_from([
+                "tenant_sim".to_string(),
+                "--profile".into(),
+                profile.to_string_lossy().into_owned(),
+                "--relay-url".into(),
+                relay.clone(),
+                "--http-url".into(),
+                "http://127.0.0.1:1".into(),
+                "--allow-cidr".into(),
+                "127.0.0.0/8".into(),
+                "--deny-list".into(),
+                deny.to_string_lossy().into_owned(),
+                "--out-dir".into(),
+                out.to_string_lossy().into_owned(),
+                "--band-signal".into(),
+                "fifo".into(),
+                "--git-credential-helper".into(),
+                "/usr/bin/true".into(),
+            ])
+            .expect("args");
+            let task = tokio::spawn(run(args));
+            let phases = out.join("phases.jsonl");
+            let started = Instant::now();
+            while !read(&phases).contains("\"phase\":\"ready\"") {
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "{name}: never ready: {}",
+                    read(&phases)
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let fifo = out.join("band.fifo");
+            for l in lines {
+                let (fifo, l) = (fifo.clone(), l.to_string());
+                tokio::task::spawn_blocking(move || {
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fifo)
+                        .expect("open fifo");
+                    writeln!(f, "{l}").expect("write");
+                })
+                .await
+                .expect("writer");
+            }
+            let code = timeout(Duration::from_secs(60), task)
+                .await
+                .expect("the run ended")
+                .expect("join")
+                .expect("run");
+            assert_eq!(code, want_code, "{name}");
+            let live: serde_json::Value =
+                serde_json::from_str(&read(&out.join("live.json"))).expect("live.json");
+            assert_eq!(live["ended"], want_ended, "{name}");
+            let names: Vec<String> = read(&phases)
+                .lines()
+                .map(|l| {
+                    serde_json::from_str::<serde_json::Value>(l).expect("phase line")["phase"]
+                        .as_str()
+                        .expect("phase")
+                        .to_string()
+                })
+                .collect();
+            let want: &[&str] = if name == "lease" {
+                &["setup-done", "ready", "lease-ran-out"]
+            } else {
+                &["setup-done", "ready"]
+            };
+            assert_eq!(names, want, "{name}");
+        }
+
+        // A ramp: 3 teams provisioned, 1 on at the start, switched on by
+        // `ramp` signals, each joiner counted as it connects.
+        let out = dir.join("ramp");
+        let args = Args::try_parse_from([
+            "tenant_sim".to_string(),
+            "--profile".into(),
+            profile.to_string_lossy().into_owned(),
+            "--relay-url".into(),
+            relay.clone(),
+            "--http-url".into(),
+            "http://127.0.0.1:1".into(),
+            "--allow-cidr".into(),
+            "127.0.0.0/8".into(),
+            "--deny-list".into(),
+            deny.to_string_lossy().into_owned(),
+            "--out-dir".into(),
+            out.to_string_lossy().into_owned(),
+            "--band-signal".into(),
+            "fifo".into(),
+            "--git-credential-helper".into(),
+            "/usr/bin/true".into(),
+            "--ramp-max".into(),
+            "18".into(),
+            "--ramp-start".into(),
+            "6".into(),
+        ])
+        .expect("args");
+        let task = tokio::spawn(run(args));
+        let phases = out.join("phases.jsonl");
+        let started = Instant::now();
+        while !read(&phases).contains("\"phase\":\"ready\"") {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "ramp: never ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pop: serde_json::Value =
+            serde_json::from_str(&read(&out.join("identities.json"))).expect("identities");
+        assert_eq!(
+            (
+                pop["humans"].as_array().map(Vec::len),
+                pop["agents"].as_array().map(Vec::len)
+            ),
+            (Some(3), Some(15)),
+            "the whole ramp is provisioned"
+        );
+        let fifo = out.join("band.fifo");
+        let send = |l: &'static str| {
+            let fifo = fifo.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open fifo");
+                writeln!(f, "{l}").expect("write");
+            })
+        };
+        let joined = |out: &std::path::Path| {
+            serde_json::from_str::<serde_json::Value>(&read(&out.join("live.json")))
+                .ok()
+                .and_then(|v| v["joined"].as_u64())
+        };
+        // Only the start is on at first; live.json is rewritten every 2 s.
+        for (line, want) in [
+            (None, 6),
+            (Some("band steady 60"), 6),
+            (Some("ramp 12 60"), 12),
+            (Some("ramp 18 60"), 18),
+        ] {
+            if let Some(line) = line {
+                send(line).await.expect("writer");
+            }
+            let started = Instant::now();
+            while joined(&out) != Some(want) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "{line:?}: joined {:?}, not {want}",
+                    joined(&out)
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        send("stop").await.expect("writer");
+        let code = timeout(Duration::from_secs(60), task)
+            .await
+            .expect("the ramp ended")
+            .expect("join")
+            .expect("run");
+        let live: serde_json::Value =
+            serde_json::from_str(&read(&out.join("live.json"))).expect("live.json");
+        assert_eq!(
+            (code, live["ended"].as_str(), live["joined"].as_u64()),
+            (0, Some("stop"), Some(18))
+        );
+
+        // A setup clone that can't happen fails setup: exit 3, before
+        // setup-done, with the clone's own line. The solo profile has one
+        // repo; the git server refuses it, or the credential helper is
+        // missing (then no git runs).
+        let refusing =
+            sim::guard::testsrv::Server::start("127.0.0.1:0", sim::guard::testsrv::status(404, ""));
+        for (name, helper, reached) in [
+            ("clone-refused", "/usr/bin/true".to_string(), true),
+            (
+                "clone-no-helper",
+                dir.join("no-such-helper").to_string_lossy().into_owned(),
+                false,
+            ),
+        ] {
+            let before = refusing.accepts();
+            let out = dir.join(name);
+            let args = Args::try_parse_from([
+                "tenant_sim".to_string(),
+                "--profile".into(),
+                solo.to_string_lossy().into_owned(),
+                "--relay-url".into(),
+                relay.clone(),
+                "--http-url".into(),
+                refusing.http(),
+                "--allow-cidr".into(),
+                "127.0.0.0/8".into(),
+                "--deny-list".into(),
+                deny.to_string_lossy().into_owned(),
+                "--out-dir".into(),
+                out.to_string_lossy().into_owned(),
+                "--band-signal".into(),
+                "fifo".into(),
+                "--git-credential-helper".into(),
+                helper,
+            ])
+            .expect("args");
+            let task = tokio::spawn(run(args));
+            let code = match timeout(Duration::from_secs(60), task).await {
+                Ok(joined) => joined.expect("join").expect("run"),
+                Err(_) => panic!("{name}: the run went on past a failed setup clone"),
+            };
+            assert_eq!(code, 3, "{name}");
+            assert!(
+                !read(&out.join("phases.jsonl")).contains("setup-done"),
+                "{name}: setup-done after a failed clone"
+            );
+            assert_eq!(
+                refusing.accepts() > before,
+                reached,
+                "{name}: git reached the server"
+            );
+        }
+
+        setup_membership_and_stops(&profile, &deny, &dir).await;
+    }
+
+    /// The rest of the run-level rows, run in the same test as the ones
+    /// above so no two runs share the phases file at once.
+    async fn setup_membership_and_stops(
+        profile: &std::path::Path,
+        deny: &std::path::Path,
+        dir: &std::path::Path,
+    ) {
+        use sim::admission::testrelay::{relay_with, Answer};
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+        let phases_of = |out: &std::path::Path| -> Vec<serde_json::Value> {
+            read(&out.join("phases.jsonl"))
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("phase line"))
+                .collect()
+        };
+        let live_of = |out: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&read(&out.join("live.json"))).unwrap_or_default()
+        };
+        let start = |name: &str, relay: &str, extra: &[&str]| {
+            let out = dir.join(name);
+            let mut argv: Vec<String> = [
+                "tenant_sim",
+                "--profile",
+                &profile.to_string_lossy(),
+                "--relay-url",
+                relay,
+                "--http-url",
+                "http://127.0.0.1:1",
+                "--allow-cidr",
+                "127.0.0.0/8",
+                "--deny-list",
+                &deny.to_string_lossy(),
+                "--out-dir",
+                &out.to_string_lossy(),
+                "--band-signal",
+                "fifo",
+                "--git-credential-helper",
+                "/usr/bin/true",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            let args = Args::try_parse_from(argv).expect("args");
+            (tokio::spawn(run(args)), out)
+        };
+        let send = |out: &std::path::Path, line: &'static str| {
+            let fifo = out.join("band.fifo");
+            tokio::task::spawn_blocking(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open fifo");
+                writeln!(f, "{line}").expect("write");
+            })
+        };
+        async fn until(what: &str, within: Duration, mut ok: impl FnMut() -> bool) {
+            let started = Instant::now();
+            while !ok() {
+                assert!(started.elapsed() < within, "{what}: not within {within:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        async fn ends(
+            name: &str,
+            task: tokio::task::JoinHandle<Result<i32>>,
+            within: Duration,
+        ) -> i32 {
+            match timeout(within, task).await {
+                Ok(joined) => joined.expect("join").expect("run"),
+                Err(_) => panic!("{name}: the run didn't end within {within:?}"),
+            }
+        }
+
+        // HIGH 1: every relay-member (9030) and channel-member (9000) event
+        // must land, or setup fails: exit 3, its own line, no setup-done,
+        // nothing measured.
+        fn reject_9030(k: u64) -> Answer {
+            if k == 9030 {
+                Answer::Reject("blocked: test 9030")
+            } else {
+                Answer::Accept
+            }
+        }
+        fn reject_9000(k: u64) -> Answer {
+            if k == 9000 {
+                Answer::Reject("restricted: test 9000")
+            } else {
+                Answer::Accept
+            }
+        }
+        fn close_on_9000(k: u64) -> Answer {
+            if k == 9000 {
+                Answer::Close
+            } else {
+                Answer::Accept
+            }
+        }
+        // A row: its name, the relay's answers, and the line it fails setup
+        // with (whole, or as a start and an end around the channel id).
+        type Row = (&'static str, fn(u64) -> Answer, &'static str, &'static str);
+        let rows: [Row; 3] = [
+            ("member-9030-rejected", reject_9030, "9030 h0 rejected: blocked: test 9030", ""),
+            ("member-9000-rejected", reject_9000, "9000 h0 ", " rejected: restricted: test 9000"),
+            ("member-9000-closed", close_on_9000, "9000 h0 ", ": WebSocket error: WebSocket protocol error: Connection reset without closing handshake"),
+        ];
+        for (name, answer, starts, ends_with) in rows {
+            let relay = relay_with(answer).await;
+            let (task, out) = start(name, &relay.url, &[]);
+            let code = ends(name, task, Duration::from_secs(60)).await;
+            assert_eq!(code, 3, "{name}");
+            let phases = phases_of(&out);
+            let names: Vec<&str> = phases.iter().filter_map(|p| p["phase"].as_str()).collect();
+            assert_eq!(names, ["setup-failed"], "{name}: no setup-done, no ready");
+            let why = phases[0]["why"].as_str().expect("why");
+            if ends_with.is_empty() {
+                assert_eq!(why, starts, "{name}");
+            } else {
+                assert!(
+                    why.starts_with(starts) && why.ends_with(ends_with),
+                    "{name}: {why}"
+                );
+            }
+            assert_eq!(live_of(&out)["sent"], 0, "{name}: a band was measured");
+        }
+
+        // A stop while setup waits out a rate limit (the relay names 60 s)
+        // ends setup within seconds, with its own line.
+        fn rate_limit_9030(k: u64) -> Answer {
+            if k == 9030 {
+                Answer::RateLimit
+            } else {
+                Answer::Accept
+            }
+        }
+        let relay = relay_with(rate_limit_9030).await;
+        let (task, out) = start("setup-stopped", &relay.url, &[]);
+        until("setup-stopped: the fifo", Duration::from_secs(20), || {
+            out.join("band.fifo").exists()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        send(&out, "stop").await.expect("writer");
+        assert_eq!(
+            ends("setup-stopped", task, Duration::from_secs(15)).await,
+            3
+        );
+        let phases = phases_of(&out);
+        assert_eq!(
+            phases,
+            vec![
+                serde_json::json!({"phase": "setup-failed", "why": "9030 h0: the run was stopped during setup"})
+            ]
+        );
+
+        // HIGH 2: a relay that drops, then a lease that runs out with no
+        // newer signal: every identity stuck reconnecting stops, exit 5,
+        // and the last live.json says lease.
+        let relay = relay_with(|_| Answer::Accept).await;
+        let (task, out) = start("dropped-lease", &relay.url, &[]);
+        until("dropped-lease: ready", Duration::from_secs(60), || {
+            read(&out.join("phases.jsonl")).contains("\"ready\"")
+        })
+        .await;
+        send(&out, "band floor 4").await.expect("writer");
+        relay.kill();
+        assert_eq!(
+            ends("dropped-lease", task, Duration::from_secs(30)).await,
+            5
+        );
+        let live = live_of(&out);
+        assert_eq!(live["ended"], "lease");
+        assert!(
+            live["client_errors"]["reconnect_failed"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "the identities were reconnecting: {live}"
+        );
+
+        // The same, ended by a stop: exit 0, the last live.json says stop.
+        let relay = relay_with(|_| Answer::Accept).await;
+        let (task, out) = start("dropped-stop", &relay.url, &[]);
+        until("dropped-stop: ready", Duration::from_secs(60), || {
+            read(&out.join("phases.jsonl")).contains("\"ready\"")
+        })
+        .await;
+        send(&out, "band floor 600").await.expect("writer");
+        relay.kill();
+        until(
+            "dropped-stop: reconnecting",
+            Duration::from_secs(20),
+            || {
+                live_of(&out)["client_errors"]["reconnect_failed"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0
+            },
+        )
+        .await;
+        send(&out, "stop").await.expect("writer");
+        assert_eq!(ends("dropped-stop", task, Duration::from_secs(30)).await, 0);
+        assert_eq!(live_of(&out)["ended"], "stop");
+
+        // A stop while setup waits for continue ends the run there.
+        let relay = relay_with(|_| Answer::Accept).await;
+        let (task, out) = start("stop-before-continue", &relay.url, &["--pause-after-setup"]);
+        until(
+            "stop-before-continue: setup-done",
+            Duration::from_secs(60),
+            || read(&out.join("phases.jsonl")).contains("\"setup-done\""),
+        )
+        .await;
+        send(&out, "stop").await.expect("writer");
+        assert_eq!(
+            ends("stop-before-continue", task, Duration::from_secs(30)).await,
+            0
+        );
+        assert_eq!(live_of(&out)["ended"], "stop");
+        assert!(
+            !read(&out.join("phases.jsonl")).contains("\"ready\""),
+            "the population connected"
+        );
+    }
+
+    #[test]
+    fn a_ramps_shape_is_checked() {
+        let solo = load_profile(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../perf/profiles/1h-5a.toml"),
+        )
+        .expect("solo");
+        let args = |extra: &[&str]| {
+            let mut v = vec!["tenant_sim", "--profile", "x.toml"];
+            v.extend_from_slice(extra);
+            Args::try_parse_from(v).expect("args")
+        };
+        let err = |extra: &[&str]| {
+            check_ramp(&solo, &args(extra))
+                .map(|_| ())
+                .expect_err("refused")
+                .to_string()
+        };
+        assert!(check_ramp(&solo, &args(&[])).expect("none").is_none());
+        assert_eq!(
+            err(&["--ramp-max", "20"]),
+            "--ramp-max 20 is not a whole number of teams of 6 (a human and 5 agents)"
+        );
+        assert_eq!(
+            err(&["--ramp-max", "0", "--ramp-start", "6"]),
+            "--ramp-start needs --ramp-max"
+        );
+        let team = load_profile(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../perf/profiles/10h-20a.toml"),
+        )
+        .expect("team");
+        assert_eq!(
+            check_ramp(&team, &args(&["--ramp-max", "15"]))
+                .map(|_| ())
+                .expect_err("under")
+                .to_string(),
+            "--ramp-max 15 is under the profile's population, 30"
+        );
+        assert_eq!(
+            err(&["--ramp-max", "18", "--ramp-start", "0"]),
+            "--ramp-start 0 is not 1 to --ramp-max 18"
+        );
+        assert_eq!(
+            err(&["--ramp-max", "18", "--ramp-start", "19"]),
+            "--ramp-start 19 is not 1 to --ramp-max 18"
+        );
+        let r = check_ramp(&team, &args(&["--ramp-max", "660"]))
+            .expect("ok")
+            .expect("a ramp");
+        assert_eq!(
+            (r.max, r.start),
+            (660, 30),
+            "starts at the profile's population"
+        );
+        let p = ramp_profile(&team, &r);
+        assert_eq!(
+            (p.humans, p.agent_count(), p.identity_count()),
+            (220, 440, 660)
+        );
+        assert_eq!(
+            (p.channels, p.repos),
+            (team.channels, team.repos),
+            "the world stays the profile's"
+        );
+    }
+
+    /// Team by team: a human, then their agents; the first 15 are 5 teams.
+    #[test]
+    fn the_ramp_order() {
+        let order: Vec<(Role, usize, usize)> = (0..5)
+            .map(|i| (Role::Human, i, ramp_index(Role::Human, i, 2)))
+            .chain((0..10).map(|i| (Role::Agent, i, ramp_index(Role::Agent, i, 2))))
+            .collect();
+        let mut by_index: Vec<_> = order.iter().map(|(r, i, at)| (*at, *r, *i)).collect();
+        by_index.sort_by_key(|x| x.0);
+        let want: Vec<(usize, Role, usize)> = (0..5)
+            .flat_map(|t| {
+                [
+                    (3 * t, Role::Human, t),
+                    (3 * t + 1, Role::Agent, 2 * t),
+                    (3 * t + 2, Role::Agent, 2 * t + 1),
+                ]
+            })
+            .collect();
+        assert_eq!(by_index, want);
+    }
+
+    /// The open-file limit, from /proc/self/limits' text.
+    #[test]
+    fn the_open_file_limit_must_hold_the_ramp() {
+        let ramp = Ramp {
+            max: 660,
+            start: 30,
+        };
+        let limits = |soft: &str| {
+            format!("Limit                     Soft Limit           Hard Limit           Units\nMax cpu time              unlimited            unlimited            seconds\nMax open files            {soft:<21}524288               files\n")
+        };
+        assert_eq!(
+            check_open_files_in(Some(&limits("1024")), &ramp).map(|_| ()).expect_err("low").to_string(),
+            "the open-file limit is 1024; a ramp to 660 identities needs at least 2896 (raise LimitNOFILE)"
+        );
+        assert!(check_open_files_in(Some(&limits("65536")), &ramp).is_ok());
+        assert!(check_open_files_in(Some(&limits("unlimited")), &ramp).is_ok());
+        assert!(
+            check_open_files_in(None, &ramp).is_ok(),
+            "no /proc: not Linux"
+        );
+        assert_eq!(
+            check_open_files_in(Some("Max cpu time unlimited\n"), &ramp)
+                .map(|_| ())
+                .expect_err("none")
+                .to_string(),
+            "/proc/self/limits has no open-file limit"
+        );
     }
 
     #[test]

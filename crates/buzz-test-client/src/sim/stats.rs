@@ -32,6 +32,11 @@ pub fn percentiles(mut xs: Vec<f64>) -> Percentiles {
     }
 }
 
+/// The ack-time histogram's upper bounds, in ms. The service level is "95%
+/// of events acknowledged within 500 ms", so 500 is a bound: the share
+/// within it is exact, not interpolated.
+pub const ACK_MS_BOUNDS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BandClient {
     pub start_unix: u64,
@@ -39,11 +44,18 @@ pub struct BandClient {
     pub sent: u64,
     pub accepted: u64,
     pub rejected: u64,
+    /// Sends the relay's per-key rate limiter turned away (a NOTICE, no OK):
+    /// counted apart from `rejected`, neither a break nor the generator's
+    /// error.
+    pub rate_limited: u64,
     pub received: u64,
     /// Sends in this band by event kind; acceptance checks the floor with it.
     pub sent_by_kind: BTreeMap<String, u64>,
     pub ok_ms: Percentiles,
     pub fanout_ms: Percentiles,
+    /// Agent per-turn reads that the relay answered, and how long each took.
+    pub reads: u64,
+    pub read_ms: Percentiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storm_backfill_ms: Option<Percentiles>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +68,19 @@ pub struct MediaStats {
     pub bytes: u64,
     pub put_ms: Percentiles,
     pub rejected: u64,
+}
+
+/// Agent per-turn reads over the whole run.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReadStats {
+    pub reads: u64,
+    pub ms: Percentiles,
+    /// Reads by what they read (thread, profiles, memory, ...).
+    pub by_what: BTreeMap<String, u64>,
+    /// Turned away by the relay's per-key HTTP rate limit: apart.
+    pub rate_limited: u64,
+    /// Every failure, wherever it failed (see `live.json` for where).
+    pub failed: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -76,6 +101,7 @@ pub struct Summary {
     pub sent_by_kind: BTreeMap<String, u64>,
     pub media: MediaStats,
     pub git: GitStats,
+    pub reads: ReadStats,
     pub join_backfill_ms: Percentiles,
     pub gaps_detected: u64,
     pub lost_after_backfill: u64,
@@ -89,10 +115,13 @@ struct BandAcc {
     sent: u64,
     accepted: u64,
     rejected: u64,
+    rate_limited: u64,
     received: u64,
     sent_by_kind: BTreeMap<String, u64>,
     ok_ms: Vec<f64>,
     fanout_ms: Vec<f64>,
+    reads: u64,
+    read_ms: Vec<f64>,
     storm_backfill_ms: Vec<f64>,
     storm_events_returned: u64,
 }
@@ -113,6 +142,17 @@ struct Inner {
     git_failed: u64,
     git_failed_by: BTreeMap<GitFailure, u64>,
     git_push_ms: Vec<f64>,
+    /// Accepted sends by ack time, one count per bound in ACK_MS_BOUNDS
+    /// and one past the last; cumulative in live.json.
+    ack_ms_buckets: [u64; ACK_MS_BOUNDS.len() + 1],
+    /// Identities connected and subscribed: the population, then each ramp
+    /// joiner.
+    joined: u64,
+    reads: u64,
+    read_ms: Vec<f64>,
+    reads_by_what: BTreeMap<String, u64>,
+    reads_rate_limited: u64,
+    read_failed_by: BTreeMap<ReadFailure, u64>,
     gaps_detected: u64,
     lost_after_backfill: u64,
     blink_closes: Vec<u64>,
@@ -129,6 +169,18 @@ pub enum MediaFailure {
     /// Before the request went out: encoding the image or signing the auth.
     Client,
     /// The relay answered, but not with a 2xx.
+    Refused,
+    /// No answer: a transport error or a timeout.
+    Unanswered,
+}
+
+/// Where an agent's read failed. Only `Client` is the generator's own
+/// failure; the other two are the relay's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadFailure {
+    /// Before the request went out: building or signing it.
+    Client,
+    /// The relay answered, but not with a 2xx and JSON.
     Refused,
     /// No answer: a transport error or a timeout.
     Unanswered,
@@ -154,6 +206,9 @@ pub struct Live {
     pub sent: u64,
     pub accepted: u64,
     pub rejected: u64,
+    /// Sends the relay's per-key rate limiter turned away, apart from
+    /// `rejected`.
+    pub rate_limited: u64,
     pub received: u64,
     /// The generator's own failures, by kind: `send_failed` (no answer to a
     /// send), `recv_error`, `reconnect_failed`, `backfill_failed`, and
@@ -167,6 +222,25 @@ pub struct Live {
     pub media_unanswered: u64,
     pub git_local_failed: u64,
     pub git_push_failed: u64,
+    /// Agent per-turn reads that failed, by where (see [`ReadFailure`]):
+    /// only `read_client_failed` is the generator's own. Reads the relay's
+    /// per-key rate limit turned away are apart, in `read_rate_limited`.
+    pub read_client_failed: u64,
+    pub read_refused: u64,
+    pub read_unanswered: u64,
+    pub read_rate_limited: u64,
+    /// Accepted sends (in sampled bands) acknowledged within each bound,
+    /// in ms, cumulative like a Prometheus histogram: `"500": n` is every
+    /// ack within 500 ms; `"+Inf"` is every ack.
+    pub ack_ms_le: BTreeMap<String, u64>,
+    /// Events found lost after a recheck, at a band's end or a ramp step.
+    pub lost: u64,
+    /// Identities connected and subscribed so far.
+    pub joined: u64,
+    /// On the last write only: why the run ended (`stop`, `lease` or
+    /// `eof`). A file that has it is final, never stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
 }
 
 /// Writes `live` to `path` whole: a temp file beside it, then a rename, so a
@@ -241,10 +315,31 @@ impl Stats {
             if accepted {
                 b.accepted += 1;
                 b.ok_ms.push(ok_ms);
+                let i = ACK_MS_BOUNDS
+                    .iter()
+                    .position(|&le| ok_ms <= le as f64)
+                    .unwrap_or(ACK_MS_BOUNDS.len());
+                s.ack_ms_buckets[i] += 1;
             } else {
                 b.rejected += 1;
                 *s.rejects_by_message.entry(message.to_string()).or_default() += 1;
             }
+        });
+    }
+
+    /// A send the relay's per-key rate limiter turned away.
+    /// An identity connected and subscribed.
+    pub fn record_joined(&self) {
+        self.with(|s| s.joined += 1);
+    }
+
+    pub fn record_rate_limited(&self, band: &str, kind: u16) {
+        self.with(|s| {
+            *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            let b = s.bands.entry(band.to_string()).or_default();
+            b.sent += 1;
+            b.rate_limited += 1;
+            *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
         });
     }
 
@@ -295,6 +390,29 @@ impl Stats {
         });
     }
 
+    /// An agent's read the relay answered, in `band` (unsampled bands count
+    /// in the run's totals only).
+    pub fn record_read(&self, band: Option<&str>, what: &str, ms: f64) {
+        self.with(|s| {
+            s.reads += 1;
+            s.read_ms.push(ms);
+            *s.reads_by_what.entry(what.to_string()).or_default() += 1;
+            if let Some(band) = band {
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.reads += 1;
+                b.read_ms.push(ms);
+            }
+        });
+    }
+
+    pub fn record_read_failed(&self, why: ReadFailure) {
+        self.with(|s| *s.read_failed_by.entry(why).or_default() += 1);
+    }
+
+    pub fn record_read_rate_limited(&self) {
+        self.with(|s| s.reads_rate_limited += 1);
+    }
+
     pub fn record_git(&self, bytes: u64, push_ms: f64) {
         self.with(|s| {
             s.git_pushes += 1;
@@ -332,11 +450,13 @@ impl Stats {
     /// The live counters, stamped `t_unix`.
     pub fn live(&self, t_unix: u64) -> Live {
         self.with(|s| {
-            let (mut sent, mut accepted, mut rejected, mut received) = (0, 0, 0, 0);
+            let (mut sent, mut accepted, mut rejected, mut rate_limited, mut received) =
+                (0, 0, 0, 0, 0);
             for b in s.bands.values() {
                 sent += b.sent;
                 accepted += b.accepted;
                 rejected += b.rejected;
+                rate_limited += b.rate_limited;
                 received += b.received;
             }
             Live {
@@ -344,6 +464,7 @@ impl Stats {
                 sent,
                 accepted,
                 rejected,
+                rate_limited,
                 received,
                 client_errors: s.client_errors.clone(),
                 media_client_failed: count(&s.media_failed_by, MediaFailure::Client),
@@ -351,6 +472,25 @@ impl Stats {
                 media_unanswered: count(&s.media_failed_by, MediaFailure::Unanswered),
                 git_local_failed: count(&s.git_failed_by, GitFailure::Local),
                 git_push_failed: count(&s.git_failed_by, GitFailure::Push),
+                read_client_failed: count(&s.read_failed_by, ReadFailure::Client),
+                read_refused: count(&s.read_failed_by, ReadFailure::Refused),
+                read_unanswered: count(&s.read_failed_by, ReadFailure::Unanswered),
+                read_rate_limited: s.reads_rate_limited,
+                ack_ms_le: {
+                    let mut out = BTreeMap::new();
+                    let mut total = 0;
+                    for (i, n) in s.ack_ms_buckets.iter().enumerate() {
+                        total += n;
+                        let key = ACK_MS_BOUNDS
+                            .get(i)
+                            .map_or_else(|| "+Inf".to_string(), |b| b.to_string());
+                        out.insert(key, total);
+                    }
+                    out
+                },
+                lost: s.lost_after_backfill,
+                joined: s.joined,
+                ended: None,
             }
         })
     }
@@ -373,10 +513,13 @@ impl Stats {
                     sent: acc.sent,
                     accepted: acc.accepted,
                     rejected: acc.rejected,
+                    rate_limited: acc.rate_limited,
                     received: acc.received,
                     sent_by_kind: acc.sent_by_kind.clone(),
                     ok_ms: percentiles(acc.ok_ms.clone()),
                     fanout_ms: percentiles(acc.fanout_ms.clone()),
+                    reads: acc.reads,
+                    read_ms: percentiles(acc.read_ms.clone()),
                     storm_backfill_ms: None,
                     storm_events_returned: None,
                 };
@@ -408,6 +551,13 @@ impl Stats {
                     push_ms: percentiles(s.git_push_ms.clone()),
                     failed: s.git_failed,
                 },
+                reads: ReadStats {
+                    reads: s.reads,
+                    ms: percentiles(s.read_ms.clone()),
+                    by_what: s.reads_by_what.clone(),
+                    rate_limited: s.reads_rate_limited,
+                    failed: s.read_failed_by.values().sum(),
+                },
                 join_backfill_ms: percentiles(s.join_backfill_ms.clone()),
                 gaps_detected: s.gaps_detected,
                 lost_after_backfill: s.lost_after_backfill,
@@ -431,6 +581,68 @@ impl Stats {
 
 #[cfg(test)]
 mod tests {
+    /// The fields live.json holds, typed out here and in the sampler's row
+    /// test_the_loop_reads_what_tenant_sim_writes: the loop requires every
+    /// total, so a field renamed on one side fails both.
+    #[test]
+    fn live_json_holds_the_fields_the_sampler_reads() {
+        let v = serde_json::to_value(super::Stats::new().live(1)).expect("json");
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut want = vec![
+            "t_unix",
+            "sent",
+            "accepted",
+            "rejected",
+            "rate_limited",
+            "received",
+            "client_errors",
+            "media_client_failed",
+            "media_refused",
+            "media_unanswered",
+            "git_local_failed",
+            "git_push_failed",
+            "read_client_failed",
+            "read_refused",
+            "read_unanswered",
+            "read_rate_limited",
+            "ack_ms_le",
+            "lost",
+            "joined",
+        ];
+        want.sort_unstable();
+        assert_eq!(keys, want, "\"ended\" is only on the last write");
+    }
+
+    /// The ack histogram is cumulative, and 500 ms is one of its bounds.
+    #[test]
+    fn the_ack_histogram() {
+        let s = super::Stats::new();
+        for ms in [3.0, 500.0, 500.5, 20_000.0] {
+            s.record_send("steady", 9, true, "", ms);
+        }
+        s.record_send("steady", 9, false, "blocked", 1.0);
+        let le = s.live(1).ack_ms_le;
+        let at = |k: &str| le[k];
+        assert_eq!(
+            (
+                at("10"),
+                at("250"),
+                at("500"),
+                at("1000"),
+                at("10000"),
+                at("+Inf")
+            ),
+            (1, 1, 2, 3, 3, 4)
+        );
+        assert_eq!(le.len(), super::ACK_MS_BOUNDS.len() + 1);
+    }
+
     use super::*;
 
     #[test]
