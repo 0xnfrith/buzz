@@ -271,6 +271,9 @@ async fn subscribe_all(
             .collect_until_eose(&sid, Duration::from_secs(12))
             .await;
         let eose_ok = eose_result.is_ok();
+        if !eose_ok {
+            stats.record_client_error("backfill_failed");
+        }
         let n = apply_eose(identity, ch, eose, eose_result)?;
         returned += n;
         if record_join && eose_ok {
@@ -279,14 +282,13 @@ async fn subscribe_all(
     }
     let sid = format!("{identity}-p");
     client.subscribe(&sid, vec![filter_p(pubkey)]).await?;
-    apply_eose(
-        identity,
-        "#p",
-        eose,
-        client
-            .collect_until_eose(&sid, Duration::from_secs(8))
-            .await,
-    )?;
+    let p_result = client
+        .collect_until_eose(&sid, Duration::from_secs(8))
+        .await;
+    if p_result.is_err() {
+        stats.record_client_error("backfill_failed");
+    }
+    apply_eose(identity, "#p", eose, p_result)?;
     Ok(returned)
 }
 
@@ -415,6 +417,7 @@ impl Session {
                     self.stats
                         .record_send(band.as_str(), kind, false, &e.to_string(), 0.0);
                 }
+                self.stats.record_client_error("send_failed");
                 warn!("{} kind {kind} send failed: {e}", self.rec.name);
                 false
             }
@@ -670,6 +673,7 @@ impl Session {
                     return Ok(client);
                 }
                 Err(e) => {
+                    self.stats.record_client_error("reconnect_failed");
                     warn!("{} reconnect failed: {e}", self.rec.name);
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(cap);
@@ -855,6 +859,7 @@ pub async fn run_identity(
                         )
                         .await?;
                 } else if is_closed {
+                    sess.stats.record_client_error("connection_dropped");
                     warn!("{} connection dropped: {s}", sess.rec.name);
                     client = sess
                         .reconnect(
@@ -866,6 +871,7 @@ pub async fn run_identity(
                         )
                         .await?;
                 } else {
+                    sess.stats.record_client_error("recv_error");
                     warn!("{} recv: {s}", sess.rec.name);
                 }
             }

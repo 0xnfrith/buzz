@@ -1,6 +1,7 @@
 //! Client-side counters, percentiles, and the summary JSON schema.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -113,6 +114,40 @@ struct Inner {
     lost_after_backfill: u64,
     blink_closes: Vec<u64>,
     blink: Option<serde_json::Value>,
+    /// The generator's own failures, by kind, as opposed to the relay's
+    /// rejections (which `record_send` counts as `rejected`).
+    client_errors: BTreeMap<String, u64>,
+}
+
+/// The live counters `tenant_sim` rewrites into `<out-dir>/live.json` while
+/// it runs, so a sampler can watch the generator's own health during a band
+/// instead of only after the run. Counts are totals since the start.
+#[derive(Clone, Debug, Serialize)]
+pub struct Live {
+    pub t_unix: u64,
+    /// Sends, accepted and rejected by the relay, and events received,
+    /// summed over the sampled bands.
+    pub sent: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub received: u64,
+    /// The generator's own failures, by kind: `send_failed` (no answer to a
+    /// send), `recv_error`, `reconnect_failed`, `backfill_failed`, and
+    /// `connection_dropped` (the connection closed under it).
+    pub client_errors: BTreeMap<String, u64>,
+    pub media_failed: u64,
+    pub git_failed: u64,
+}
+
+/// Writes `live` to `path` whole: a temp file beside it, then a rename, so a
+/// reader never sees half a file.
+pub fn write_live(path: &Path, live: &Live) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(live).map_err(std::io::Error::other)?,
+    )?;
+    std::fs::rename(&tmp, path)
 }
 
 pub struct Stats {
@@ -218,6 +253,34 @@ impl Stats {
         self.with(|s| s.lost_after_backfill)
     }
 
+    /// Counts one of the generator's own failures (see `Live`).
+    pub fn record_client_error(&self, what: &str) {
+        self.with(|s| *s.client_errors.entry(what.to_string()).or_default() += 1);
+    }
+
+    /// The live counters, stamped `t_unix`.
+    pub fn live(&self, t_unix: u64) -> Live {
+        self.with(|s| {
+            let (mut sent, mut accepted, mut rejected, mut received) = (0, 0, 0, 0);
+            for b in s.bands.values() {
+                sent += b.sent;
+                accepted += b.accepted;
+                rejected += b.rejected;
+                received += b.received;
+            }
+            Live {
+                t_unix,
+                sent,
+                accepted,
+                rejected,
+                received,
+                client_errors: s.client_errors.clone(),
+                media_failed: s.media_rejected,
+                git_failed: s.git_failed,
+            }
+        })
+    }
+
     pub fn summarize(
         &self,
         profile: &str,
@@ -295,6 +358,43 @@ impl Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_counts_the_generators_own_errors_apart_from_rejects() {
+        let st = Stats::new();
+        st.record_send("steady", 9, true, "", 1.0);
+        st.record_send("steady", 9, false, "blocked: rate", 0.0);
+        st.record_client_error("send_failed");
+        st.record_client_error("send_failed");
+        st.record_client_error("reconnect_failed");
+        let live = st.live(42);
+        assert_eq!(
+            (live.t_unix, live.sent, live.accepted, live.rejected),
+            (42, 2, 1, 1)
+        );
+        assert_eq!(live.client_errors.get("send_failed"), Some(&2));
+        assert_eq!(live.client_errors.get("reconnect_failed"), Some(&1));
+        assert_eq!(live.client_errors.len(), 2);
+    }
+
+    #[test]
+    fn write_live_replaces_the_file_whole() {
+        let dir = std::env::temp_dir().join(format!("live-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("live.json");
+        let st = Stats::new();
+        write_live(&path, &st.live(1)).unwrap();
+        st.record_client_error("recv_error");
+        write_live(&path, &st.live(2)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["t_unix"], 2);
+        assert_eq!(v["client_errors"]["recv_error"], 1);
+        assert!(
+            !dir.join("live.json.tmp").exists(),
+            "the temp file was left"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn sends_are_counted_by_kind_per_band() {

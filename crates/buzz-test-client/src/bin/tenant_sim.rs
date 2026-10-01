@@ -25,13 +25,15 @@ use sim::kinds;
 use sim::profile::{load_profile, Profile};
 use sim::roles::{Band, Role};
 use sim::seed;
-use sim::stats::Stats;
+use sim::stats::{write_live, Stats};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::warn;
 
 /// Same OK window as `buzz-ws-client`'s publish.
 const OK_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often `<out-dir>/live.json` is rewritten.
+const LIVE_EVERY: Duration = Duration::from_secs(2);
 /// Transport failures tolerated per owner event before provisioning fails.
 const SEND_ATTEMPTS: u32 = 4;
 /// Rate-limit waits tolerated per owner event (each waits out one window).
@@ -475,6 +477,24 @@ async fn run(args: Args) -> Result<i32> {
     spawn_band_reader(&args.band_signal, &out_dir, band_tx, go_tx)?;
 
     let stats = Arc::new(Stats::new());
+    // The live counters (<out-dir>/live.json), rewritten every LIVE_EVERY,
+    // so a sampler can see the generator's own errors during a band. It
+    // exists from the start; a missing file is the sampler's error, not
+    // "no errors".
+    let live_path = out_dir.join("live.json");
+    write_live(&live_path, &stats.live(unix_now()))?;
+    let live_task = {
+        let (stats, path) = (stats.clone(), live_path.clone());
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(LIVE_EVERY);
+            loop {
+                every.tick().await;
+                if let Err(e) = write_live(&path, &stats.live(unix_now())) {
+                    warn!("live counters {}: {e}", path.display());
+                }
+            }
+        })
+    };
     let setup_started = Instant::now();
     let mut setup = SetupStats::default();
     let (channels, repos) =
@@ -655,6 +675,8 @@ async fn run(args: Args) -> Result<i32> {
         }
     }
 
+    live_task.abort();
+    write_live(&live_path, &stats.live(unix_now()))?;
     let mut ends = HashMap::new();
     ends.insert("floor".into(), unix_now());
     ends.insert("steady".into(), unix_now());
