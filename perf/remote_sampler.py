@@ -10,6 +10,9 @@ the conditions that void a run:
   lockdown;
 - a box misses too many ticks: 3 calls in a row, or over 1% of the ticks
   once there are 100;
+- a relay box's slow calls fail as often, counted apart from its ticks: a
+  slow call fails when its reply is not a whole slow sample (an error from
+  `docker system df` or `psql`, or a disk figure missing);
 - the generator overloads before the relay breaks: CPU averaging over 70% on
   two 60 s windows in a row, MemAvailable under 10% of MemTotal for 3 ticks,
   an out-of-memory kill on its box, or its own errors rising in tenant_sim's
@@ -66,6 +69,18 @@ GEN_FAILURE_TOTALS = ("media_failed", "git_failed")
 # tenant_sim rewrites live.json every 2 s. Older than this (five writes
 # missed), or this far ahead of the clock, the file is no longer live.
 LIVE_MAX_AGE_S = 10.0
+
+# What a relay box's slow sample must hold, as numbers: the whole box's
+# filesystem, and on a box with Docker the stack's Postgres data, WAL, MinIO,
+# Redis, git, container logs, image overhead and WAL position.
+SLOW_NEEDS = ("box.fs.used", "box.fs.avail")
+SLOW_NEEDS_DOCKER = ("disk.postgres_data.bytes", "disk.wal.bytes", "disk.minio.bytes", "disk.redis.bytes",
+                     "disk.git.bytes", "disk.container_logs_bytes", "disk.images_bytes", "wal.wal_lsn_bytes")
+# The reader's errors that only the slow tier makes. The others (a
+# container's cgroup, a unit, nft) are the fast tier's: a relay that is
+# restarting shows one, and that is the relay breaking, not the sampler
+# failing.
+SLOW_ERRORS = ("docker system df:", "psql:")
 
 
 class Refused(Exception):
@@ -243,6 +258,9 @@ class Monitor:
     consecutive: dict[str, int] = field(default_factory=dict)
     misses: dict[str, int] = field(default_factory=dict)
     ticks: dict[str, int] = field(default_factory=dict)
+    slow_consecutive: dict[str, int] = field(default_factory=dict)
+    slow_misses: dict[str, int] = field(default_factory=dict)
+    slow_calls: dict[str, int] = field(default_factory=dict)
     relay_break_t: float | None = None
     notes: list[dict[str, Any]] = field(default_factory=list)
     _win: tuple[float, dict[str, int]] | None = None
@@ -293,6 +311,25 @@ class Monitor:
             base = self._relay_oom0.setdefault(box.ip, relay["oom_kill"])
             if relay["oom_kill"] > base:
                 self.relay_break(t, f"{key}: the relay was OOM-killed")
+        return None
+
+    def slow_tick(self, box: Box, t: float, miss: str | None) -> Void | None:
+        """One relay box's slow call: miss is None for a whole slow sample,
+        else why it isn't one. The same two limits as the ticks, counted
+        apart from them: a good fast call between two failed slow ones must
+        not reset the count."""
+        key = f"{box.role} ({box.ip})"
+        self.slow_calls[box.ip] = self.slow_calls.get(box.ip, 0) + 1
+        if miss is not None:
+            self.slow_misses[box.ip] = self.slow_misses.get(box.ip, 0) + 1
+            self.slow_consecutive[box.ip] = self.slow_consecutive.get(box.ip, 0) + 1
+            if self.slow_consecutive[box.ip] >= self.max_consecutive:
+                return Void(f"{key}: {self.slow_consecutive[box.ip]} slow calls in a row failed; the last: {miss}", box.role, t)
+        else:
+            self.slow_consecutive[box.ip] = 0
+        n, m = self.slow_calls[box.ip], self.slow_misses.get(box.ip, 0)
+        if n >= self.min_ticks_for_pct and m * 100.0 > self.max_miss_pct * n:
+            return Void(f"{key} missed {m} of {n} slow calls, over the {self.max_miss_pct:g}% limit", box.role, t)
         return None
 
     def gen_tick(self, t: float, sample: dict[str, Any], live: dict[str, Any] | None, live_err: str | None,
@@ -432,7 +469,10 @@ class BandStats:
         self.cpu_s = 0.0
         self.maxrss: int | None = None
 
-    def add(self, tier: str, sample: dict[str, Any] | None) -> None:
+    def add(self, tier: str, sample: dict[str, Any] | None, partial: dict[str, Any] | None = None) -> None:
+        """A call's sample, or None for a miss. A partial reply (a slow one
+        that isn't whole) is a miss, but the reader still ran: its cost
+        counts."""
         if tier == "slow":
             self.slow_calls += 1
         else:
@@ -442,16 +482,13 @@ class BandStats:
                 self.slow_missed += 1
             else:
                 self.missed += 1
+            if partial is not None:
+                self.reader_cost(partial)
             return
         t = sample["t_unix"]
         self.t0 = t if self.t0 is None else self.t0
         self.t1 = t
-        reader = sample.get("reader") or {}
-        if _num(reader.get("cpu_s")):
-            self.cpu_s += reader["cpu_s"]
-        rss = [reader.get(k) for k in ("maxrss_kb", "children_maxrss_kb") if _num(reader.get(k))]
-        if rss:
-            self.maxrss = max([self.maxrss or 0, *rss])
+        self.reader_cost(sample)
         self.steal = sample.get("steal") or {}
         if tier == "slow":
             disk = sample.get("disk") or {}
@@ -487,6 +524,14 @@ class BandStats:
         if drops is not None:
             self.drops0 = self.drops0 or drops
             self.drops1 = drops
+
+    def reader_cost(self, sample: dict[str, Any]) -> None:
+        reader = sample.get("reader") or {}
+        if _num(reader.get("cpu_s")):
+            self.cpu_s += reader["cpu_s"]
+        rss = [reader.get(k) for k in ("maxrss_kb", "children_maxrss_kb") if _num(reader.get(k))]
+        if rss:
+            self.maxrss = max([self.maxrss or 0, *rss])
 
     def summary(self) -> dict[str, Any]:
         out: dict[str, Any] = {"band": self.band, "role": self.role, "ticks": self.ticks, "missed": self.missed,
@@ -562,6 +607,20 @@ def parse_reply(code: int, out: str, err: str, tier: str) -> tuple[dict[str, Any
     return v, None
 
 
+def slow_gap(sample: dict[str, Any]) -> str | None:
+    """Why a relay box's slow reply is not a whole slow sample, or None."""
+    errors = [str(e) for e in sample.get("errors") or [] if str(e).startswith(SLOW_ERRORS)]
+    if errors:
+        return "the slow sample has errors: " + "; ".join(errors)
+    for path in SLOW_NEEDS + (() if "containers_absent" in sample else SLOW_NEEDS_DOCKER):
+        v: Any = sample
+        for k in path.split("."):
+            v = v.get(k) if isinstance(v, dict) else None
+        if not _num(v):
+            return f"the slow sample has no {path}"
+    return None
+
+
 def own_cpu_s() -> float:
     me, kids = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
     return me.ru_utime + me.ru_stime + kids.ru_utime + kids.ru_stime
@@ -629,12 +688,17 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
             for box in s.boxes:
                 for tier in tiers:
                     sample, miss = parse_reply(*runner(ssh_argv(s.key or "", s.known_hosts or "", box.ip, tier)), tier)
-                    rings[box.role].append(json.dumps({"t": t, "band": band, "tier": tier, **({"sample": sample} if sample else {"miss": miss})}, separators=(",", ":")))
-                    stats[box.role].add(tier, sample)
-                    if tier == "fast":
-                        v = mon.box_tick(box, t, sample, miss)
-                        if v:
-                            return void(v)
+                    # A slow reply that isn't whole is a miss, kept in the
+                    # ring beside its reason, never counted as a sample.
+                    partial = sample if tier == "slow" and sample and (miss := slow_gap(sample)) else None
+                    if partial:
+                        sample = None
+                    rings[box.role].append(json.dumps({"t": t, "band": band, "tier": tier, **({"sample": sample} if sample else {"miss": miss}),
+                                                       **({"partial": partial} if partial else {})}, separators=(",", ":")))
+                    stats[box.role].add(tier, sample, partial)
+                    v = mon.box_tick(box, t, sample, miss) if tier == "fast" else mon.slow_tick(box, t, miss)
+                    if v:
+                        return void(v)
             if s.self_role and s.self_config is not None:
                 live, live_err = read_live(s.live_file) if s.live_file else (None, None)
                 live_t = clock()

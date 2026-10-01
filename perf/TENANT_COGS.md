@@ -414,8 +414,9 @@ python3 perf/tenant_cogs.py remote-sample \
 - **Output:** `<out-dir>/samples/<role>/ring-*.jsonl`, at most
   `--ring-files` x `--ring-bytes` (8 x 4 MiB) per box, and a restarted loop
   carries on from the newest file; `bands.jsonl`, one line per band per
-  box; `notes.jsonl`. A band line has `ticks` and `missed` (fast),
-  `slow_calls` and `slow_missed`, percentiles of memory used, CPU busy and
+  box; `notes.jsonl`. A slow reply that isn't whole is kept in the ring as
+  `partial`, beside its `miss` reason. A band line has `ticks` and `missed`
+  (fast), `slow_calls` and `slow_missed`, percentiles of memory used, CPU busy and
   each container's working set, steal (or why it is unknown), drops, WAL
   high water and write rate, and `sampler`: its CPU seconds, its share of
   the box, and its peak memory. On the generator's own box the sampler's
@@ -424,6 +425,16 @@ python3 perf/tenant_cogs.py remote-sample \
   - a relay's rule-set hash differs from `--expected-hashes`;
   - a box misses 3 ticks in a row ("box unreachable"), or over 1% of its
     ticks once it has 100;
+  - a relay box's slow calls fail 3 in a row, or over 1% of them once
+    there are 100, counted apart from its ticks. A slow call fails when the
+    reply is not a whole slow sample: an error from `docker system df` or
+    `psql`, or a figure missing (the filesystem's used and free; on a box
+    with Docker, Postgres data, WAL, MinIO, Redis, git, container logs,
+    image overhead and the WAL position). A missing volume is a gap even
+    though the walk logs no error. The fast tier's errors (a container
+    with no cgroup, a unit, nft) don't count here: a restarting relay
+    shows one, and that is the relay breaking. The journal is not
+    required, so a box without one doesn't void every run;
   - before the relay breaks, the generator's CPU averages over 70% on two
     60 s windows in a row, its MemAvailable stays under 10% of MemTotal for
     3 ticks, its box has an out-of-memory kill, or its own errors rise in

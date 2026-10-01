@@ -25,17 +25,24 @@ H1, H2 = "a" * 64, "b" * 64
 
 
 def relay_sample(t: float, h: str = H1, ws: int = 100, busy: int = 0, oom: int = 0, tier: str = "fast") -> dict:
-    return {
+    """A relay box's sample as box_sampler.py prints it; a slow one is whole."""
+    row = {
         "v": 1, "tier": tier, "t_unix": t,
         "box": {"mem": {"MemTotal": 1000, "MemAvailable": 600},
                 "cpu": {"ticks": {"user": busy, "nice": 0, "system": 0, "idle": 1000 + int(t) * 10, "iowait": 0, "irq": 0, "softirq": 0, "steal": 0}, "ncpu": 2},
-                "oom_kill": 0},
+                "oom_kill": 0, "fs": {"total": 100, "free": 60, "avail": 50, "used": 40}},
         "steal": {"reported": None, "why": "unknown: not x86 (arm64)"},
         "containers": {"relay": {"working_set": ws, "oom_kill": oom}},
         "nft": {"hash": h, "drops": {"output": {"packets": int(t), "bytes": 0}}},
         "reader": {"cpu_s": 0.02, "maxrss_kb": 9000, "children_maxrss_kb": 4000},
         "errors": [],
     }
+    if tier == "slow":
+        size = lambda n: {"bytes": n, "files": 1}  # noqa: E731
+        row["disk"] = {"minio": size(5), "redis": size(6), "git": size(7), "postgres_volume": size(30), "wal": size(16),
+                       "postgres_data": size(14), "container_logs_bytes": 3, "journal": size(8), "images_bytes": 900}
+        row["wal"] = {"wal_lsn_bytes": 1000 + int(t) * 100, "db_size_bytes": 10}
+    return row
 
 
 def live_counters(t: int = 1, rejected: int = 0, media_failed: int = 0, git_failed: int = 0, **client_errors: int) -> dict:
@@ -161,6 +168,61 @@ class Replies(unittest.TestCase):
         for (code, out, err), want in rows:
             with self.subTest(out=out[:20], err=err):
                 self.assertEqual(rs.parse_reply(code, out, err, "fast"), want)
+
+
+class SlowGaps(unittest.TestCase):
+    """What makes a relay box's slow reply less than a whole slow sample."""
+
+    def test_a_whole_slow_sample(self) -> None:
+        self.assertIsNone(rs.slow_gap(relay_sample(1, tier="slow")))
+
+    def test_the_slow_tiers_own_errors(self) -> None:
+        rows = [
+            (["psql: exit 2: could not connect"], "the slow sample has errors: psql: exit 2: could not connect"),
+            (["psql: no postgres container"], "the slow sample has errors: psql: no postgres container"),
+            (["docker system df: exit 124: timed out after 10s"], "the slow sample has errors: docker system df: exit 124: timed out after 10s"),
+            (["docker system df: exit 1: x", "container relay: no cgroup (pid 0)", "psql: exit 2: y"],
+             "the slow sample has errors: docker system df: exit 1: x; psql: exit 2: y"),
+        ]
+        for errors, want in rows:
+            with self.subTest(errors=errors):
+                self.assertEqual(rs.slow_gap({**relay_sample(1, tier="slow"), "errors": errors}), want)
+
+    def test_the_fast_tiers_errors_are_not_a_gap(self) -> None:
+        """A restarting relay has no cgroup: the relay breaking, not the
+        sampler failing."""
+        for e in ("container relay: no cgroup (pid 0)", "docker ps: exit 1: x", "unit docker.service: no cgroup (not running?)", "nft: exit 1/1: x"):
+            with self.subTest(e):
+                self.assertIsNone(rs.slow_gap({**relay_sample(1, tier="slow"), "errors": [e]}))
+
+    def test_each_figure_missing(self) -> None:
+        for path in rs.SLOW_NEEDS + rs.SLOW_NEEDS_DOCKER:
+            for how in ("absent", "null", "text"):
+                with self.subTest(path=path, how=how):
+                    row = json.loads(json.dumps(relay_sample(1, tier="slow")))
+                    *up, last = path.split(".")
+                    d = row
+                    for k in up:
+                        d = d[k]
+                    if how == "absent":
+                        del d[last]
+                    else:
+                        d[last] = None if how == "null" else "12"
+                    self.assertEqual(rs.slow_gap(row), f"the slow sample has no {path}")
+
+    def test_a_walk_that_found_no_folder(self) -> None:
+        """walk_size gives null for a missing volume and logs no error."""
+        row = relay_sample(1, tier="slow")
+        row["disk"]["minio"] = None
+        self.assertEqual(rs.slow_gap(row), "the slow sample has no disk.minio.bytes")
+
+    def test_a_box_without_docker_needs_only_the_filesystem(self) -> None:
+        row = {**relay_sample(1, tier="slow"), "containers_absent": "no docker on this box (config)", "containers": {}}
+        row.pop("wal")
+        row["disk"] = {"container_logs_bytes": None, "journal": None}
+        self.assertIsNone(rs.slow_gap(row))
+        row["box"] = {**row["box"], "fs": None}
+        self.assertEqual(rs.slow_gap(row), "the slow sample has no box.fs.used")
 
 
 class BoundedCalls(unittest.TestCase):
@@ -294,6 +356,34 @@ class Voids(unittest.TestCase):
             self.assertIsNone(m.box_tick(self.BOX, t, None if t == 10 else relay_sample(t), "late"), t)
         v = m.box_tick(self.BOX, 150, None, "late")
         self.assertEqual(v.reason, "relay1 (10.77.0.3) missed 2 of 150 ticks, over the 1% limit")
+
+    def test_slow_calls_three_in_a_row_void(self) -> None:
+        m = self.mon()
+        self.assertIsNone(m.slow_tick(self.BOX, 1, "the slow sample has no disk.wal.bytes"))
+        self.assertIsNone(m.slow_tick(self.BOX, 2, None))
+        self.assertIsNone(m.slow_tick(self.BOX, 3, "x"))
+        self.assertIsNone(m.slow_tick(self.BOX, 4, "x"))
+        v = m.slow_tick(self.BOX, 5, "the slow sample has errors: psql: exit 2: y")
+        self.assertEqual((v.reason, v.box, v.t_unix),
+                         ("relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: exit 2: y", "relay1", 5))
+
+    def test_slow_calls_over_one_percent_void_once_there_are_100(self) -> None:
+        m = self.mon()
+        out = None
+        for n in range(1, 101):
+            out = m.slow_tick(self.BOX, n, "x" if n in (10, 50) else None)
+            if n < 100:
+                self.assertIsNone(out, n)
+        self.assertEqual(out.reason, "relay1 (10.77.0.3) missed 2 of 100 slow calls, over the 1% limit")
+
+    def test_slow_and_fast_are_counted_apart(self) -> None:
+        m = self.mon()
+        for t in (1, 2):
+            self.assertIsNone(m.box_tick(self.BOX, t, None, "ssh exit 255"))
+            self.assertIsNone(m.slow_tick(self.BOX, t, "x"))
+        self.assertIsNone(m.box_tick(self.BOX, 3, relay_sample(3), None))
+        self.assertIsNone(m.slow_tick(self.BOX, 3, None))
+        self.assertEqual((m.consecutive, m.slow_consecutive), ({"10.77.0.3": 0}, {"10.77.0.3": 0}))
 
     def test_a_box_with_no_recorded_hash_voids(self) -> None:
         m = rs.Monitor(expected={})
@@ -584,6 +674,70 @@ class Loop(unittest.TestCase):
                 code = rs.run_loop(s, runner=runner, clock=lambda: clock["t"], sleep=lambda sec: None, local=local)
             self.assertEqual(code, 0)
             self.assertFalse((Path(d) / "samples" / "void.json").exists())
+
+    def test_slow_errors_three_in_a_row_void_while_fast_calls_succeed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            def answer(t: float, tier: str) -> tuple[int, str, str]:
+                row = relay_sample(t, tier=tier)
+                if tier == "slow":
+                    row["errors"] = ["psql: exit 2: psql: error: connection to server failed"]
+                    row["wal"] = None
+                return 0, json.dumps(row), ""
+            code, calls = self.drive(self.settings(Path(d), slow_every=15.0), answer)
+            self.assertEqual(code, 3)
+            want = "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: exit 2: psql: error: connection to server failed"
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual((void["reason"], void["box"], void["t_unix"]), (want, "relay1", 1030.0))
+            self.assertEqual(self.stderr, f"void: {want}\n")
+            self.assertEqual([c[-1] for c in calls].count("fast"), 7, "the fast calls between succeeded and did not reset the count")
+            bands = [json.loads(l) for l in (Path(d) / "samples" / "bands.jsonl").read_text().splitlines()]
+            self.assertEqual((bands[0]["ticks"], bands[0]["missed"], bands[0]["slow_calls"], bands[0]["slow_missed"]), (7, 0, 3, 3))
+            self.assertEqual(bands[0]["sampler"]["cpu_s"], 0.2, "a partial reply's reader cost still counts: 10 calls x 0.02")
+            ring = [json.loads(l) for l in (Path(d) / "samples" / "relay1" / "ring-000000.jsonl").read_text().splitlines()]
+            slow = [r for r in ring if r["tier"] == "slow"]
+            self.assertEqual([(r["miss"], "sample" in r, r["partial"]["errors"]) for r in slow],
+                             [("the slow sample has errors: psql: exit 2: psql: error: connection to server failed", False,
+                               ["psql: exit 2: psql: error: connection to server failed"])] * 3)
+
+    def test_slow_samples_missing_a_figure_void(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            def answer(t: float, tier: str) -> tuple[int, str, str]:
+                row = relay_sample(t, tier=tier)
+                if tier == "slow":
+                    row["disk"]["wal"] = None  # pg_wal not found: no error from the walk
+                return 0, json.dumps(row), ""
+            code, _ = self.drive(self.settings(Path(d), slow_every=5.0), answer)
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual((void["reason"], void["t_unix"]),
+                             ("relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has no disk.wal.bytes", 1010.0))
+
+    def test_slow_calls_over_one_percent_void_through_the_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            n = {"slow": 0}
+
+            def answer(t: float, tier: str) -> tuple[int, str, str]:
+                row = relay_sample(t, tier=tier)
+                if tier == "slow":
+                    n["slow"] += 1
+                    if n["slow"] in (10, 50):
+                        row["errors"] = ["docker system df: exit 124: timed out after 10s"]
+                return 0, json.dumps(row), ""
+            code, _ = self.drive(self.settings(Path(d), slow_every=5.0), answer)
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual((void["reason"], void["t_unix"]), ("relay1 (10.77.0.3) missed 2 of 100 slow calls, over the 1% limit", 1495.0))
+
+    def test_a_restarting_relay_in_a_slow_sample_is_not_a_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            def answer(t: float, tier: str) -> tuple[int, str, str]:
+                row = relay_sample(t, tier=tier)
+                row["errors"] = ["container relay: no cgroup (pid 0)"]
+                return 0, json.dumps(row), ""
+            code, _ = self.drive(self.settings(Path(d), slow_every=5.0, duration=60.0), answer)
+            self.assertEqual(code, 0)
+            bands = [json.loads(l) for l in (Path(d) / "samples" / "bands.jsonl").read_text().splitlines()]
+            self.assertEqual((bands[0]["slow_calls"], bands[0]["slow_missed"]), (13, 0))
 
     def test_bands_and_the_end_of_a_run(self) -> None:
         with tempfile.TemporaryDirectory() as d:
