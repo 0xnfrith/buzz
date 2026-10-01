@@ -13,6 +13,7 @@ and the proof exits 1 if any failed.
 | `reads` | nothing: two generators through every band of a short profile | exit 0; both driven in lockstep; agents' reads all answered, none refused (the hard row) |
 | `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and the ack test breaks it after at least one step held; a held to the max |
 | `ramp-freeze` | relay b frozen (`docker pause`) at the ramp's second step | exit 0; b broke at step 2 because its sends went unanswered, a break and never a void; a held to the max |
+| `ramp-starved` | relay b cut to 0.01 CPU at the ramp's second step | exit 0; b broke at step 2 because it shed sends (`rate-limited: too many concurrent requests` or `shared admission unavailable`), a break and never counted apart; a held to the max; the texts b got, counted |
 | `boundary` | the floor's boundary check fails | exit 4 on that line; `end` still ran and removed both stacks |
 | `void` | generator a stopped (SIGSTOP) in the steady band | the loop voids on its stale live file; exit 3 on that line; `end` ran |
 | `crash-gen` | generator b killed (SIGKILL) in the steady band | exit 3: the generator for b stopped on its own; `end` ran |
@@ -52,7 +53,7 @@ IMAGES = (
     "minio/mc:RELEASE.2025-08-13T08-35-41Z",
 )
 BANDS = ["warmup", "floor", "steady", "peak", "cooldown"]
-ROWS = ("reads", "ramp", "ramp-freeze", "boundary", "void", "crash-gen", "crash-clock", "heavy-seed")
+ROWS = ("reads", "ramp", "ramp-freeze", "ramp-starved", "boundary", "void", "crash-gen", "crash-clock", "heavy-seed")
 HEAVY_SEED_EVENTS = 757_803
 GENS = {"a": {"port": 13031, "health_port": 18031}, "b": {"port": 13032, "health_port": 18032}}
 # The clock's own periods, short where a row would otherwise wait long.
@@ -268,6 +269,36 @@ class Proof:
                    f"send_unanswered {live_b.get('send_unanswered')}, send_failed {(live_b.get('client_errors') or {}).get('send_failed', 0)}")
         self.end(row, cfg)
 
+    def row_ramp_starved(self) -> None:
+        """Relay b cut to 0.01 CPU at the ramp's second step: it sheds the
+        sends it can't take with a rate-limited text. A shed is the relay's
+        break, never counted apart as a quota, so the run goes on."""
+        row = "ramp-starved"
+        root, cfg = self.config(row, ["a", "b"], ramp={"max": 18, "start": 6},
+                                inject={"at_band": [{"band": "ramp-002", "do": "cpus", "cpus": "0.01", "gen": "b"}]})
+        argv = self.clock_argv(root, cfg, ["a", "b"], ["--ramp", str(PROOF / "profiles/proof-ramp.toml"), "--ramp-start", "6",
+                                                        "--ramp-step", "6", "--ramp-every", "75", "--ramp-max", "18",
+                                                        "--ramp-budget", "900"])
+        a, b = self.ramp_result(row, root, self.run_clock(root, argv, 1500))
+        self.eq(row, "b broke at the second step, 12 identities, and held 6",
+                (b.get("broke_step"), b.get("broke_k"), b.get("held_k"), b.get("band")), (2, 12, 6, "ramp-002"))
+        self.check(row, "b broke because its relay shed sends",
+                   re.fullmatch(r"the relay shed \d+ sends: full, or unable to reach its admission store", str(b.get("why"))),
+                   b.get("why"))
+        self.eq(row, "a held to the max", (a.get("held_k"), a.get("ended"), "broke_k" in a), (18, "held at the max", False))
+        live_b = read_json(root / "items" / "ramp" / "b" / "live.json")
+        self.check(row, "b's live file counted the sheds, none as unknown",
+                   (live_b.get("relay_shed") or 0) > 0 and live_b.get("limit_unknown") == {},
+                   f"relay_shed {live_b.get('relay_shed')}, rate_limited {live_b.get('rate_limited')}, "
+                   f"limit_unknown {live_b.get('limit_unknown')}")
+        texts: dict[str, int] = {}
+        for line in read_text(root / "items" / "ramp" / "b" / "stderr.log").splitlines():
+            m = re.search(r"shed by the relay: (rate-limited: [a-z ]+)", line)
+            if m:
+                texts[m.group(1)] = texts.get(m.group(1), 0) + 1
+        print(f"  THE STARVED RELAY'S TEXTS: {json.dumps(texts)}")
+        self.end(row, cfg)
+
     def stopped_row(self, row: str, inject: dict[str, Any], want_code: int, want: Callable[[str], bool], want_text: str) -> Path:
         root, cfg = self.config(row, ["a", "b"], inject=inject)
         code = self.run_clock(root, self.clock_argv(root, cfg, ["a", "b"], ["--profile", str(PROOF / "profiles/proof-solo.toml")]), 900)
@@ -415,7 +446,8 @@ def main(argv: list[str]) -> int:
     if not proof.preflight():
         return 1
     fns: dict[str, Callable[[], None]] = {
-        "reads": proof.row_reads, "ramp": proof.row_ramp, "ramp-freeze": proof.row_ramp_freeze, "boundary": proof.row_boundary,
+        "reads": proof.row_reads, "ramp": proof.row_ramp, "ramp-freeze": proof.row_ramp_freeze,
+        "ramp-starved": proof.row_ramp_starved, "boundary": proof.row_boundary,
         "void": proof.row_void, "crash-gen": proof.row_crash_gen, "crash-clock": proof.row_crash_clock,
         "heavy-seed": proof.row_heavy_seed}
     for r in rows:

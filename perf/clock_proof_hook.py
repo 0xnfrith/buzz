@@ -22,8 +22,9 @@ The events are the clock's (band_clock.py). This hook:
   only) and checks by label that nothing is left.
 
 What the proof forces comes from the config's `inject`: a boundary that
-fails, a generator stopped (SIGSTOP) or killed at a band, and a relay frozen
-(`docker pause`) at a band; and from `fleet_cpus`, a relay's CPU cap from
+fails, a generator stopped (SIGSTOP) or killed at a band, a relay frozen
+(`docker pause`) at a band, and a relay's CPU cut (`docker update --cpus`)
+at a band; and from `fleet_cpus`, a relay's CPU cap from
 `fleet` on, for the whole run. Every image is used as it is on the machine: Compose runs
 with `--pull never`. Every call appends a line to `<root>/hook.log`.
 """
@@ -360,6 +361,9 @@ def ev_band(cfg: dict[str, Any], name: str) -> None:
         if act["do"] == "pause":
             # The relay frozen: every send it was written goes unanswered.
             docker(cfg, "pause", f"{project(cfg, act['gen'])}-relay-1")
+        elif act["do"] == "cpus":
+            # The relay starved of CPU from this band on.
+            docker(cfg, "update", "--cpus", str(act["cpus"]), f"{project(cfg, act['gen'])}-relay-1")
         elif act["do"] in ("sigstop", "sigkill"):
             pid = pid_of(gen_dir(cfg, item, act["gen"]))
             if pid is None:

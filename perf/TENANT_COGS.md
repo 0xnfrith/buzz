@@ -889,6 +889,7 @@ proof checks nothing is left by label.
 | `reads` | nothing: two generators through every band | exit 0; both sent every band in order, paused after each measured one; the rules every minute and at each boundary; fleet read back no raised limit; **every agent read answered, none refused or dropped** |
 | `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and the ack test breaks it on a step after at least one held; a holds to the max |
 | `ramp-freeze` | relay b frozen (`docker pause`) at the second step | exit 0; b broke at step 2 because its sends went unanswered (`send_unanswered`, none `send_failed`): a break, never a void; a holds to the max |
+| `ramp-starved` | relay b cut to 0.01 CPU (`docker update --cpus`) at the second step | exit 0; b broke at step 2 because it shed sends (`relay_shed`, none `limit_unknown`): a break, never counted apart; a holds to the max; the texts b got, counted |
 | `boundary` | the floor's boundary check fails | exit 4 on that line; no band after it; `end` ran |
 | `void` | generator a stopped (SIGSTOP) in the steady band | the loop voids on a's stale live file; exit 3 on that line |
 | `crash-gen` | generator b killed (SIGKILL) in the steady band | exit 3: "the generator for b stopped on its own: exited -9" |
