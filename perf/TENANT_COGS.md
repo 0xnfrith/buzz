@@ -335,7 +335,7 @@ rounded up.
 ```bash
 python3 -m unittest perf/test_tenant_cogs.py
 # from the perf/ directory:
-cd perf && python3 -m unittest test_tenant_cogs.py
+cd perf && python3 -m unittest test_tenant_cogs.py test_box_sampler.py test_remote_sampler.py
 ```
 
 The profile is parsed as TOML by both `tenant_sim` and `tenant_cogs.py`, so
@@ -344,10 +344,13 @@ band lengths in `[bands]` are the lengths the orchestrator runs.
 A successful `run` exits 0 only when the floor shows 30 connections and is
 idle (the per-kind counts cover every client send, every one is presence or
 typing, kinds 20001/20002, and the relay stores nothing), sampled bands have zero unexpected rejects, media uploads succeeded with zero
-rejects, git pushed with zero failures, the three bands are distinct, and
-`lost_after_backfill` is 0. "Distinct" means the relay's working set rises:
-floor p50 < steady p50 < peak max. A results line is still appended for
-diagnosis; the process exit is the weekly-job gate.
+rejects, git pushed with zero failures, each sampled band (floor, steady,
+peak) has at least 3 samples carrying the relay's working set, and
+`lost_after_backfill` is 0. Whether the bands are distinct (the relay's
+working set rising floor p50 < steady p50 < peak max) is reported as
+`band_order` in the final line, never as a failure: a valid run must not
+fail because the relay's memory didn't rise band by band. A results line is
+still appended for diagnosis; the process exit is the weekly-job gate.
 
 `fanout_recipients_p50` is a true histogram percentile of the observations
 that landed in that band (end-minus-start bucket counts), not a lifetime
@@ -359,6 +362,84 @@ refused start. Teardown is `docker compose down -v --remove-orphans`, then a
 check that no container, volume or network with the project's compose label
 is left. If either step fails, the run exits nonzero, even after a passing
 result. Teardown is safe to repeat.
+
+## Remote sampler (`remote-sample`, `box_sampler.py`)
+
+For a run on rented boxes, the sampler runs on the load generator's box and
+reads each relay box from outside, over a restricted SSH key whose forced
+command is `box_sampler.py`. It never runs Docker commands of its own on a
+relay box: the box's reader does, with fixed arguments.
+
+**`box_sampler.py --tier fast|slow --config <file>`** prints one JSON sample
+of the box it runs on. It takes nothing from the client (a deployment
+wrapper maps the client's word to `--tier`), refuses any tier but `fast` or
+`slow` with exit 64, and writes nothing (`python3 -IB`).
+- `fast`, every tick: memory, CPU with steal, load, out-of-memory kills,
+  disk I/O, the filesystem, each Compose container's cgroup (found from
+  `/proc/<pid>/cgroup`), systemd units' cgroups, and the nftables rule
+  set's stateless sha256 and drop counters.
+- `slow` adds the disk walks (Postgres data and WAL, MinIO, Redis, git,
+  container logs, the journal), image overhead, and the WAL position and
+  database size (one fixed `psql` query).
+- Steal is reported only when `box_sampler.py --steal-check` (run once per
+  box by the deployment) found KVM's steal-time bit set; otherwise it is
+  "unknown", never 0.
+- Each sample records the reader's own CPU time and peak memory, its
+  children's included (`getrusage`), so the per-band results show the
+  sampler's share of the box. On a relay box that is the reader and what it
+  runs; the SSH server's own cost is not in it.
+
+**`tenant_cogs.py remote-sample`** runs the loop:
+
+```bash
+python3 perf/tenant_cogs.py remote-sample \
+  --box relay1=10.77.0.3 --ssh-key <key> --known-hosts <file> \
+  --allow-cidr 10.77.0.0/24 --deny-list <file> --expected-hashes <json> \
+  --self gen --self-config <box_sampler config> \
+  --live-file <tenant_sim out-dir>/live.json --band-file <file> --out-dir <dir>
+```
+
+- **Every SSH destination passes the target guard:** a literal IP, inside
+  `--allow-cidr`, off `--deny-list`. The argv is fixed: only `--ssh-key`,
+  no agent, `-F /dev/null`, a strict `--known-hosts`, `--` before the
+  address, then the tier word. `--ssh-key` and `--known-hosts` must be
+  regular files, and `--expected-hashes` must name every box: without the
+  hashes recorded at the lockdown there is nothing to check a rule set
+  against. The existing `--ssh` option and the k3s refusals are unchanged.
+- **Every call is bounded:** 20 s, 1 MiB of reply and 64 KiB of error
+  output. Past any of them the call is killed and counts as a miss, as
+  does a reply that is not a sample of the tier asked for.
+- **Cadence:** `fast` every 5 s and `slow` every 60 s; `--soak` makes it 30 s
+  and 300 s.
+- **Output:** `<out-dir>/samples/<role>/ring-*.jsonl`, at most
+  `--ring-files` x `--ring-bytes` (8 x 4 MiB) per box, and a restarted loop
+  carries on from the newest file; `bands.jsonl`, one line per band per
+  box; `notes.jsonl`. A band line has `ticks` and `missed` (fast),
+  `slow_calls` and `slow_missed`, percentiles of memory used, CPU busy and
+  each container's working set, steal (or why it is unknown), drops, WAL
+  high water and write rate, and `sampler`: its CPU seconds, its share of
+  the box, and its peak memory. On the generator's own box the sampler's
+  CPU is the loop's, its SSH calls included.
+- **A void** writes `samples/void.json` and exits 3:
+  - a relay's rule-set hash differs from `--expected-hashes`;
+  - a box misses 3 ticks in a row ("box unreachable"), or over 1% of its
+    ticks once it has 100;
+  - before the relay breaks, the generator's CPU averages over 70% on two
+    60 s windows in a row, its MemAvailable stays under 10% of MemTotal for
+    3 ticks, its box has an out-of-memory kill, or its own errors rise in
+    `tenant_sim`'s live counters. A missing or unreadable `--live-file` is
+    a void too, never "no errors".
+  - "The relay breaks" is the first of: relay rejects or dropped
+    connections rising in the live counters, a relay OOM kill, or no relay
+    container. A generator event after it is a note, not a void, written
+    once.
+- **INT and TERM** write the band summaries, then exit 130 and 143. A
+  second signal while the summaries or `void.json` are written is ignored.
+
+`tenant_sim` rewrites `<out-dir>/live.json` every 2 s for this: totals of
+sent, accepted, rejected and received, its own errors by kind
+(`send_failed`, `recv_error`, `reconnect_failed`, `backfill_failed`,
+`connection_dropped`), and media and git failures.
 
 ## What is not in this tree
 

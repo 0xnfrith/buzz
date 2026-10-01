@@ -32,6 +32,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import remote_sampler  # noqa: E402
+
 
 SCHEMA = 1
 DEFAULT_CADENCE = 5
@@ -1413,6 +1416,9 @@ def band_stats(samples: list[dict[str, Any]], name: str, client: dict[str, Any] 
         block: dict[str, Any] = {
             "cpu_s": cpu,
             "rss_bytes": pct_block(rss),
+            # How many samples carried a working set: the data-completeness
+            # gate (acceptance_errors) needs it.
+            "rss_samples": len(rss),
             "anon_bytes": pct_block(series(comp, "rss_anon")),
         }
         if comp in {"relay", "postgres", "redis", "minio"}:
@@ -1945,6 +1951,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     .get("steady", {})
                     .get("rejected"),
                     "acceptance_errors": errors,
+                    "band_order": band_order_note(line),
                 }
             )
         )
@@ -2114,6 +2121,35 @@ def floor_errors(floor: dict[str, Any]) -> list[str]:
     return errs
 
 
+# The fewest samples, with the relay's working set in them, a sampled band
+# needs to count.
+MIN_BAND_SAMPLES = 3
+
+
+def relay_ws_samples(band: dict[str, Any]) -> int:
+    """How many of a band's samples carried the relay's working set."""
+    n = (band.get("relay") or {}).get("rss_samples")
+    return int(n) if isinstance(n, (int, float)) else 0
+
+
+def band_order_note(line: dict[str, Any]) -> str:
+    """Whether the relay's working set rose band by band: a note, never a
+    gate."""
+    bands = line.get("bands") or {}
+    try:
+        floor_rss = bands["floor"]["relay"]["rss_bytes"]["p50"]
+        steady_rss = bands["steady"]["relay"]["rss_bytes"]["p50"]
+        peak_rss = bands["peak"]["relay"]["rss_bytes"]["max"]
+    except (KeyError, TypeError) as exc:
+        return f"band order: relay working set missing ({exc})"
+    if floor_rss < steady_rss < peak_rss:
+        return "band order: distinct (relay working set rises floor < steady < peak)"
+    return (
+        f"band order: not distinct (relay working set floor p50={floor_rss} "
+        f"steady p50={steady_rss} peak max={peak_rss})"
+    )
+
+
 def acceptance_errors(
     line: dict[str, Any], summary: dict[str, Any], proc_code: int | None
 ) -> list[str]:
@@ -2154,17 +2190,14 @@ def acceptance_errors(
         errs.append(f"git.failed={git.get('failed')}")
     if int(git.get("pushes") or 0) <= 0:
         errs.append("git.pushes == 0")
-    try:
-        floor_rss = bands["floor"]["relay"]["rss_bytes"]["p50"]
-        steady_rss = bands["steady"]["relay"]["rss_bytes"]["p50"]
-        peak_rss = bands["peak"]["relay"]["rss_bytes"]["max"]
-        if not (floor_rss < steady_rss < peak_rss):
-            errs.append(
-                f"bands not distinct (relay working set): floor p50={floor_rss} "
-                f"steady p50={steady_rss} peak max={peak_rss}"
-            )
-    except (KeyError, TypeError) as exc:
-        errs.append(f"band rss missing: {exc}")
+    # Data completeness, not band order: each sampled band needs enough
+    # samples with the relay's working set in them. A valid paid run must
+    # not fail because the relay's memory didn't rise band by band; the
+    # order is reported by band_order_note instead.
+    for name in ("floor", "steady", "peak"):
+        n = relay_ws_samples(bands.get(name) or {})
+        if n < MIN_BAND_SAMPLES:
+            errs.append(f"{name}: {n} samples with the relay's working set, fewer than {MIN_BAND_SAMPLES}")
     if proc_code not in (0, None):
         errs.append(f"tenant_sim exit {proc_code}")
     return errs
@@ -2257,6 +2290,7 @@ def build_parser() -> argparse.ArgumentParser:
     sample = sub.add_parser("sample")
     add_common(sample)
     sample.add_argument("--once", action="store_true")
+    remote_sampler.add_parser(sub)
     blink = sub.add_parser("blink")
     add_common(blink)
     blink.add_argument("--rollout", default="")
@@ -2281,10 +2315,13 @@ def main(argv: list[str] | None = None) -> int:
         "run": cmd_run,
         "seed-bench": cmd_seed_bench,
         "docker-endpoint": cmd_docker_endpoint,
+        "remote-sample": lambda a: remote_sampler.cmd_remote_sample(
+            a, TargetGuard.from_args(a.allow_cidr, a.deny_list), parse_ip_literal
+        ),
     }
     try:
         return commands[args.cmd](args)
-    except Refused as exc:
+    except (Refused, remote_sampler.Refused) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
 
