@@ -212,8 +212,25 @@ the image's source revision either way.
   and why, and changes nothing.
 - **`--continue-within-s`** (default 3600) bounds the wait for `continue`:
   past it, exit 3 with its own line.
-- **Phase lines** (`setup-done`, `seed-start`, `seed-done`, `ready`,
-  `lease-ran-out`, `signal-refused`) go to stdout and to
+- **A stop, or a lease that runs out, ends every wait,** wherever the run
+  is: an identity's reconnects, their backoff and the subscribe after them
+  (a relay that is gone can't keep a stopped run alive), the storm's
+  stagger, an identity's first connect, setup's retry waits (exit 3,
+  "the run was stopped during setup"), the seed, the wait for `continue`
+  and the wait for the population (exit 0, or 5 for a lease, with
+  `ended` in the last `live.json`). Agent reads stop between reads. What
+  is left can't block past its own bound: a send's OK (30 s), a media
+  upload (30 s a path), a read (30 s), a git command (90 s), a gap
+  recheck (8 s a channel).
+- **Setup fails** (phase `setup-failed` with why, exit 3, before
+  `setup-done`) when the relay refuses, or doesn't take after the
+  retries, a channel create, a relay-member event (9030) or a
+  channel-member event (9000), or a setup clone fails: a run with fewer
+  members, channels or repos than its profile isn't that profile's run.
+  A rate limit fails setup only when the retries give up; one waited out
+  is how the owner is paced at relay defaults.
+- **Phase lines** (`setup-done`, `setup-failed`, `seed-start`, `seed-done`,
+  `ready`, `lease-ran-out`, `signal-refused`) go to stdout and to
   `<out-dir>/phases.jsonl`, so a driver can read them where stdout goes to a
   journal.
 
