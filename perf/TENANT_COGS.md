@@ -423,12 +423,17 @@ python3 perf/tenant_cogs.py remote-sample \
   CPU is the loop's, its SSH calls included.
 - **A void** writes `samples/void.json` and exits 3:
   - a relay's rule-set hash differs from `--expected-hashes`;
-  - a box misses 3 ticks in a row ("box unreachable"), or over 1% of its
-    ticks once it has 100;
-  - before the relay breaks, a relay box's slow calls fail 3 in a row, or
-    over 1% of them once there are 100, counted apart from its ticks.
-    After the break each is a note with its time instead: a crash-looping
-    Postgres is the relay breaking. A slow call fails when the
+  - before that box's relay breaks, a relay box misses 3 ticks in a row
+    ("box unreachable"), or over 1% of its ticks once it has 100. After
+    the break each is a note with its time instead: a relay box that is
+    swapping or crashing can stop answering, and that is the relay
+    breaking. Each run of misses reaching 3 is noted once, and the share
+    once;
+  - before that box's relay breaks, a relay box's slow calls fail 3 in a
+    row, or over 1% of them once there are 100, counted apart from its
+    ticks. After the break each is a note with its time instead, noted
+    the same way: a crash-looping Postgres is the relay breaking. A slow
+    call fails when the
     reply is not a whole slow sample: an error from `docker system df` or
     `psql`, or a figure missing (the filesystem's used and free; on a box
     with Docker, Postgres data, WAL, MinIO, Redis, git, container logs,
@@ -461,6 +466,13 @@ python3 perf/tenant_cogs.py remote-sample \
     out, so a timeout is the relay's; a stalled generator still shows in
     its CPU, its memory and a stale live file. A generator event after
     the break is a note, not a void, written once.
+  - **Whose break.** A relay box's missed calls wait on that box's own
+    break (its relay OOM-killed or gone) or a break in the live counters,
+    whichever came first; another box's break doesn't count for it. The
+    generator's own limits wait on the first break of any relay. Each
+    source's first break is a note.
+  - A changed rule set, a missing hash, and live counters that are
+    missing or no longer live void at any time, before or after a break.
 - **INT and TERM** write the band summaries, then exit 130 and 143. A
   second signal while the summaries or `void.json` are written is ignored.
 

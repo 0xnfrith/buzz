@@ -405,6 +405,64 @@ class Voids(unittest.TestCase):
             self.assertIsNone(m.slow_tick(self.BOX, n, "x" if n in (10, 50, 110) else None), n)
         self.assertEqual(m.notes[1:], [{"t_unix": 100, "after_relay_break": "relay1 (10.77.0.3) missed 2 of 100 slow calls, over the 1% limit", "relay_break_t": 0}])
 
+    def test_unreachable_after_this_boxs_break_is_a_note(self) -> None:
+        """A relay box that broke can stop answering: each run of misses
+        reaching 3 is noted once, with its time, and nothing voids."""
+        m = self.mon()
+        s = relay_sample(1)
+        s["containers"] = {"postgres": {"working_set": 10, "oom_kill": 0}}
+        self.assertIsNone(m.box_tick(self.BOX, 1, s, None))
+        for t in (2, 3, 4, 5):
+            self.assertIsNone(m.box_tick(self.BOX, t, None, "ssh exit 255: Connection timed out"), t)
+        self.assertIsNone(m.box_tick(self.BOX, 6, relay_sample(6), None))
+        for t in (7, 8, 9):
+            self.assertIsNone(m.box_tick(self.BOX, t, None, "ssh exit 255: Connection refused"), t)
+        self.assertEqual(m.notes, [
+            {"t_unix": 1, "relay_break": "relay1 (10.77.0.3): no relay container"},
+            {"t_unix": 4, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: ssh exit 255: Connection timed out", "relay_break_t": 1},
+            {"t_unix": 9, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: ssh exit 255: Connection refused", "relay_break_t": 1},
+        ])
+
+    def test_unreachable_after_a_break_in_the_live_counters_is_a_note(self) -> None:
+        m = self.mon()
+        m.relay_break(1, "the relay rejected 3 events")
+        for t in (2, 3, 4):
+            self.assertIsNone(m.box_tick(self.BOX, t, None, "x"), t)
+        self.assertEqual(m.notes[-1], {"t_unix": 4, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: x", "relay_break_t": 1})
+
+    def test_unreachable_after_another_boxs_break_still_voids(self) -> None:
+        """Only the box's own break, or the live counters', counts for it."""
+        m = rs.Monitor(expected={"10.77.0.3": H1, "10.77.0.4": H1})
+        other = rs.Box("relay2", "10.77.0.4")
+        s = relay_sample(1)
+        s["containers"] = {}
+        self.assertIsNone(m.box_tick(other, 1, s, None))
+        self.assertEqual(m.box_break_t, {"10.77.0.4": 1})
+        self.assertIsNone(m.box_tick(self.BOX, 2, None, "x"))
+        self.assertIsNone(m.box_tick(self.BOX, 3, None, "x"))
+        v = m.box_tick(self.BOX, 4, None, "x")
+        self.assertEqual((v.reason, v.box, v.t_unix), ("box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: x", "relay1", 4))
+
+    def test_ticks_over_one_percent_after_a_break_are_a_note_once(self) -> None:
+        m = self.mon()
+        m.relay_break(0, "the relay dropped connections")
+        for t in range(1, 121):
+            self.assertIsNone(m.box_tick(self.BOX, t, None if t in (10, 50, 110) else relay_sample(t), "late"), t)
+        self.assertEqual(m.notes[1:], [{"t_unix": 100, "after_relay_break": "relay1 (10.77.0.3) missed 2 of 100 ticks, over the 1% limit", "relay_break_t": 0}])
+
+    def test_a_limit_stamped_before_the_break_voids(self) -> None:
+        """Only a break at or before a limit's own time makes it a note."""
+        m = self.mon()
+        m.relay_break(5, "the relay rejected 3 events")
+        v = m.judge([rs.Limit("box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: x", "relay1", 4, "10.77.0.3", after_break=True)])
+        self.assertEqual((v.reason, v.t_unix), ("box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: x", 4))
+
+    def test_a_changed_rule_set_after_a_break_still_voids(self) -> None:
+        m = self.mon()
+        m.relay_break(1, "the relay rejected 3 events")
+        v = m.box_tick(self.BOX, 2, relay_sample(2, h=H2), None)
+        self.assertEqual((v.reason, v.box), (f"the rule-set hash on relay1 (10.77.0.3) is {H2}, not {H1}, recorded at the lockdown", "relay1"))
+
     def test_slow_and_fast_are_counted_apart(self) -> None:
         m = self.mon()
         for t in (1, 2):
@@ -807,6 +865,26 @@ class Loop(unittest.TestCase):
             self.assertEqual(notes, [
                 {"t_unix": 1005.0, "relay_break": "relay1 (10.77.0.3): no relay container"},
                 {"t_unix": 1020.0, "after_relay_break": "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: no postgres container", "relay_break_t": 1005.0},
+            ])
+
+    def test_unreachable_after_a_relay_break_is_a_note_through_the_loop(self) -> None:
+        """The relay container is gone from t=1005, a break; from t=1015 the
+        box stops answering. The run ends at its duration, exit 0."""
+        with tempfile.TemporaryDirectory() as d:
+            def answer(t: float, tier: str) -> tuple[int, str, str]:
+                if t >= 1015:
+                    return 255, "", "ssh: connect to host 10.77.0.3 port 22: Connection timed out\n"
+                row = relay_sample(t, tier=tier)
+                if t >= 1005:
+                    row["containers"] = {"postgres": {"working_set": 10, "oom_kill": 0}}
+                return 0, json.dumps(row), ""
+            code, _ = self.drive(self.settings(Path(d), duration=40.0), answer)
+            self.assertEqual(code, 0)
+            self.assertFalse((Path(d) / "samples" / "void.json").exists())
+            notes = [json.loads(l) for l in (Path(d) / "samples" / "notes.jsonl").read_text().splitlines()]
+            self.assertEqual(notes, [
+                {"t_unix": 1005.0, "relay_break": "relay1 (10.77.0.3): no relay container"},
+                {"t_unix": 1025.0, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: ssh exit 255: ssh: connect to host 10.77.0.3 port 22: Connection timed out", "relay_break_t": 1005.0},
             ])
 
     def test_slow_failures_before_a_relay_break_void_through_the_loop(self) -> None:

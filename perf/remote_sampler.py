@@ -8,9 +8,10 @@ the conditions that void a run:
 
 - a relay box's nftables rule-set hash differs from the one recorded at its
   lockdown;
-- a box misses too many ticks: 3 calls in a row, or over 1% of the ticks
-  once there are 100;
-- before the relay breaks, a relay box's slow calls fail as often,
+- before that box's relay breaks, a box misses too many ticks: 3 calls in
+  a row, or over 1% of the ticks once there are 100. After the break, that
+  is a note;
+- before that box's relay breaks, a relay box's slow calls fail as often,
   counted apart from its ticks: a slow call fails when its reply is not a
   whole slow sample (an error from `docker system df` or `psql`, or a disk
   figure missing). After the break, that is a note;
@@ -257,6 +258,22 @@ class Void:
 
 
 @dataclass
+class Limit:
+    """A limit a tick crossed, decided by Monitor.judge: a void, or a note
+    if it waits on a break that came at or before it."""
+    reason: str
+    role: str  # whose result: a relay box's role, or "generator"
+    t: float
+    # The relay box whose break the limit waits on; None: the first break
+    # of any relay (the generator's own limits).
+    ip: str | None = None
+    # A void before that break, a note after it. False: a void at any time.
+    after_break: bool = False
+    # After the break, noted once per key; None: noted each time.
+    once: str | None = None
+
+
+@dataclass
 class Monitor:
     expected: dict[str, str]  # relay IP -> recorded rule-set hash
     max_consecutive: int = 3
@@ -274,7 +291,14 @@ class Monitor:
     slow_consecutive: dict[str, int] = field(default_factory=dict)
     slow_misses: dict[str, int] = field(default_factory=dict)
     slow_calls: dict[str, int] = field(default_factory=dict)
+    # The first break of any relay: what the generator's own limits wait on.
     relay_break_t: float | None = None
+    # A break the live counters showed. Until each live file is bound to the
+    # relay it drives, it counts for every relay box.
+    live_break_t: float | None = None
+    # Each relay box's own break, from its samples: its relay OOM-killed, or
+    # no relay container in a listing that worked.
+    box_break_t: dict[str, float] = field(default_factory=dict)
     notes: list[dict[str, Any]] = field(default_factory=list)
     _win: tuple[float, dict[str, int]] | None = None
     _over: list[float] = field(default_factory=list)
@@ -282,16 +306,67 @@ class Monitor:
     _gen_oom0: int | None = None
     _relay_oom0: dict[str, int] = field(default_factory=dict)
     _live0: dict[str, Any] | None = None
-    _slow_pct_noted: set[str] = field(default_factory=set)
+    _noted: set[str] = field(default_factory=set)
 
-    def relay_break(self, t: float, why: str) -> None:
+    def relay_break(self, t: float, why: str, ip: str | None = None) -> None:
+        """A break signal: from a relay box's own sample (ip), or from the
+        live counters (no ip). Each source's first is noted."""
+        if ip is None:
+            new = self.live_break_t is None
+            if new:
+                self.live_break_t = t
+        else:
+            new = ip not in self.box_break_t
+            if new:
+                self.box_break_t[ip] = t
         if self.relay_break_t is None:
             self.relay_break_t = t
+        if new:
             self.notes.append({"t_unix": t, "relay_break": why})
 
-    def box_tick(self, box: Box, t: float, sample: dict[str, Any] | None, miss: str | None) -> Void | None:
-        """One relay box's tick: a sample, or the reason it was missed."""
+    def break_at(self, ip: str | None) -> float | None:
+        """When the relay broke, for a limit on box ip: that box's own break
+        or the live counters', whichever came first. ip None: the first
+        break of any relay."""
+        if ip is None:
+            return self.relay_break_t
+        ts = [x for x in (self.live_break_t, self.box_break_t.get(ip)) if x is not None]
+        return min(ts) if ts else None
+
+    def judge(self, limits: list[Limit]) -> Void | None:
+        """Decides a tick's limits, in the order they were read: the first
+        that is still a void, or None. A limit that waits on a break which
+        came at or before it is a note instead, with its time."""
+        for lim in limits:
+            b = self.break_at(lim.ip)
+            if lim.after_break and b is not None and b <= lim.t:
+                if lim.once is None or lim.once not in self._noted:
+                    if lim.once is not None:
+                        self._noted.add(lim.once)
+                    self.notes.append({"t_unix": lim.t, "after_relay_break": lim.reason, "relay_break_t": b})
+                continue
+            if lim.role == "generator":
+                reason = lim.reason + (", before the relay broke" if lim.after_break else "")
+                return Void(reason, "generator", lim.t, gen_event_t=lim.t, relay_break_t=self.relay_break_t)
+            return Void(lim.reason, lim.role, lim.t)
+        return None
+
+    def _settle(self, limits: list[Limit], defer: list[Limit] | None) -> Void | None:
+        """With defer, the limits wait for the tick's end; without, they are
+        judged now."""
+        if defer is not None:
+            defer.extend(limits)
+            return None
+        return self.judge(limits)
+
+    def box_tick(self, box: Box, t: float, sample: dict[str, Any] | None, miss: str | None,
+                 defer: list[Limit] | None = None) -> Void | None:
+        """One relay box's tick: a sample, or the reason it was missed.
+        Missed calls are limits that wait on this box's break: a crashed or
+        swapping relay box can stop answering, and that is the relay
+        breaking. A changed rule set voids at any time."""
         key = f"{box.role} ({box.ip})"
+        out: list[Limit] = []
         self.ticks[box.ip] = self.ticks.get(box.ip, 0) + 1
         if sample is not None and not (sample.get("nft") or {}).get("hash"):
             miss = "the sample has no rule-set hash"
@@ -299,69 +374,67 @@ class Monitor:
         if sample is None:
             self.misses[box.ip] = self.misses.get(box.ip, 0) + 1
             self.consecutive[box.ip] = self.consecutive.get(box.ip, 0) + 1
-            if self.consecutive[box.ip] >= self.max_consecutive:
-                return Void(f"box unreachable: {key}: {self.consecutive[box.ip]} calls in a row failed; the last: {miss}", box.role, t)
+            # Each run of misses reaching the limit is one limit: before the
+            # break that voids, and after it, it is noted once.
+            if self.consecutive[box.ip] == self.max_consecutive:
+                out.append(Limit(f"box unreachable: {key}: {self.consecutive[box.ip]} calls in a row failed; the last: {miss}",
+                                 box.role, t, box.ip, after_break=True))
         else:
             self.consecutive[box.ip] = 0
         # Checked on every tick, not only on a miss: the share can cross the
         # limit on a good tick, when the count of ticks reaches the minimum.
         n, m = self.ticks[box.ip], self.misses.get(box.ip, 0)
         if n >= self.min_ticks_for_pct and m * 100.0 > self.max_miss_pct * n:
-            return Void(f"{key} missed {m} of {n} ticks, over the {self.max_miss_pct:g}% limit", box.role, t)
+            out.append(Limit(f"{key} missed {m} of {n} ticks, over the {self.max_miss_pct:g}% limit",
+                             box.role, t, box.ip, after_break=True, once=f"{box.ip} ticks"))
         if sample is None:
-            return None
+            return self._settle(out, defer)
         got, want = sample["nft"]["hash"], self.expected.get(box.ip)
         if want is None:
-            return Void(f"no rule-set hash was recorded at the lockdown for {key}", box.role, t)
+            out.append(Limit(f"no rule-set hash was recorded at the lockdown for {key}", box.role, t))
+            return self._settle(out, defer)
         if got != want:
-            return Void(f"the rule-set hash on {key} is {got}, not {want}, recorded at the lockdown", box.role, t)
+            out.append(Limit(f"the rule-set hash on {key} is {got}, not {want}, recorded at the lockdown", box.role, t))
+            return self._settle(out, defer)
         relay = (sample.get("containers") or {}).get("relay")
         # A container list from a failed `docker ps` is empty, not a sign the
         # relay is gone: only a listing that worked can show a relay break.
         listed = not any(str(e).startswith("docker ps:") for e in sample.get("errors") or [])
         if relay is None and sample.get("containers") is not None and "containers_absent" not in sample and listed:
-            self.relay_break(t, f"{key}: no relay container")
+            self.relay_break(t, f"{key}: no relay container", box.ip)
         elif relay is not None and relay.get("oom_kill") is not None:
             base = self._relay_oom0.setdefault(box.ip, relay["oom_kill"])
             if relay["oom_kill"] > base:
-                self.relay_break(t, f"{key}: the relay was OOM-killed")
-        return None
+                self.relay_break(t, f"{key}: the relay was OOM-killed", box.ip)
+        return self._settle(out, defer)
 
-    def slow_tick(self, box: Box, t: float, miss: str | None) -> Void | None:
+    def slow_tick(self, box: Box, t: float, miss: str | None, defer: list[Limit] | None = None) -> Void | None:
         """One relay box's slow call: miss is None for a whole slow sample,
         else why it isn't one. The same two limits as the ticks, counted
         apart from them: a good fast call between two failed slow ones must
-        not reset the count. Before the relay breaks, a limit voids. After,
-        it is a note with its time: a crash-looping Postgres is the relay
-        breaking, and the result stands. Each run of misses reaching the
-        limit is noted once, and the share once."""
+        not reset the count. Before this box's relay breaks, a limit voids.
+        After, it is a note with its time: a crash-looping Postgres is the
+        relay breaking, and the result stands. Each run of misses reaching
+        the limit is noted once, and the share once."""
         key = f"{box.role} ({box.ip})"
-        broke = self.relay_break_t is not None and self.relay_break_t <= t
+        out: list[Limit] = []
         self.slow_calls[box.ip] = self.slow_calls.get(box.ip, 0) + 1
-        why = None
         if miss is not None:
             self.slow_misses[box.ip] = self.slow_misses.get(box.ip, 0) + 1
             self.slow_consecutive[box.ip] = self.slow_consecutive.get(box.ip, 0) + 1
             run = self.slow_consecutive[box.ip]
-            if run >= self.max_consecutive and not (broke and run > self.max_consecutive):
-                why = f"{key}: {run} slow calls in a row failed; the last: {miss}"
+            if run == self.max_consecutive:
+                out.append(Limit(f"{key}: {run} slow calls in a row failed; the last: {miss}", box.role, t, box.ip, after_break=True))
         else:
             self.slow_consecutive[box.ip] = 0
         n, m = self.slow_calls[box.ip], self.slow_misses.get(box.ip, 0)
-        if why is None and n >= self.min_ticks_for_pct and m * 100.0 > self.max_miss_pct * n:
-            if not (broke and box.ip in self._slow_pct_noted):
-                why = f"{key} missed {m} of {n} slow calls, over the {self.max_miss_pct:g}% limit"
-                if broke:
-                    self._slow_pct_noted.add(box.ip)
-        if why is None:
-            return None
-        if broke:
-            self.notes.append({"t_unix": t, "after_relay_break": why, "relay_break_t": self.relay_break_t})
-            return None
-        return Void(why, box.role, t)
+        if n >= self.min_ticks_for_pct and m * 100.0 > self.max_miss_pct * n:
+            out.append(Limit(f"{key} missed {m} of {n} slow calls, over the {self.max_miss_pct:g}% limit",
+                             box.role, t, box.ip, after_break=True, once=f"{box.ip} slow calls"))
+        return self._settle(out, defer)
 
     def gen_tick(self, t: float, sample: dict[str, Any], live: dict[str, Any] | None, live_err: str | None,
-                 live_t: float | None = None) -> Void | None:
+                 live_t: float | None = None, defer: list[Limit] | None = None) -> Void | None:
         """The generator box's own tick: its sample, and tenant_sim's live
         counters (or why they can't be read), read at live_t (t if not
         given). tenant_sim and the loop share this box's clock."""
@@ -396,7 +469,7 @@ class Monitor:
                 self._gen_oom0 = oom
         if self.live_required:
             if live is None:
-                return Void(f"the generator's live counters: {live_err}", "generator", t, gen_event_t=t, relay_break_t=self.relay_break_t)
+                return self._settle([Limit(f"the generator's live counters: {live_err}", "generator", t)], defer)
             # tenant_sim logs a failed rewrite and carries on, so an old
             # file with no errors in it must not pass as a live one.
             lt, now = live["t_unix"], t if live_t is None else live_t
@@ -408,7 +481,7 @@ class Monitor:
             elif lt - now > self.live_max_age_s:
                 stale = f"are ahead of this box's clock: t_unix {lt} is {lt - now:.1f} s ahead, over the {self.live_max_age_s:g} s limit"
             if stale:
-                return Void(f"the generator's live counters {stale}", "generator", t, gen_event_t=t, relay_break_t=self.relay_break_t)
+                return self._settle([Limit(f"the generator's live counters {stale}", "generator", t)], defer)
             # Each tick is compared with the one before, so one rise is
             # reported once.
             ce = live.get("client_errors") or {}
@@ -426,12 +499,7 @@ class Monitor:
                 if ce.get("connection_dropped", 0) > c0.get("connection_dropped", 0):
                     self.relay_break(t, "the relay dropped connections")
             self._live0 = live
-        for e in events:
-            if self.relay_break_t is not None and self.relay_break_t <= t:
-                self.notes.append({"t_unix": t, "after_relay_break": e, "relay_break_t": self.relay_break_t})
-                continue
-            return Void(e + ", before the relay broke", "generator", t, gen_event_t=t, relay_break_t=self.relay_break_t)
-        return None
+        return self._settle([Limit(e, "generator", t, after_break=True) for e in events], defer)
 
 
 def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
