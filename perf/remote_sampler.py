@@ -21,7 +21,11 @@ the conditions that void a run:
   live counters: a client error kind, a media upload that failed before it
   went out, or a git add, commit or branch that failed;
 - tenant_sim's live counters are missing, unreadable, stale, ahead of the
-  clock, or go backwards;
+  clock, or go backwards.
+
+Every limit a tick crosses is decided at the tick's end, after all of
+that tick's break signals: a limit and a break on the same tick count as
+after the break.
 
 On a void it writes `<out>/samples/void.json` and exits 3; whoever drives
 the bands acts on that. It never stops anything itself.
@@ -259,8 +263,10 @@ class Void:
 
 @dataclass
 class Limit:
-    """A limit a tick crossed, decided by Monitor.judge: a void, or a note
-    if it waits on a break that came at or before it."""
+    """A limit one tick crossed. The tick's end decides it, once every
+    break signal read in that tick is in (Monitor.judge): a limit and a
+    break on the same tick count as after the break, since one tick can't
+    order them."""
     reason: str
     role: str  # whose result: a relay box's role, or "generator"
     t: float
@@ -784,6 +790,10 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
             tiers = ["fast"] + (["slow"] if t >= next_slow else [])
             if "slow" in tiers:
                 next_slow = t + s.slow_every
+            # Every limit this tick crosses waits for its end: a break signal
+            # read later in the same tick (the live counters come after the
+            # relay boxes) still counts as before the limit.
+            limits: list[Limit] = []
             for box in s.boxes:
                 for tier in tiers:
                     sample, miss = parse_reply(*runner(ssh_argv(s.key or "", s.known_hosts or "", box.ip, tier)), tier)
@@ -795,9 +805,10 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
                     rings[box.role].append(json.dumps({"t": t, "band": band, "tier": tier, **({"sample": sample} if sample else {"miss": miss}),
                                                        **({"partial": partial} if partial else {})}, separators=(",", ":")))
                     stats[box.role].add(tier, sample, partial)
-                    v = mon.box_tick(box, t, sample, miss) if tier == "fast" else mon.slow_tick(box, t, miss)
-                    if v:
-                        return void(v)
+                    if tier == "fast":
+                        mon.box_tick(box, t, sample, miss, limits)
+                    else:
+                        mon.slow_tick(box, t, miss, limits)
             if s.self_role and s.self_config is not None:
                 live, live_err = read_live(s.live_file) if s.live_file else (None, None)
                 live_t = clock()
@@ -809,9 +820,10 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
                     rings[s.self_role].append(json.dumps({"t": t, "band": band, "tier": tier, "sample": sample, **({"live": live} if live else {})}, separators=(",", ":")))
                     stats[s.self_role].add(tier, sample)
                     if tier == "fast":
-                        v = mon.gen_tick(t, sample, live, live_err, live_t)
-                        if v:
-                            return void(v)
+                        mon.gen_tick(t, sample, live, live_err, live_t, limits)
+            v = mon.judge(limits)
+            if v:
+                return void(v)
             if s.once or (s.duration is not None and clock() - start >= s.duration):
                 flush()
                 return EXIT_OK

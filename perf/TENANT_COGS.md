@@ -471,6 +471,10 @@ python3 perf/tenant_cogs.py remote-sample \
     whichever came first; another box's break doesn't count for it. The
     generator's own limits wait on the first break of any relay. Each
     source's first break is a note.
+  - **The same tick.** Every limit a tick crosses is decided at the tick's
+    end, once all of that tick's break signals are in. A limit and a break
+    on the same tick count as after the break: one tick can't order them,
+    and the loop reads the relay boxes before the live counters.
   - A changed rule set, a missing hash, and live counters that are
     missing or no longer live void at any time, before or after a break.
 - **INT and TERM** write the band summaries, then exit 130 and 143. A

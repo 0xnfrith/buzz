@@ -887,6 +887,74 @@ class Loop(unittest.TestCase):
                 {"t_unix": 1025.0, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: ssh exit 255: ssh: connect to host 10.77.0.3 port 22: Connection timed out", "relay_break_t": 1005.0},
             ])
 
+    def same_tick(self, d: Path, box_fails: str, live_from: int, **live_counts: int):  # type: ignore[no-untyped-def]
+        """Box limits that reach 3 at t=1020, and the live counters show a
+        break from live_from. The loop reads the boxes first, then the live
+        counters."""
+        live = d / "live.json"
+
+        def answer(t: float, tier: str) -> tuple[int, str, str]:
+            live.write_text(json.dumps(live_counters(int(t), **(live_counts if t >= live_from else {}))))
+            if box_fails == "fast" and t >= 1010:
+                return 255, "", "ssh: connect to host 10.77.0.3 port 22: Connection timed out\n"
+            row = relay_sample(t, tier=tier)
+            if box_fails == "slow" and tier == "slow" and t >= 1010:
+                row["errors"] = ["psql: exit 2: psql: error: connection to server failed"]
+            return 0, json.dumps(row), ""
+        live.write_text(json.dumps(live_counters(1000)))
+        return self.drive(self.settings(d, live_file=str(live), slow_every=5.0, duration=30.0), answer)
+
+    def test_a_slow_limit_on_the_tick_the_live_counters_break_is_a_note(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            code, _ = self.same_tick(Path(d), "slow", 1020, rejected=3)
+            self.assertEqual(code, 0, self.stderr)
+            notes = [json.loads(l) for l in (Path(d) / "samples" / "notes.jsonl").read_text().splitlines()]
+            self.assertEqual(notes, [
+                {"t_unix": 1020.0, "relay_break": "the relay rejected 3 events"},
+                {"t_unix": 1020.0, "after_relay_break": "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: exit 2: psql: error: connection to server failed", "relay_break_t": 1020.0},
+            ])
+
+    def test_unreachable_on_the_tick_the_live_counters_break_is_a_note(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            code, _ = self.same_tick(Path(d), "fast", 1020, media_unanswered=2)
+            self.assertEqual(code, 0, self.stderr)
+            notes = [json.loads(l) for l in (Path(d) / "samples" / "notes.jsonl").read_text().splitlines()]
+            self.assertEqual(notes, [
+                {"t_unix": 1020.0, "relay_break": "the relay didn't answer 2 media uploads"},
+                {"t_unix": 1020.0, "after_relay_break": "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: ssh exit 255: ssh: connect to host 10.77.0.3 port 22: Connection timed out", "relay_break_t": 1020.0},
+                # The slow call on each tick failed too: its own run, noted apart.
+                {"t_unix": 1020.0, "after_relay_break": "relay1 (10.77.0.3): 3 slow calls in a row failed; the last: ssh exit 255: ssh: connect to host 10.77.0.3 port 22: Connection timed out", "relay_break_t": 1020.0},
+            ])
+
+    def test_a_box_limit_a_tick_before_the_break_still_voids(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            code, _ = self.same_tick(Path(d), "slow", 1025, rejected=3)
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual((void["reason"], void["t_unix"]),
+                             ("relay1 (10.77.0.3): 3 slow calls in a row failed; the last: the slow sample has errors: psql: exit 2: psql: error: connection to server failed", 1020.0))
+
+    def test_a_generator_error_on_the_tick_a_box_breaks_is_a_note(self) -> None:
+        """The other direction: the box's own break, read before the live
+        counters on the same tick."""
+        with tempfile.TemporaryDirectory() as d:
+            live = Path(d) / "live.json"
+
+            def answer(t: float, tier: str) -> tuple[int, str, str]:
+                live.write_text(json.dumps(live_counters(int(t), media_client_failed=1 if t >= 1020 else 0)))
+                row = relay_sample(t, tier=tier)
+                if t >= 1020:
+                    row["containers"]["relay"]["oom_kill"] = 1
+                return 0, json.dumps(row), ""
+            live.write_text(json.dumps(live_counters(1000)))
+            code, _ = self.drive(self.settings(Path(d), live_file=str(live), duration=30.0), answer)
+            self.assertEqual(code, 0, self.stderr)
+            notes = [json.loads(l) for l in (Path(d) / "samples" / "notes.jsonl").read_text().splitlines()]
+            self.assertEqual(notes, [
+                {"t_unix": 1020.0, "relay_break": "relay1 (10.77.0.3): the relay was OOM-killed"},
+                {"t_unix": 1020.0, "after_relay_break": "the generator reported its own errors: media_client_failed +1", "relay_break_t": 1020.0},
+            ])
+
     def test_slow_failures_before_a_relay_break_void_through_the_loop(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             def answer(t: float, tier: str) -> tuple[int, str, str]:
