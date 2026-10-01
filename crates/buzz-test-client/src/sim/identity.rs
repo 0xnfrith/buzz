@@ -217,6 +217,20 @@ async fn wait_switched_on(slot: &mut RampSlot, band: &mut watch::Receiver<Band>)
     }
 }
 
+/// Resolves once the run is stopping: a `stop`, or a lease that ran out.
+/// Never resolves if the signal's sender is gone without a stop (it lives
+/// as long as the process).
+pub async fn until_stop(rx: &mut watch::Receiver<Band>) {
+    loop {
+        if *rx.borrow_and_update() == Band::Stop {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 pub fn next_band(rx: &mut watch::Receiver<Band>, current: Band) -> Option<Band> {
     match rx.has_changed() {
         Ok(true) => Some(*rx.borrow_and_update()),
@@ -691,6 +705,11 @@ impl Session {
             n: self.turns,
         };
         for r in reads::turn_reads(&self.profile.kinds, &turn) {
+            // Each read is bounded by the client's timeout; between them, a
+            // stopped run reads no more.
+            if *self.band_rx.borrow() == Band::Stop {
+                break;
+            }
             let res = reads::read(
                 &self.http,
                 &self.world.http_url,
@@ -748,35 +767,44 @@ impl Session {
         record_join: bool,
         storm_ms: bool,
         since: Option<u64>,
-    ) -> Result<BuzzTestClient> {
+    ) -> Result<Option<BuzzTestClient>> {
         info!("{} reconnect ({reason})", self.rec.name);
         let mut delay = Duration::from_millis(250);
         let cap = Duration::from_secs(5);
+        // Every attempt, its backoff and the subscribe after it end when the
+        // run stops (a `stop`, or a lease that ran out): None. A relay that
+        // is gone must not keep a stopped run alive.
+        let mut stop = self.band_rx.clone();
         loop {
-            match connect_identity(
-                &self.world.relay_url,
-                &self.rec,
-                &self.keys,
-                self.oa_owner.as_ref(),
-            )
-            .await
-            {
+            let attempt = tokio::select! {
+                r = connect_identity(
+                    &self.world.relay_url,
+                    &self.rec,
+                    &self.keys,
+                    self.oa_owner.as_ref(),
+                ) => r,
+                _ = until_stop(&mut stop) => return Ok(None),
+            };
+            match attempt {
                 Ok(mut client) => {
                     let start = Instant::now();
-                    let n = subscribe_all(
-                        &mut client,
-                        &self.rec.name,
-                        &self.rec.pubkey,
-                        &self.world.channels,
-                        &self.sub_kinds(),
-                        limit,
-                        &self.stats,
-                        record_join,
-                        since,
-                        EosePolicy::Tolerant,
-                    )
-                    .await
-                    .unwrap_or(0);
+                    let kinds = self.sub_kinds();
+                    let subscribed = tokio::select! {
+                        n = subscribe_all(
+                            &mut client,
+                            &self.rec.name,
+                            &self.rec.pubkey,
+                            &self.world.channels,
+                            &kinds,
+                            limit,
+                            &self.stats,
+                            record_join,
+                            since,
+                            EosePolicy::Tolerant,
+                        ) => n,
+                        _ = until_stop(&mut stop) => return Ok(None),
+                    };
+                    let n = subscribed.unwrap_or(0);
                     if storm_ms {
                         self.stats.record_storm_backfill(
                             "peak",
@@ -784,12 +812,15 @@ impl Session {
                             n,
                         );
                     }
-                    return Ok(client);
+                    return Ok(Some(client));
                 }
                 Err(e) => {
                     self.stats.record_client_error("reconnect_failed");
                     warn!("{} reconnect failed: {e}", self.rec.name);
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = until_stop(&mut stop) => return Ok(None),
+                    }
                     delay = (delay * 2).min(cap);
                 }
             }
@@ -849,14 +880,19 @@ pub async fn run_identity(
         http: guard::http_client(Duration::from_secs(30))?,
     };
 
-    let mut client = match connect_identity(
-        &sess.world.relay_url,
-        &sess.rec,
-        &sess.keys,
-        sess.oa_owner.as_ref(),
-    )
-    .await
-    {
+    // The first connect and subscribe end when the run stops, too: a
+    // joiner switched on just before a stop mustn't hold the run open.
+    let mut stop = band_rx.clone();
+    let connected = tokio::select! {
+        r = connect_identity(
+            &sess.world.relay_url,
+            &sess.rec,
+            &sess.keys,
+            sess.oa_owner.as_ref(),
+        ) => r,
+        _ = until_stop(&mut stop) => return Ok(()),
+    };
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("{} connect: {e:#}", sess.rec.name);
@@ -864,20 +900,23 @@ pub async fn run_identity(
             return Err(anyhow!(msg));
         }
     };
-    if let Err(e) = subscribe_all(
-        &mut client,
-        &sess.rec.name,
-        &sess.rec.pubkey,
-        &sess.world.channels,
-        &sess.sub_kinds(),
-        sess.profile.human.backfill_limit,
-        &sess.stats,
-        true,
-        None,
-        EosePolicy::Required,
-    )
-    .await
-    {
+    let kinds = sess.sub_kinds();
+    let subscribed = tokio::select! {
+        r = subscribe_all(
+            &mut client,
+            &sess.rec.name,
+            &sess.rec.pubkey,
+            &sess.world.channels,
+            &kinds,
+            sess.profile.human.backfill_limit,
+            &sess.stats,
+            true,
+            None,
+            EosePolicy::Required,
+        ) => r,
+        _ = until_stop(&mut stop) => return Ok(()),
+    };
+    if let Err(e) = subscribed {
         let msg = format!("{} subscribe: {e:#}", sess.rec.name);
         let _ = ready.send(Err(msg.clone())).await;
         return Err(anyhow!(msg));
@@ -935,9 +974,13 @@ pub async fn run_identity(
             let stagger = Duration::from_secs_f64(
                 rng_f64(&mut sess.rng) * sess.profile.storm.stagger_s as f64,
             );
-            tokio::time::sleep(stagger).await;
+            let mut stop = band_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(stagger) => {}
+                _ = until_stop(&mut stop) => break,
+            }
             let _ = client.disconnect().await;
-            client = sess
+            match sess
                 .reconnect(
                     "storm",
                     sess.profile.storm.backfill_limit,
@@ -945,7 +988,17 @@ pub async fn run_identity(
                     true,
                     None,
                 )
-                .await?;
+                .await?
+            {
+                Some(c) => client = c,
+                // The old socket is already closed: nothing to disconnect.
+                None => {
+                    if sess.world.blink && !blink_closes.is_empty() {
+                        sess.stats.record_blink_closes(&blink_closes);
+                    }
+                    return Ok(());
+                }
+            }
         }
 
         let active = in_active_window(sess.role, band, band_started.elapsed(), &sess.profile);
@@ -986,7 +1039,7 @@ pub async fn run_identity(
                 if is_closed && sess.world.blink {
                     blink_closes.push(unix_now());
                     let since = sess.last_seen_created_at.saturating_sub(5);
-                    client = sess
+                    match sess
                         .reconnect(
                             "blink",
                             sess.profile.human.backfill_limit,
@@ -994,11 +1047,15 @@ pub async fn run_identity(
                             false,
                             Some(since),
                         )
-                        .await?;
+                        .await?
+                    {
+                        Some(c) => client = c,
+                        None => break,
+                    }
                 } else if is_closed {
                     sess.stats.record_client_error("connection_dropped");
                     warn!("{} connection dropped: {s}", sess.rec.name);
-                    client = sess
+                    match sess
                         .reconnect(
                             "drop",
                             sess.profile.human.backfill_limit,
@@ -1006,7 +1063,11 @@ pub async fn run_identity(
                             false,
                             None,
                         )
-                        .await?;
+                        .await?
+                    {
+                        Some(c) => client = c,
+                        None => break,
+                    }
                 } else {
                     sess.stats.record_client_error("recv_error");
                     warn!("{} recv: {s}", sess.rec.name);

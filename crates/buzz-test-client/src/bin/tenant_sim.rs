@@ -147,11 +147,29 @@ struct Args {
     setup_only: bool,
 }
 
-/// What provisioning cost, for the `setup-done` line.
+/// What provisioning cost, for the `setup-done` line, and the band signal,
+/// so a stop ends setup's waits.
 #[derive(Debug, Default)]
 struct SetupStats {
     events: u64,
     rate_limited: u64,
+    stop: Option<tokio::sync::watch::Receiver<sim::roles::Band>>,
+}
+
+impl SetupStats {
+    /// Sleeps `d`, or until the run stops: Err then.
+    async fn sleep(&mut self, d: Duration, what: &str) -> Result<()> {
+        match self.stop.as_mut() {
+            Some(stop) => tokio::select! {
+                _ = tokio::time::sleep(d) => Ok(()),
+                _ = sim::identity::until_stop(stop) => bail!("{what}: the run was stopped during setup"),
+            },
+            None => {
+                tokio::time::sleep(d).await;
+                Ok(())
+            }
+        }
+    }
 }
 
 fn unix_now() -> u64 {
@@ -204,13 +222,15 @@ async fn send_with_retry(
                 waits += 1;
                 setup.rate_limited += 1;
                 last = anyhow::anyhow!("{what}: still rate-limited after {waits} waits");
-                tokio::time::sleep(retry_in).await;
+                setup.sleep(retry_in, what).await?;
             }
             Err(e) => {
                 last = anyhow::anyhow!("{what}: {e}");
                 warn!("{what} attempt {attempt}: {e}");
                 attempt += 1;
-                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                setup
+                    .sleep(Duration::from_millis(200 * attempt as u64), what)
+                    .await?;
                 match BuzzTestClient::connect(relay_url.as_str(), keys).await {
                     Ok(c) => *client = c,
                     Err(ce) => warn!("reconnect after {what}: {ce}"),
@@ -381,6 +401,23 @@ fn check_open_files_in(limits: Option<&str>, ramp: &Ramp) -> Result<()> {
     bail!("/proc/self/limits has no open-file limit")
 }
 
+/// A run stopped (a `stop`, or a lease that ran out) before its population
+/// was measured: the last live.json says why, and the exit is 0, or 5 for
+/// a lease.
+fn stopped_early(
+    control: &signal::Control,
+    stats: &Stats,
+    live_task: &tokio::task::JoinHandle<()>,
+    live_path: &std::path::Path,
+) -> Result<i32> {
+    live_task.abort();
+    let ended = control.ended().unwrap_or(Ended::Stop);
+    let mut last = stats.live(unix_now());
+    last.ended = Some(ended.as_str().to_string());
+    write_live(live_path, &last)?;
+    Ok(if ended == Ended::Lease { 5 } else { 0 })
+}
+
 /// How many events the volume seed writes: `--seed-days` of the profile's
 /// history, or `--seed-events` exactly.
 fn seed_count(profile: &Profile, args: &Args) -> u64 {
@@ -415,8 +452,10 @@ async fn provision(
                 setup,
             )
             .await?;
+            // An identity the relay didn't admit isn't in the population a
+            // run measures: setup fails, as for a refused channel create.
             if !ok.accepted {
-                warn!("9030 {} rejected: {}", rec.name, ok.message);
+                bail!("9030 {} rejected: {}", rec.name, ok.message);
             }
         }
     }
@@ -453,7 +492,9 @@ async fn provision(
     for rec in pop.humans.iter().chain(pop.agents.iter()) {
         for ch in &channels {
             let ev = kinds::member_add(&owner_keys, &profile.kinds, ch, &rec.pubkey)?;
-            match send_with_retry(
+            // Every identity joins every channel: a join the relay refused,
+            // or one that failed after its retries, fails setup.
+            let ok = send_with_retry(
                 &mut owner,
                 &owner_keys,
                 &targets.relay,
@@ -461,13 +502,9 @@ async fn provision(
                 &format!("9000 {} {ch}", rec.name),
                 setup,
             )
-            .await
-            {
-                Ok(ok) if !ok.accepted => {
-                    warn!("9000 {} {} rejected: {}", rec.name, ch, ok.message);
-                }
-                Ok(_) => {}
-                Err(e) => warn!("9000 {} {ch}: {e:#}", rec.name),
+            .await?;
+            if !ok.accepted {
+                bail!("9000 {} {ch} rejected: {}", rec.name, ok.message);
             }
         }
     }
@@ -583,13 +620,17 @@ async fn run(args: Args) -> Result<i32> {
     write_live(&live_path, &stats.live(unix_now()))?;
     let live_task = spawn_live_writer(stats.clone(), live_path.clone(), LIVE_EVERY);
     let setup_started = Instant::now();
-    let mut setup = SetupStats::default();
+    let mut setup = SetupStats {
+        stop: Some(control.band.clone()),
+        ..SetupStats::default()
+    };
     let (channels, repos) =
         match provision(&profile, &pop, &args, &targets, &stats, &mut setup).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("warm-up failed: {e:#}");
                 warn!("warm-up failed: {e:#}");
+                emit(&serde_json::json!({"phase": "setup-failed", "why": format!("{e:#}")}));
                 return Ok(3);
             }
         };
@@ -611,6 +652,7 @@ async fn run(args: Args) -> Result<i32> {
             &channels,
             seed_events,
             Duration::from_secs(args.seed_max_seconds),
+            control.band.clone(),
         )
         .await?;
         seed_failed = report.rejected > 0 || report.errors > 0;
@@ -637,7 +679,16 @@ async fn run(args: Args) -> Result<i32> {
             .go
             .take()
             .ok_or_else(|| anyhow::anyhow!("continue taken twice"))?;
-        match timeout(within, go).await {
+        // A stop (or a lease that runs out) while setup waits for continue
+        // ends the run there: nobody connected, nothing to measure.
+        let mut stop = control.band.clone();
+        let waited = tokio::select! {
+            r = timeout(within, go) => r,
+            _ = sim::identity::until_stop(&mut stop) => {
+                return stopped_early(&control, &stats, &live_task, &live_path);
+            }
+        };
+        match waited {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 eprintln!("band signal closed before continue");
@@ -753,6 +804,7 @@ async fn run(args: Args) -> Result<i32> {
     drop(ready_tx);
 
     let mut ready = 0usize;
+    let mut stop = control.band.clone();
     let wait = timeout(Duration::from_secs(180), async {
         while ready < expected {
             match ready_rx.recv().await {
@@ -769,8 +821,17 @@ async fn run(args: Args) -> Result<i32> {
             }
         }
         Ok(())
-    })
-    .await;
+    });
+    // A stop while the population connects ends the run there too.
+    let wait = tokio::select! {
+        w = wait => w,
+        _ = sim::identity::until_stop(&mut stop) => {
+            for t in &tasks {
+                t.abort();
+            }
+            return stopped_early(&control, &stats, &live_task, &live_path);
+        }
+    };
     match wait {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -1388,6 +1449,233 @@ mod tests {
                 "{name}: git reached the server"
             );
         }
+
+        setup_membership_and_stops(&profile, &deny, &dir).await;
+    }
+
+    /// The rest of the run-level rows, run in the same test as the ones
+    /// above so no two runs share the phases file at once.
+    async fn setup_membership_and_stops(
+        profile: &std::path::Path,
+        deny: &std::path::Path,
+        dir: &std::path::Path,
+    ) {
+        use sim::admission::testrelay::{relay_with, Answer};
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+        let phases_of = |out: &std::path::Path| -> Vec<serde_json::Value> {
+            read(&out.join("phases.jsonl"))
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("phase line"))
+                .collect()
+        };
+        let live_of = |out: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&read(&out.join("live.json"))).unwrap_or_default()
+        };
+        let start = |name: &str, relay: &str, extra: &[&str]| {
+            let out = dir.join(name);
+            let mut argv: Vec<String> = [
+                "tenant_sim",
+                "--profile",
+                &profile.to_string_lossy(),
+                "--relay-url",
+                relay,
+                "--http-url",
+                "http://127.0.0.1:1",
+                "--allow-cidr",
+                "127.0.0.0/8",
+                "--deny-list",
+                &deny.to_string_lossy(),
+                "--out-dir",
+                &out.to_string_lossy(),
+                "--band-signal",
+                "fifo",
+                "--git-credential-helper",
+                "/usr/bin/true",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            let args = Args::try_parse_from(argv).expect("args");
+            (tokio::spawn(run(args)), out)
+        };
+        let send = |out: &std::path::Path, line: &'static str| {
+            let fifo = out.join("band.fifo");
+            tokio::task::spawn_blocking(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open fifo");
+                writeln!(f, "{line}").expect("write");
+            })
+        };
+        async fn until(what: &str, within: Duration, mut ok: impl FnMut() -> bool) {
+            let started = Instant::now();
+            while !ok() {
+                assert!(started.elapsed() < within, "{what}: not within {within:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        async fn ends(
+            name: &str,
+            task: tokio::task::JoinHandle<Result<i32>>,
+            within: Duration,
+        ) -> i32 {
+            match timeout(within, task).await {
+                Ok(joined) => joined.expect("join").expect("run"),
+                Err(_) => panic!("{name}: the run didn't end within {within:?}"),
+            }
+        }
+
+        // HIGH 1: every relay-member (9030) and channel-member (9000) event
+        // must land, or setup fails: exit 3, its own line, no setup-done,
+        // nothing measured.
+        fn reject_9030(k: u64) -> Answer {
+            if k == 9030 {
+                Answer::Reject("blocked: test 9030")
+            } else {
+                Answer::Accept
+            }
+        }
+        fn reject_9000(k: u64) -> Answer {
+            if k == 9000 {
+                Answer::Reject("restricted: test 9000")
+            } else {
+                Answer::Accept
+            }
+        }
+        fn close_on_9000(k: u64) -> Answer {
+            if k == 9000 {
+                Answer::Close
+            } else {
+                Answer::Accept
+            }
+        }
+        // A row: its name, the relay's answers, and the line it fails setup
+        // with (whole, or as a start and an end around the channel id).
+        type Row = (&'static str, fn(u64) -> Answer, &'static str, &'static str);
+        let rows: [Row; 3] = [
+            ("member-9030-rejected", reject_9030, "9030 h0 rejected: blocked: test 9030", ""),
+            ("member-9000-rejected", reject_9000, "9000 h0 ", " rejected: restricted: test 9000"),
+            ("member-9000-closed", close_on_9000, "9000 h0 ", ": WebSocket error: WebSocket protocol error: Connection reset without closing handshake"),
+        ];
+        for (name, answer, starts, ends_with) in rows {
+            let relay = relay_with(answer).await;
+            let (task, out) = start(name, &relay.url, &[]);
+            let code = ends(name, task, Duration::from_secs(60)).await;
+            assert_eq!(code, 3, "{name}");
+            let phases = phases_of(&out);
+            let names: Vec<&str> = phases.iter().filter_map(|p| p["phase"].as_str()).collect();
+            assert_eq!(names, ["setup-failed"], "{name}: no setup-done, no ready");
+            let why = phases[0]["why"].as_str().expect("why");
+            if ends_with.is_empty() {
+                assert_eq!(why, starts, "{name}");
+            } else {
+                assert!(
+                    why.starts_with(starts) && why.ends_with(ends_with),
+                    "{name}: {why}"
+                );
+            }
+            assert_eq!(live_of(&out)["sent"], 0, "{name}: a band was measured");
+        }
+
+        // A stop while setup waits out a rate limit (the relay names 60 s)
+        // ends setup within seconds, with its own line.
+        fn rate_limit_9030(k: u64) -> Answer {
+            if k == 9030 {
+                Answer::RateLimit
+            } else {
+                Answer::Accept
+            }
+        }
+        let relay = relay_with(rate_limit_9030).await;
+        let (task, out) = start("setup-stopped", &relay.url, &[]);
+        until("setup-stopped: the fifo", Duration::from_secs(20), || {
+            out.join("band.fifo").exists()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        send(&out, "stop").await.expect("writer");
+        assert_eq!(
+            ends("setup-stopped", task, Duration::from_secs(15)).await,
+            3
+        );
+        let phases = phases_of(&out);
+        assert_eq!(
+            phases,
+            vec![
+                serde_json::json!({"phase": "setup-failed", "why": "9030 h0: the run was stopped during setup"})
+            ]
+        );
+
+        // HIGH 2: a relay that drops, then a lease that runs out with no
+        // newer signal: every identity stuck reconnecting stops, exit 5,
+        // and the last live.json says lease.
+        let relay = relay_with(|_| Answer::Accept).await;
+        let (task, out) = start("dropped-lease", &relay.url, &[]);
+        until("dropped-lease: ready", Duration::from_secs(60), || {
+            read(&out.join("phases.jsonl")).contains("\"ready\"")
+        })
+        .await;
+        send(&out, "band floor 4").await.expect("writer");
+        relay.kill();
+        assert_eq!(
+            ends("dropped-lease", task, Duration::from_secs(30)).await,
+            5
+        );
+        let live = live_of(&out);
+        assert_eq!(live["ended"], "lease");
+        assert!(
+            live["client_errors"]["reconnect_failed"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "the identities were reconnecting: {live}"
+        );
+
+        // The same, ended by a stop: exit 0, the last live.json says stop.
+        let relay = relay_with(|_| Answer::Accept).await;
+        let (task, out) = start("dropped-stop", &relay.url, &[]);
+        until("dropped-stop: ready", Duration::from_secs(60), || {
+            read(&out.join("phases.jsonl")).contains("\"ready\"")
+        })
+        .await;
+        send(&out, "band floor 600").await.expect("writer");
+        relay.kill();
+        until(
+            "dropped-stop: reconnecting",
+            Duration::from_secs(20),
+            || {
+                live_of(&out)["client_errors"]["reconnect_failed"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0
+            },
+        )
+        .await;
+        send(&out, "stop").await.expect("writer");
+        assert_eq!(ends("dropped-stop", task, Duration::from_secs(30)).await, 0);
+        assert_eq!(live_of(&out)["ended"], "stop");
+
+        // A stop while setup waits for continue ends the run there.
+        let relay = relay_with(|_| Answer::Accept).await;
+        let (task, out) = start("stop-before-continue", &relay.url, &["--pause-after-setup"]);
+        until(
+            "stop-before-continue: setup-done",
+            Duration::from_secs(60),
+            || read(&out.join("phases.jsonl")).contains("\"setup-done\""),
+        )
+        .await;
+        send(&out, "stop").await.expect("writer");
+        assert_eq!(
+            ends("stop-before-continue", task, Duration::from_secs(30)).await,
+            0
+        );
+        assert_eq!(live_of(&out)["ended"], "stop");
+        assert!(
+            !read(&out.join("phases.jsonl")).contains("\"ready\""),
+            "the population connected"
+        );
     }
 
     #[test]

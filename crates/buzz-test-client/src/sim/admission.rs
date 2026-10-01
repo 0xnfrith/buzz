@@ -86,18 +86,50 @@ pub async fn publish(
 /// A fake relay for the rows that need a socket.
 #[cfg(test)]
 pub(crate) mod testrelay {
-    /// A relay that takes every connection and accepts everything: an AUTH
-    /// challenge on connect, OK for every AUTH and EVENT, EOSE for every
-    /// REQ. For a whole run without a real relay.
-    pub(crate) async fn accepting_relay() -> String {
+    /// How a test relay answers an EVENT of a given kind.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Answer {
+        Accept,
+        /// OK false, with this message.
+        Reject(&'static str),
+        /// No answer: the socket is closed.
+        Close,
+        /// The per-key rate limit's NOTICE, no OK.
+        RateLimit,
+    }
+
+    /// A test relay; `kill` drops it: every open socket closes, and new
+    /// connections are refused.
+    pub(crate) struct TestRelay {
+        pub(crate) url: String,
+        kill: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl TestRelay {
+        pub(crate) fn kill(&self) {
+            let _ = self.kill.send(true);
+        }
+    }
+
+    /// A relay that takes every connection: an AUTH challenge on connect,
+    /// OK for every AUTH, EOSE for every REQ, and for each EVENT what
+    /// `answer` says for its kind.
+    pub(crate) async fn relay_with(answer: fn(u64) -> Answer) -> TestRelay {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let (kill, killed) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
-            while let Ok((tcp, _)) = listener.accept().await {
+            let mut stop = killed.clone();
+            loop {
+                let (tcp, _) = tokio::select! {
+                    r = listener.accept() => match r { Ok(c) => c, Err(_) => return },
+                    _ = stop.changed() => return, // the listener drops: refused
+                };
+                let mut stop = killed.clone();
                 tokio::spawn(async move {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
                         return;
@@ -106,15 +138,28 @@ pub(crate) mod testrelay {
                     if ws.send(Message::Text(challenge.into())).await.is_err() {
                         return;
                     }
-                    while let Some(Ok(msg)) = ws.next().await {
+                    loop {
+                        let msg = tokio::select! {
+                            m = ws.next() => match m { Some(Ok(m)) => m, _ => return },
+                            _ = stop.changed() => return, // the socket drops
+                        };
                         let Ok(text) = msg.into_text() else { continue };
                         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
                             continue;
                         };
                         let reply = match v[0].as_str() {
-                            Some("AUTH") | Some("EVENT") => {
-                                serde_json::json!(["OK", v[1]["id"], true, ""])
-                            }
+                            Some("AUTH") => serde_json::json!(["OK", v[1]["id"], true, ""]),
+                            Some("EVENT") => match answer(v[1]["kind"].as_u64().unwrap_or(0)) {
+                                Answer::Accept => serde_json::json!(["OK", v[1]["id"], true, ""]),
+                                Answer::Reject(m) => {
+                                    serde_json::json!(["OK", v[1]["id"], false, m])
+                                }
+                                Answer::Close => return,
+                                Answer::RateLimit => serde_json::json!([
+                                    "NOTICE",
+                                    "rate-limited: quota exceeded; retry in 60s"
+                                ]),
+                            },
                             Some("REQ") => serde_json::json!(["EOSE", v[1]]),
                             _ => continue,
                         };
@@ -129,7 +174,19 @@ pub(crate) mod testrelay {
                 });
             }
         });
-        format!("ws://{addr}")
+        TestRelay {
+            url: format!("ws://{addr}"),
+            kill,
+        }
+    }
+
+    /// A relay that accepts everything. For a whole run without a real
+    /// relay.
+    pub(crate) async fn accepting_relay() -> String {
+        // The relay outlives the test: its kill switch is never used.
+        let r = relay_with(|_| Answer::Accept).await;
+        std::mem::forget(r.kill);
+        r.url
     }
 
     /// A one-connection relay that answers the first EVENT with `replies`,
