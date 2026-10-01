@@ -32,6 +32,7 @@ fn failed(at: GitFailure) -> impl Fn(anyhow::Error) -> PushError {
     move |err| PushError { at, err }
 }
 
+#[derive(Clone)]
 pub struct GitRepo {
     pub name: String,
     pub owner_hex: String,
@@ -225,6 +226,32 @@ pub fn clone_repo(
     })
 }
 
+/// [`clone_repo`] on tokio's blocking pool: git runs as a child process for
+/// up to [`GIT_TIMEOUT`], and must not hold a runtime worker meanwhile.
+pub async fn clone_repo_async(
+    http_url: Target,
+    owner_hex: String,
+    name: String,
+    dest: PathBuf,
+    helper: PathBuf,
+    nsec: String,
+    auth_tag: Option<String>,
+) -> Result<GitRepo> {
+    tokio::task::spawn_blocking(move || {
+        clone_repo(
+            &http_url,
+            &owner_hex,
+            &name,
+            &dest,
+            &helper,
+            &nsec,
+            auth_tag.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("clone task: {e}"))?
+}
+
 /// Commits `bytes` as a new file and pushes it. Writing the file, `add`,
 /// `commit` and `branch` are the generator's own work (`Local`); the push
 /// is the relay's (`Push`). Each blob is a new file, so `commit` always has
@@ -268,6 +295,26 @@ pub fn push_blob(
     )
     .map_err(failed(GitFailure::Push))?;
     Ok((bytes.len() as u64, start.elapsed().as_secs_f64() * 1e3))
+}
+
+/// [`push_blob`] on tokio's blocking pool: git runs as child processes for
+/// up to [`GIT_TIMEOUT`] each, and must not hold a runtime worker meanwhile.
+/// The generator box has 2 vCPUs, so 2 workers: two slow pushes run on
+/// them would stall every task, the live counters' writer too.
+pub async fn push_blob_async(
+    repo: GitRepo,
+    helper: PathBuf,
+    bytes: Vec<u8>,
+    seq: u64,
+) -> std::result::Result<(u64, f64), PushError> {
+    tokio::task::spawn_blocking(move || push_blob(&repo, &helper, &bytes, seq))
+        .await
+        .unwrap_or_else(|e| {
+            Err(PushError {
+                at: GitFailure::Local,
+                err: anyhow!("push task: {e}"),
+            })
+        })
 }
 
 #[cfg(test)]
@@ -558,6 +605,102 @@ mod tests {
         assert_eq!(e.at, GitFailure::Local, "{e}");
         assert!(e.to_string().contains("\"add\""), "{e}");
         assert_eq!(refusing.accepts(), 0, "a failed add still pushed");
+    }
+
+    /// Two pushes to a remote that answers only after 12 s, at once, on a
+    /// 2-worker runtime: the generator box's 2 vCPUs. The live counters'
+    /// writer keeps running, so live.json is never more than a few seconds
+    /// old; the sampler voids at 10 s. Run on the workers, the pushes would
+    /// stall it for the whole 12 s.
+    #[test]
+    fn slow_pushes_do_not_stall_the_live_writer() {
+        use crate::sim::stats::{spawn_live_writer, write_live, Stats};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let slow = Server::start_after(
+            "127.0.0.1:0",
+            testsrv::status(500, ""),
+            Duration::from_secs(12),
+        );
+        let dir = testsrv::tempdir();
+        let repos: Vec<GitRepo> = (0..2)
+            .map(|i| local_repo(dir.join(format!("wt{i}")), remote(&slow)))
+            .collect();
+        let live = dir.join("live.json");
+        let now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_secs_f64()
+        };
+        // tenant_sim writes the file once before the writer starts.
+        let stats = Arc::new(Stats::new());
+        write_live(&live, &stats.live(now() as u64)).expect("first write");
+        let done = Arc::new(AtomicBool::new(false));
+        // A plain thread, off the runtime, reads live.json's age throughout.
+        let watcher = {
+            let (live, done) = (live.clone(), done.clone());
+            thread::spawn(move || {
+                let (mut worst, mut reads) = (0.0f64, 0u32);
+                while !done.load(Ordering::SeqCst) {
+                    let t = std::fs::read(&live)
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .and_then(|v| v["t_unix"].as_u64());
+                    if let Some(t) = t {
+                        worst = worst.max(now() - t as f64);
+                        reads += 1;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                (worst, reads)
+            })
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = Instant::now();
+        let results = rt.block_on(async {
+            let writer = spawn_live_writer(stats.clone(), live.clone(), Duration::from_secs(2));
+            let pushes: Vec<_> = repos
+                .into_iter()
+                .enumerate()
+                .map(|(i, repo)| {
+                    tokio::spawn(push_blob_async(
+                        repo,
+                        PathBuf::from("/usr/bin/true"),
+                        vec![i as u8; 64],
+                        1,
+                    ))
+                })
+                .collect();
+            let mut out = Vec::new();
+            for p in pushes {
+                out.push(p.await.expect("push task"));
+            }
+            writer.abort();
+            out
+        });
+        let took = started.elapsed();
+        done.store(true, Ordering::SeqCst);
+        let (worst, reads) = watcher.join().expect("watcher");
+        assert!(
+            took >= Duration::from_secs(12),
+            "the pushes didn't wait for the slow remote: {took:?}"
+        );
+        for r in results {
+            let e = r.map(|_| ()).expect_err("a push to a 500");
+            assert_eq!(e.at, GitFailure::Push, "{e}");
+        }
+        assert!(reads >= 20, "live.json was read only {reads} times");
+        assert!(
+            worst < 5.0,
+            "live.json was {worst:.1} s old while two slow pushes ran; the sampler voids at 10 s"
+        );
     }
 
     #[test]

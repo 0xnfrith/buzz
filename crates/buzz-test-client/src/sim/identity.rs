@@ -577,14 +577,15 @@ impl Session {
                 }
             }
             "git_push" => {
-                if let Some(repo) = self.git_repo.as_ref() {
+                if let Some(repo) = self.git_repo.clone() {
                     let lo = self.profile.git.push_kb[0];
                     let hi = *self.profile.git.push_kb.last().unwrap_or(&lo);
                     let kb = lo + (rng_f64(&mut self.rng) * (hi.saturating_sub(lo) as f64)) as u64;
                     let mut blob = vec![0u8; (kb * 1024).max(1) as usize];
                     self.rng.fill(blob.as_mut_slice());
                     let git_seq = self.seq + 1;
-                    match git::push_blob(repo, &self.world.git_helper, &blob, git_seq) {
+                    let helper = self.world.git_helper.clone();
+                    match git::push_blob_async(repo, helper, blob, git_seq).await {
                         Ok((bytes, ms)) => self.stats.record_git(bytes, ms),
                         Err(e) => {
                             warn!("{} git push ({:?}): {e}", self.rec.name, e.at);

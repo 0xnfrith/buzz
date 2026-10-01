@@ -482,6 +482,12 @@ Each blob is a new file, so `commit` always has a change in a healthy run.
 `summary.json` keeps its meaning: its media `rejected` and git `failed`
 count every failure, wherever it failed, not only the relay's refusals.
 
+`tenant_sim` runs git (the setup clones and every push) on tokio's
+blocking pool, never on a runtime worker: each git command can take up to
+90 s, and the generator box's 2 vCPUs give the runtime 2 workers. Two slow
+pushes on them would stall every task, the live counters' writer
+included, and the loop would void the run as stale at the relay's limit.
+
 ## What is not in this tree
 
 Run outputs, identities, kubeconfigs, and `.env` files. `runs/` and

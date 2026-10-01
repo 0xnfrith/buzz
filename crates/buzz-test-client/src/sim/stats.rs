@@ -1,8 +1,9 @@
 //! Client-side counters, percentiles, and the summary JSON schema.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -177,6 +178,33 @@ pub fn write_live(path: &Path, live: &Live) -> std::io::Result<()> {
         serde_json::to_vec(live).map_err(std::io::Error::other)?,
     )?;
     std::fs::rename(&tmp, path)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Rewrites `path` from `stats` every `every`, as a task on the runtime. A
+/// runtime too busy to run it leaves the file stale, and the sampler voids
+/// the run on that, so nothing slow may block a runtime worker (see
+/// `git::push_blob_async`). A failed write is logged and the next one tried.
+pub fn spawn_live_writer(
+    stats: Arc<Stats>,
+    path: PathBuf,
+    every: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            if let Err(e) = write_live(&path, &stats.live(unix_now())) {
+                tracing::warn!("live counters {}: {e}", path.display());
+            }
+        }
+    })
 }
 
 fn count<K: Ord>(m: &BTreeMap<K, u64>, k: K) -> u64 {

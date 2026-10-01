@@ -25,7 +25,7 @@ use sim::kinds;
 use sim::profile::{load_profile, Profile};
 use sim::roles::{Band, Role};
 use sim::seed;
-use sim::stats::{write_live, Stats};
+use sim::stats::{spawn_live_writer, write_live, Stats};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::warn;
@@ -390,15 +390,17 @@ async fn provision(
                     .as_ref()
                     .map(|p| p.join("git").join(&name))
                     .unwrap_or_else(|| PathBuf::from("git").join(&name));
-                match git::clone_repo(
-                    &targets.http,
-                    &agent.pubkey,
-                    &name,
-                    &dest,
-                    helper,
-                    &agent.nsec,
-                    auth_tag.as_deref(),
-                ) {
+                match git::clone_repo_async(
+                    targets.http.clone(),
+                    agent.pubkey.clone(),
+                    name.clone(),
+                    dest,
+                    helper.clone(),
+                    agent.nsec.clone(),
+                    auth_tag.clone(),
+                )
+                .await
+                {
                     Ok(repo) => {
                         repos.push(RepoRef {
                             name: repo.name.clone(),
@@ -483,18 +485,7 @@ async fn run(args: Args) -> Result<i32> {
     // "no errors".
     let live_path = out_dir.join("live.json");
     write_live(&live_path, &stats.live(unix_now()))?;
-    let live_task = {
-        let (stats, path) = (stats.clone(), live_path.clone());
-        tokio::spawn(async move {
-            let mut every = tokio::time::interval(LIVE_EVERY);
-            loop {
-                every.tick().await;
-                if let Err(e) = write_live(&path, &stats.live(unix_now())) {
-                    warn!("live counters {}: {e}", path.display());
-                }
-            }
-        })
-    };
+    let live_task = spawn_live_writer(stats.clone(), live_path.clone(), LIVE_EVERY);
     let setup_started = Instant::now();
     let mut setup = SetupStats::default();
     let (channels, repos) =
