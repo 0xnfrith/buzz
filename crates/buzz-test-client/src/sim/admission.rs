@@ -293,6 +293,71 @@ pub(crate) mod testrelay {
         }
     }
 
+    /// A relay that takes every connection as [`relay_with`] does, accepts
+    /// every EVENT, and logs each REQ as (subscription id, its filters). A
+    /// `#p` subscription (an id ending `-p`) gets `p_events` before its
+    /// EOSE; every other one only its EOSE.
+    pub(crate) async fn req_logging_relay(p_events: Vec<nostr::Event>) -> (String, ReqLog) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let log: ReqLog = Default::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (seen, p_events) = (seen.clone(), p_events.clone());
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    let challenge = serde_json::json!(["AUTH", "test-challenge"]).to_string();
+                    if ws.send(Message::Text(challenge.into())).await.is_err() {
+                        return;
+                    }
+                    while let Some(Ok(msg)) = ws.next().await {
+                        let Ok(text) = msg.into_text() else { continue };
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        let mut replies = Vec::new();
+                        match v[0].as_str() {
+                            Some("AUTH") | Some("EVENT") => {
+                                replies.push(serde_json::json!(["OK", v[1]["id"], true, ""]))
+                            }
+                            Some("REQ") => {
+                                let sid = v[1].as_str().unwrap_or_default().to_string();
+                                let filters: Vec<serde_json::Value> =
+                                    v.as_array().map(|a| a[2..].to_vec()).unwrap_or_default();
+                                seen.lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .push((sid.clone(), serde_json::Value::Array(filters)));
+                                if sid.ends_with("-p") {
+                                    for ev in &p_events {
+                                        replies.push(serde_json::json!(["EVENT", sid, ev]));
+                                    }
+                                }
+                                replies.push(serde_json::json!(["EOSE", sid]));
+                            }
+                            _ => {}
+                        }
+                        for r in replies {
+                            if ws.send(Message::Text(r.to_string().into())).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("ws://{addr}"), log)
+    }
+
+    /// Each REQ a [`req_logging_relay`] got: its subscription id and filters.
+    pub(crate) type ReqLog = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
     /// A relay that accepts everything. For a whole run without a real
     /// relay.
     pub(crate) async fn accepting_relay() -> String {

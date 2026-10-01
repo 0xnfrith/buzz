@@ -286,6 +286,44 @@ not start the relay and cannot restart it.
 - Reactions target the newest received channel event, never a DM or turn
   metric from the `#p` stream.
 
+### The `#p` subscription
+
+Each identity subscribes to the events that tag it (`#p`), from a `since`,
+as Buzz Desktop's live `#p` subscriptions do: never a history query.
+
+- **At warm-up** the filter is `{"#p": [<pubkey>], "since": <its start>}`:
+  no kinds, no limit. Its events are never counted as backfill. Warm-up
+  still requires its EOSE within 8 s.
+- **On a reconnect** (the peak band's storm, a dropped connection, a blink)
+  it is resent as the desktop's reconnect replay resends a live
+  subscription (`desktop/src/shared/api/relayReconnectReplay.ts`:
+  `replayLiveSubscriptions`, line 148, and `buildReconnectReplayFilter`,
+  line 66): from the later of the subscription's own `since` and the newest
+  event seen on it less 5 s (`RECONNECT_REPLAY_SKEW_SECS`, line 12); with
+  no event seen, from its own `since` (line 72). That short catch-up window
+  is real load, and the storm carries it. The channel subscriptions and the
+  gap recheck are unchanged.
+
+**A finding: a kind-less `#p` history query is expensive at volume.** Before
+this, the `#p` subscription had no `since`. Measured on a workstation (arm64,
+the relay at `sha-6e5c462` capped at 2 CPUs and 2 GB, Postgres uncapped, 16
+cores), after the heavy profile's 90-day seed (757,803 events):
+
+| Query | Postgres time |
+|---|---|
+| `{"#p": [<pubkey>]}`, one identity, the relay idle | 1.4 to 1.55 s, for 61 events |
+| `{"kinds": [9, 40002], "#p": [<pubkey>], "limit": 50}`, the relay idle | 1.4 s |
+| `{"#p": [<pubkey>]}` from 100 identities at once (the warm-up) | about 18 s each (median 17.8 s), Postgres on 13 of 16 cores; every other query 5 ms or less |
+| `{"kinds": [39002], "#p": [<pubkey>]}` | 5.6 ms |
+| `{"#p": [<pubkey>], "since": <now>}` | 0.1 ms |
+
+The plan walks every event in the community newest-first, all 763,965, and
+looks each up in `event_mentions`, because the planner expects 323,042
+matches where there are 61. Past the 8 s window, warm-up failed. Two things
+on that rig made it worse: every seed event is stamped at seed time, so a
+`since` an hour back walks them all too (1.39 s); and every event was in one
+partition, `events_p_future`.
+
 ## The ramp
 
 The ramp finds how many people and agents a relay carries before it breaks

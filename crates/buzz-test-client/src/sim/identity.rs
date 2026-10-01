@@ -257,9 +257,21 @@ fn filter_channel(kinds: &[u16], channel: &str, limit: u32) -> Filter {
         .limit(limit as usize)
 }
 
-fn filter_p(pubkey: &str) -> Filter {
-    Filter::new().custom_tags(SingleLetterTag::lowercase(Alphabet::P), [pubkey])
+/// The identity's `#p` subscription, from `since` on: the desktop's live
+/// `#p` subscriptions carry a `since` (the time they start), never a
+/// kind-less history query. On a heavy relay that history query walks every
+/// event newest-first; this one is answered at once. Its events are never
+/// counted as backfill.
+fn filter_p(pubkey: &str, since: u64) -> Filter {
+    Filter::new()
+        .custom_tags(SingleLetterTag::lowercase(Alphabet::P), [pubkey])
+        .since(Timestamp::from(since))
 }
+
+/// The desktop's replay window for a live subscription on reconnect
+/// (`desktop/src/shared/api/relayReconnectReplay.ts`): its filter's own
+/// `since`, or the newest event it saw less 5 s, whichever is later.
+const P_REPLAY_SKEW_S: u64 = 5;
 
 /// Warm-up must prove EOSE; reconnects may keep going if a later EOSE is late.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,6 +320,7 @@ async fn subscribe_all(
     stats: &Stats,
     record_join: bool,
     since: Option<u64>,
+    p_since: u64,
     eose: EosePolicy,
 ) -> Result<u64> {
     let mut returned = 0u64;
@@ -333,7 +346,9 @@ async fn subscribe_all(
         }
     }
     let sid = format!("{identity}-p");
-    client.subscribe(&sid, vec![filter_p(pubkey)]).await?;
+    client
+        .subscribe(&sid, vec![filter_p(pubkey, p_since)])
+        .await?;
     let p_result = client
         .collect_until_eose(&sid, Duration::from_secs(8))
         .await;
@@ -388,6 +403,10 @@ struct Session {
     expected: HashMap<String, u64>,
     missing: HashSet<String>,
     last_seen_created_at: u64,
+    /// When the `#p` subscription first started, and the newest event seen
+    /// on it: a reconnect resubscribes from these, as the desktop does.
+    p_since: u64,
+    p_last_seen: Option<u64>,
     git_repo: Option<GitRepo>,
     http: guard::HttpClient,
 }
@@ -413,8 +432,16 @@ impl Session {
     }
 
     async fn handle_msg(&mut self, band: Band, msg: RelayMessage) {
-        if let RelayMessage::Event { event, .. } = msg {
+        if let RelayMessage::Event {
+            event,
+            subscription_id,
+        } = msg
+        {
             self.last_seen_created_at = self.last_seen_created_at.max(event.created_at.as_secs());
+            if subscription_id == format!("{}-p", self.rec.name) {
+                let t = event.created_at.as_secs();
+                self.p_last_seen = Some(self.p_last_seen.map_or(t, |l| l.max(t)));
+            }
             let channel = tag_value(&event, "h").unwrap_or_default();
             self.seen.push_back((event.id.to_hex(), channel.clone()));
             if self.seen.len() > 64 {
@@ -788,6 +815,18 @@ impl Session {
         }
     }
 
+    /// The `#p` subscription's `since` on a reconnect: the desktop's replay
+    /// (`relayReconnectReplay.ts`, `replayLiveSubscriptions` and
+    /// `buildReconnectReplayFilter`) resends a live subscription from the
+    /// later of its filter's own `since` and the newest event it saw less
+    /// 5 s; with no event seen, from its own `since`.
+    fn p_replay_since(&self) -> u64 {
+        match self.p_last_seen {
+            Some(t) => self.p_since.max(t.saturating_sub(P_REPLAY_SKEW_S)),
+            None => self.p_since,
+        }
+    }
+
     async fn reconnect(
         &mut self,
         reason: &str,
@@ -828,6 +867,7 @@ impl Session {
                             &self.stats,
                             record_join,
                             since,
+                            self.p_replay_since(),
                             EosePolicy::Tolerant,
                         ) => n,
                         _ = until_stop(&mut stop) => return Ok(None),
@@ -973,6 +1013,8 @@ async fn identity_task(
         expected: HashMap::new(),
         missing: HashSet::new(),
         last_seen_created_at: unix_now(),
+        p_since: unix_now(),
+        p_last_seen: None,
         git_repo,
         http: guard::http_client(Duration::from_secs(30))?,
     };
@@ -998,6 +1040,8 @@ async fn identity_task(
         }
     };
     let kinds = sess.sub_kinds();
+    // The `#p` subscription starts now, as the desktop's does.
+    sess.p_since = unix_now();
     let subscribed = tokio::select! {
         r = subscribe_all(
             &mut client,
@@ -1009,6 +1053,7 @@ async fn identity_task(
             &sess.stats,
             true,
             None,
+            sess.p_since,
             EosePolicy::Required,
         ) => r,
         _ = until_stop(&mut stop) => return Ok(()),
@@ -1242,6 +1287,8 @@ mod tests {
             expected: HashMap::new(),
             missing: HashSet::new(),
             last_seen_created_at: unix_now(),
+            p_since: unix_now(),
+            p_last_seen: None,
             git_repo: None,
             http: guard::http_client(Duration::from_secs(5)).expect("http client"),
         }
@@ -1309,6 +1356,140 @@ mod tests {
         assert_eq!((live.sent, live.accepted), (1, 1), "the turn metric");
         assert_eq!((live.read_refused, live.read_client_failed), (3, 0));
         assert_eq!(refusing.accepts(), 3);
+    }
+
+    /// A session whose relay is `url`.
+    fn session_on(stats: Arc<Stats>, url: &str) -> Session {
+        let mut sess = test_session(stats);
+        let guard = TargetGuard::new(vec![Cidr::parse("127.0.0.0/8").expect("allow")], vec![])
+            .expect("guard");
+        let w = &sess.world;
+        sess.world = Arc::new(World {
+            relay_url: guard.check_url(url, &["ws"]).expect("relay"),
+            http_url: w.http_url.clone(),
+            channels: w.channels.clone(),
+            human_pubkeys: w.human_pubkeys.clone(),
+            repos: vec![],
+            git_helper: w.git_helper.clone(),
+            out_dir: w.out_dir.clone(),
+            blink: false,
+        });
+        sess
+    }
+
+    /// An event that tags `pubkey`, made `created_at`.
+    fn p_event(pubkey: &str, created_at: u64) -> nostr::Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(9), "hi")
+            .tags([Tag::parse(["p", pubkey]).expect("tag")])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(&Keys::generate())
+            .expect("sign")
+    }
+
+    /// The `#p` filters a relay was sent, by subscription id.
+    fn p_reqs(log: &admission::testrelay::ReqLog, name: &str) -> Vec<serde_json::Value> {
+        log.lock()
+            .expect("log")
+            .iter()
+            .filter(|(sid, _)| *sid == format!("{name}-p"))
+            .map(|(_, f)| f.clone())
+            .collect()
+    }
+
+    /// The warm-up's `#p` subscription is exactly `#p` and `since` (its
+    /// start): no kinds, no limit, no history query. What it returns is
+    /// never counted as backfill. The channel subscriptions are unchanged.
+    #[tokio::test]
+    async fn the_warmup_p_subscription_starts_at_its_since() {
+        let stats = Arc::new(Stats::new());
+        let sess = test_session(stats.clone());
+        let pk = sess.rec.pubkey.clone();
+        let (url, log) = admission::testrelay::req_logging_relay(vec![
+            p_event(&pk, 1_700_000_000),
+            p_event(&pk, 1_700_000_100),
+        ])
+        .await;
+        let mut client = BuzzTestClient::connect(&url, &sess.keys)
+            .await
+            .expect("connect");
+        let returned = subscribe_all(
+            &mut client,
+            &sess.rec.name,
+            &pk,
+            &sess.world.channels,
+            &sess.sub_kinds(),
+            50,
+            &stats,
+            true,
+            None,
+            1_790_000_000,
+            EosePolicy::Required,
+        )
+        .await
+        .expect("subscribed");
+        assert_eq!(
+            returned, 0,
+            "the #p subscription's events counted as backfill"
+        );
+        assert_eq!(
+            p_reqs(&log, &sess.rec.name),
+            vec![serde_json::json!([{"#p": [pk], "since": 1_790_000_000u64}])]
+        );
+        let ch = log
+            .lock()
+            .expect("log")
+            .iter()
+            .find(|(sid, _)| *sid == format!("{}-ch0", sess.rec.name))
+            .map(|(_, f)| f.clone())
+            .expect("channel REQ");
+        assert!(ch[0].get("since").is_none(), "{ch}");
+        assert_eq!(
+            (ch[0]["#h"][0].as_str(), ch[0]["limit"].as_u64()),
+            (Some("chan-a"), Some(50))
+        );
+    }
+
+    /// A reconnect resubscribes `#p` as the desktop's replay does: from the
+    /// subscription's own start, or the newest event seen on it less 5 s,
+    /// whichever is later. An event on a channel subscription doesn't move
+    /// it, nor does one older than the start.
+    #[tokio::test]
+    async fn a_reconnect_resubscribes_p_as_the_desktop_replays() {
+        let (url, log) = admission::testrelay::req_logging_relay(vec![]).await;
+        let stats = Arc::new(Stats::new());
+        let mut sess = session_on(stats, &url);
+        let name = sess.rec.name.clone();
+        let pk = sess.rec.pubkey.clone();
+        sess.p_since = 1_790_000_000;
+        let on = |sid: &str, t: u64| RelayMessage::Event {
+            subscription_id: sid.to_string(),
+            event: Box::new(p_event(&pk, t)),
+        };
+        // (what came in on which subscription, the since a reconnect sends)
+        let rows: [(Option<(String, u64)>, u64); 4] = [
+            (None, 1_790_000_000),
+            (Some((format!("{name}-ch0"), 1_790_000_900)), 1_790_000_000),
+            (Some((format!("{name}-p"), 1_789_999_000)), 1_790_000_000),
+            (Some((format!("{name}-p"), 1_790_000_500)), 1_790_000_495),
+        ];
+        for (i, (msg, want)) in rows.into_iter().enumerate() {
+            if let Some((sid, t)) = msg {
+                sess.handle_msg(Band::Warmup, on(&sid, t)).await;
+            }
+            let client = sess
+                .reconnect("test", 50, false, false, None)
+                .await
+                .expect("reconnect")
+                .expect("a client");
+            let _ = client.disconnect().await;
+            let reqs = p_reqs(&log, &name);
+            assert_eq!(reqs.len(), i + 1, "row {i}");
+            assert_eq!(
+                reqs[i],
+                serde_json::json!([{"#p": [pk.clone()], "since": want}]),
+                "row {i}"
+            );
+        }
     }
 
     /// An identity that joined, then failed or panicked while the run
