@@ -18,8 +18,8 @@ the conditions that void a run:
 - the generator overloads before the relay breaks: CPU averaging over 70% on
   two 60 s windows in a row, MemAvailable under 10% of MemTotal for 3 ticks,
   an out-of-memory kill on its box, or its own errors rising in tenant_sim's
-  live counters: a client error kind, a media upload that failed before it
-  went out, or a git add, commit or branch that failed;
+  live counters: a client error kind, a media upload or an agent's read that
+  failed before it went out, or a git add, commit or branch that failed;
 - tenant_sim's live counters are missing, unreadable, stale, ahead of the
   clock, or go backwards.
 
@@ -73,11 +73,12 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 # rate_limited (sends the relay's per-key rate limits turned away) is
 # counted apart: neither the relay breaking nor the generator's own error.
 LIVE_TOTALS = ("rejected", "rate_limited", "media_client_failed", "media_refused", "media_unanswered",
-               "git_local_failed", "git_push_failed")
-# Media and git failures, split by where they failed. A media upload that
-# failed before it went out, or a git add, commit or branch, is the
-# generator's own error.
-GEN_FAILURE_TOTALS = ("media_client_failed", "git_local_failed")
+               "git_local_failed", "git_push_failed",
+               "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited")
+# Media, git and read failures, split by where they failed. A media upload
+# or an agent's read that failed before it went out, or a git add, commit or
+# branch, is the generator's own error.
+GEN_FAILURE_TOTALS = ("media_client_failed", "git_local_failed", "read_client_failed")
 # An upload the relay refused (an answer that isn't 2xx) or never answered
 # (a transport error or a timeout), or a push that failed, is the relay
 # breaking: at its limit, a relay usually fails by timing out. A stalled
@@ -86,6 +87,8 @@ RELAY_FAILURE_TOTALS = {
     "media_refused": "the relay refused {n} media uploads",
     "media_unanswered": "the relay didn't answer {n} media uploads",
     "git_push_failed": "{n} git pushes to the relay failed",
+    "read_refused": "the relay refused {n} agent reads",
+    "read_unanswered": "the relay didn't answer {n} agent reads",
 }
 # tenant_sim rewrites live.json every 2 s. Older than this (five writes
 # missed), or this far ahead of the clock, the file is no longer live.

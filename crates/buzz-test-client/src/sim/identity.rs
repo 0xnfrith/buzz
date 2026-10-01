@@ -21,6 +21,7 @@ use super::guard::{self, Target};
 use super::kinds;
 use super::media;
 use super::profile::{Profile, Rates};
+use super::reads;
 use super::roles::{
     in_active_window, next_any_wait, pick_action, rng_f64, rng_usize, scaled_rates, Band, Role,
 };
@@ -330,6 +331,11 @@ struct Session {
     seq: u64,
     own: VecDeque<(String, String)>,
     seen: VecDeque<(String, String)>,
+    /// Recent distinct authors seen, newest last: a turn reads their
+    /// profiles.
+    authors: VecDeque<String>,
+    /// This agent's turns so far: one in four also counts a thread.
+    turns: u64,
     expected: HashMap<String, u64>,
     missing: HashSet<String>,
     last_seen_created_at: u64,
@@ -364,6 +370,12 @@ impl Session {
             self.seen.push_back((event.id.to_hex(), channel.clone()));
             if self.seen.len() > 64 {
                 self.seen.pop_front();
+            }
+            let author = event.pubkey.to_hex();
+            self.authors.retain(|a| *a != author);
+            self.authors.push_back(author);
+            if self.authors.len() > 5 {
+                self.authors.pop_front();
             }
             let fanout = tag_value(&event, "ts_ms").and_then(|t| t.parse::<u64>().ok());
             let fanout_ms = fanout.map(|ts| {
@@ -533,6 +545,7 @@ impl Session {
                 let turn_seq = self.seq + 1;
                 let ev = kinds::turn_metric(&keys, &k, &owner_hex, &ch, turn_seq)?;
                 self.send(client, band, ev).await;
+                self.turn_reads(band, &ch, &owner_hex).await;
             }
             "dm" => {
                 if let Some(pk) = self
@@ -622,6 +635,48 @@ impl Session {
             _ => {}
         }
         Ok(())
+    }
+
+    /// A turn's reads (see [`reads`]), one after another, as a harness
+    /// makes them, each counted by where it ended.
+    async fn turn_reads(&mut self, band: Band, channel: &str, owner_hex: &str) {
+        self.turns += 1;
+        let root = self
+            .seen
+            .iter()
+            .rev()
+            .find(|(_, ch)| ch == channel)
+            .map(|(id, _)| id.clone());
+        let authors: Vec<String> = self.authors.iter().cloned().collect();
+        let agent = self.rec.pubkey.clone();
+        let turn = reads::Turn {
+            channel,
+            root: root.as_deref(),
+            authors: &authors,
+            agent: &agent,
+            owner: Some(owner_hex),
+            n: self.turns,
+        };
+        for r in reads::turn_reads(&self.profile.kinds, &turn) {
+            let res = reads::read(
+                &self.http,
+                &self.world.http_url,
+                &self.keys,
+                self.auth_tag.as_deref(),
+                &r,
+            )
+            .await;
+            match res {
+                Ok(ms) => self
+                    .stats
+                    .record_read(band.sampled().then(|| band.as_str()), r.what, ms),
+                Err(reads::ReadError::RateLimited) => self.stats.record_read_rate_limited(),
+                Err(reads::ReadError::Failed { at, err }) => {
+                    warn!("{} read {} ({at:?}): {err:#}", self.rec.name, r.what);
+                    self.stats.record_read_failed(at);
+                }
+            }
+        }
     }
 
     async fn gap_recheck(&mut self, client: &mut BuzzTestClient, since: u64) {
@@ -746,6 +801,8 @@ pub async fn run_identity(
         seq: 0,
         own: VecDeque::new(),
         seen: VecDeque::new(),
+        authors: VecDeque::new(),
+        turns: 0,
         expected: HashMap::new(),
         missing: HashSet::new(),
         last_seen_created_at: unix_now(),
@@ -927,6 +984,11 @@ mod tests {
 
     /// A human's session in the team profile, its world on loopback.
     fn test_session(stats: Arc<Stats>) -> Session {
+        test_session_at(stats, "http://127.0.0.1:1")
+    }
+
+    /// [`test_session`] with its HTTP base at `http`.
+    fn test_session_at(stats: Arc<Stats>, http: &str) -> Session {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../perf/profiles/10h-20a.toml");
         let profile = Arc::new(crate::sim::profile::load_profile(&path).expect("profile"));
@@ -937,9 +999,7 @@ mod tests {
             .expect("guard");
         let world = Arc::new(World {
             relay_url: guard.check_url("ws://127.0.0.1:1", &["ws"]).expect("relay"),
-            http_url: guard
-                .check_url("http://127.0.0.1:1", &["http"])
-                .expect("http"),
+            http_url: guard.check_url(http, &["http"]).expect("http"),
             channels: vec!["chan-a".into()],
             human_pubkeys: pop.humans.iter().map(|h| h.pubkey.clone()).collect(),
             repos: vec![],
@@ -963,12 +1023,78 @@ mod tests {
             seq: 0,
             own: VecDeque::new(),
             seen: VecDeque::new(),
+            authors: VecDeque::new(),
+            turns: 0,
             expected: HashMap::new(),
             missing: HashSet::new(),
             last_seen_created_at: unix_now(),
             git_repo: None,
             http: guard::http_client(Duration::from_secs(5)).expect("http client"),
         }
+    }
+
+    /// A turn against a relay that refuses every read: each of the turn's
+    /// reads counts as the relay's refusal in the live counters, none as
+    /// the generator's error.
+    #[tokio::test]
+    async fn a_turn_against_a_refusing_relay_counts_each_read_as_refused() {
+        use crate::sim::guard::testsrv::{self, Server};
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(503, r#"{"error":"down"}"#));
+        let stats = Arc::new(Stats::new());
+        let mut sess = test_session_at(stats.clone(), &refusing.http());
+        sess.seen.push_back(("ee".repeat(32), "chan-a".into()));
+        sess.authors.push_back("ab".repeat(32));
+        sess.turn_reads(Band::Steady, "chan-a", &"cd".repeat(32))
+            .await;
+        let live = stats.live(1);
+        assert_eq!(
+            (
+                live.read_refused,
+                live.read_unanswered,
+                live.read_client_failed,
+                live.read_rate_limited
+            ),
+            (5, 0, 0, 0)
+        );
+        assert_eq!(refusing.accepts(), 5);
+    }
+
+    /// An agent's turn, as `act` takes it: the turn metric is sent, then the
+    /// turn's reads are made (here with no root and no author seen yet:
+    /// memory, history and canvas), each counted where it ended.
+    #[tokio::test]
+    async fn an_agents_turn_sends_its_metric_then_reads() {
+        use crate::sim::guard::testsrv::{self, Server};
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(503, r#"{"error":"down"}"#));
+        let ws = fake_relay(vec![r#"["OK","{id}",true,""]"#.to_string()]).await;
+        let stats = Arc::new(Stats::new());
+        let mut sess = test_session_at(stats.clone(), &refusing.http());
+        let pop = generate_population(&sess.profile);
+        let agent = pop.agents[0].clone();
+        let owner = pop
+            .humans
+            .iter()
+            .find(|h| Some(&h.name) == agent.owner_name.as_ref())
+            .expect("owner");
+        sess.oa_owner = Some(pop.keys_of(owner).expect("owner keys"));
+        sess.keys = pop.keys_of(&agent).expect("agent keys");
+        sess.rec = agent;
+        sess.role = Role::Agent;
+        // Only turns, so the one action is a turn.
+        let mut profile = (*sess.profile).clone();
+        profile.agent.rates = Rates {
+            turn_metric: 1.0,
+            ..Rates::default()
+        };
+        sess.profile = Arc::new(profile);
+        let mut client = BuzzTestClient::connect_unauthenticated(&ws)
+            .await
+            .expect("connect");
+        sess.act(&mut client, Band::Steady).await.expect("act");
+        let live = stats.live(1);
+        assert_eq!((live.sent, live.accepted), (1, 1), "the turn metric");
+        assert_eq!((live.read_refused, live.read_client_failed), (3, 0));
+        assert_eq!(refusing.accepts(), 3);
     }
 
     /// A send the relay's per-key rate limiter turns away during a band

@@ -48,6 +48,9 @@ pub struct BandClient {
     pub sent_by_kind: BTreeMap<String, u64>,
     pub ok_ms: Percentiles,
     pub fanout_ms: Percentiles,
+    /// Agent per-turn reads that the relay answered, and how long each took.
+    pub reads: u64,
+    pub read_ms: Percentiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storm_backfill_ms: Option<Percentiles>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,6 +63,19 @@ pub struct MediaStats {
     pub bytes: u64,
     pub put_ms: Percentiles,
     pub rejected: u64,
+}
+
+/// Agent per-turn reads over the whole run.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReadStats {
+    pub reads: u64,
+    pub ms: Percentiles,
+    /// Reads by what they read (thread, profiles, memory, ...).
+    pub by_what: BTreeMap<String, u64>,
+    /// Turned away by the relay's per-key HTTP rate limit: apart.
+    pub rate_limited: u64,
+    /// Every failure, wherever it failed (see `live.json` for where).
+    pub failed: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -80,6 +96,7 @@ pub struct Summary {
     pub sent_by_kind: BTreeMap<String, u64>,
     pub media: MediaStats,
     pub git: GitStats,
+    pub reads: ReadStats,
     pub join_backfill_ms: Percentiles,
     pub gaps_detected: u64,
     pub lost_after_backfill: u64,
@@ -98,6 +115,8 @@ struct BandAcc {
     sent_by_kind: BTreeMap<String, u64>,
     ok_ms: Vec<f64>,
     fanout_ms: Vec<f64>,
+    reads: u64,
+    read_ms: Vec<f64>,
     storm_backfill_ms: Vec<f64>,
     storm_events_returned: u64,
 }
@@ -118,6 +137,11 @@ struct Inner {
     git_failed: u64,
     git_failed_by: BTreeMap<GitFailure, u64>,
     git_push_ms: Vec<f64>,
+    reads: u64,
+    read_ms: Vec<f64>,
+    reads_by_what: BTreeMap<String, u64>,
+    reads_rate_limited: u64,
+    read_failed_by: BTreeMap<ReadFailure, u64>,
     gaps_detected: u64,
     lost_after_backfill: u64,
     blink_closes: Vec<u64>,
@@ -134,6 +158,18 @@ pub enum MediaFailure {
     /// Before the request went out: encoding the image or signing the auth.
     Client,
     /// The relay answered, but not with a 2xx.
+    Refused,
+    /// No answer: a transport error or a timeout.
+    Unanswered,
+}
+
+/// Where an agent's read failed. Only `Client` is the generator's own
+/// failure; the other two are the relay's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadFailure {
+    /// Before the request went out: building or signing it.
+    Client,
+    /// The relay answered, but not with a 2xx and JSON.
     Refused,
     /// No answer: a transport error or a timeout.
     Unanswered,
@@ -175,6 +211,13 @@ pub struct Live {
     pub media_unanswered: u64,
     pub git_local_failed: u64,
     pub git_push_failed: u64,
+    /// Agent per-turn reads that failed, by where (see [`ReadFailure`]):
+    /// only `read_client_failed` is the generator's own. Reads the relay's
+    /// per-key rate limit turned away are apart, in `read_rate_limited`.
+    pub read_client_failed: u64,
+    pub read_refused: u64,
+    pub read_unanswered: u64,
+    pub read_rate_limited: u64,
 }
 
 /// Writes `live` to `path` whole: a temp file beside it, then a rename, so a
@@ -314,6 +357,29 @@ impl Stats {
         });
     }
 
+    /// An agent's read the relay answered, in `band` (unsampled bands count
+    /// in the run's totals only).
+    pub fn record_read(&self, band: Option<&str>, what: &str, ms: f64) {
+        self.with(|s| {
+            s.reads += 1;
+            s.read_ms.push(ms);
+            *s.reads_by_what.entry(what.to_string()).or_default() += 1;
+            if let Some(band) = band {
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.reads += 1;
+                b.read_ms.push(ms);
+            }
+        });
+    }
+
+    pub fn record_read_failed(&self, why: ReadFailure) {
+        self.with(|s| *s.read_failed_by.entry(why).or_default() += 1);
+    }
+
+    pub fn record_read_rate_limited(&self) {
+        self.with(|s| s.reads_rate_limited += 1);
+    }
+
     pub fn record_git(&self, bytes: u64, push_ms: f64) {
         self.with(|s| {
             s.git_pushes += 1;
@@ -373,6 +439,10 @@ impl Stats {
                 media_unanswered: count(&s.media_failed_by, MediaFailure::Unanswered),
                 git_local_failed: count(&s.git_failed_by, GitFailure::Local),
                 git_push_failed: count(&s.git_failed_by, GitFailure::Push),
+                read_client_failed: count(&s.read_failed_by, ReadFailure::Client),
+                read_refused: count(&s.read_failed_by, ReadFailure::Refused),
+                read_unanswered: count(&s.read_failed_by, ReadFailure::Unanswered),
+                read_rate_limited: s.reads_rate_limited,
             }
         })
     }
@@ -400,6 +470,8 @@ impl Stats {
                     sent_by_kind: acc.sent_by_kind.clone(),
                     ok_ms: percentiles(acc.ok_ms.clone()),
                     fanout_ms: percentiles(acc.fanout_ms.clone()),
+                    reads: acc.reads,
+                    read_ms: percentiles(acc.read_ms.clone()),
                     storm_backfill_ms: None,
                     storm_events_returned: None,
                 };
@@ -430,6 +502,13 @@ impl Stats {
                     bytes: s.git_bytes,
                     push_ms: percentiles(s.git_push_ms.clone()),
                     failed: s.git_failed,
+                },
+                reads: ReadStats {
+                    reads: s.reads,
+                    ms: percentiles(s.read_ms.clone()),
+                    by_what: s.reads_by_what.clone(),
+                    rate_limited: s.reads_rate_limited,
+                    failed: s.read_failed_by.values().sum(),
                 },
                 join_backfill_ms: percentiles(s.join_backfill_ms.clone()),
                 gaps_detected: s.gaps_detected,

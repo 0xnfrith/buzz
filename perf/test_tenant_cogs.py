@@ -443,9 +443,10 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(any("events_rejected" in e for e in errs))
 
     def test_rate_limits_are_carried_apart_and_never_an_acceptance_error(self) -> None:
-        summary = {"bands": {"steady": {"sent": 9, "accepted": 4, "rejected": 0, "rate_limited": 5, "received": 3}}}
+        summary = {"bands": {"steady": {"sent": 9, "accepted": 4, "rejected": 0, "rate_limited": 5, "received": 3,
+                                        "reads": 12, "read_ms": {"p50": 3, "p95": 9, "p99": 9, "max": 9}}}}
         client = tenant_cogs.client_from_summary(summary, "steady")
-        self.assertEqual((client["rejected"], client["rate_limited"]), (0, 5))
+        self.assertEqual((client["rejected"], client["rate_limited"], client["reads"], client["read_ms"]["p95"]), (0, 5, 12, 9))
         line = self.fixture()
         line["bands"]["steady"]["client"]["rate_limited"] = 5
         self.assertEqual(tenant_cogs.acceptance_errors(line, self.summary_ok(), 0), [])

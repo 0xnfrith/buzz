@@ -8,6 +8,7 @@ pub mod identity;
 pub mod kinds;
 pub mod media;
 pub mod profile;
+pub mod reads;
 pub mod roles;
 pub mod seed;
 pub mod stats;

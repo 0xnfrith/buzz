@@ -1552,6 +1552,9 @@ def client_from_summary(summary: dict[str, Any], band: str) -> dict[str, Any] | 
         "received": b.get("received", 0),
         "ok_ms": b.get("ok_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
         "fanout_ms": b.get("fanout_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
+        # Agent per-turn reads the relay answered in this band, and their time.
+        "reads": b.get("reads", 0),
+        "read_ms": b.get("read_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
     }
     # Left out when tenant_sim did not report it, so the floor gate fails closed.
     if "sent_by_kind" in b:
@@ -1645,6 +1648,9 @@ def write_results_line(
             "k3s_overhead_bytes": None,
         },
         "blink": summary.get("blink"),
+        # Agent per-turn reads over the run: answered, by what, rate-limited
+        # apart, and failed.
+        "reads": summary.get("reads"),
         "cost_usd": 0.0,
         "notes": notes,
     }

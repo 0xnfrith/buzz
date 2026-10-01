@@ -446,12 +446,14 @@ python3 perf/tenant_cogs.py remote-sample \
     60 s windows in a row, its MemAvailable stays under 10% of MemTotal for
     3 ticks, its box has an out-of-memory kill, or its own errors rise in
     `tenant_sim`'s live counters: its client errors, a media upload that
-    failed before it went out (`media_client_failed`), or a git add, commit
-    or branch that failed (`git_local_failed`). A missing or unreadable
+    failed before it went out (`media_client_failed`), a git add, commit
+    or branch that failed (`git_local_failed`), or an agent's read that
+    failed before it went out (`read_client_failed`). A missing or unreadable
     `--live-file` is a void too, never "no errors", and so is a file
     without `rejected`, `rate_limited`, `media_client_failed`, `media_refused`,
-    `media_unanswered`, `git_local_failed` or `git_push_failed`: a total
-    missing is never read as 0.
+    `media_unanswered`, `git_local_failed`, `git_push_failed`,
+    `read_client_failed`, `read_refused`, `read_unanswered` or
+    `read_rate_limited`: a total missing is never read as 0.
   - `tenant_sim`'s live counters stop being live: `t_unix` missing or not
     a whole number of seconds, more than 10 s old or 10 s ahead of the
     clock when the loop reads it, or lower than the last one read. The
@@ -460,7 +462,9 @@ python3 perf/tenant_cogs.py remote-sample \
     or dropped connections rising in the live counters; media uploads the relay
     refused (`media_refused`, an answer that isn't 2xx) or didn't answer
     (`media_unanswered`, a transport error or a timeout); git pushes that
-    failed (`git_push_failed`, the 90 s timeout included); a relay OOM
+    failed (`git_push_failed`, the 90 s timeout included); agent reads the
+    relay refused (`read_refused`) or didn't answer (`read_unanswered`); a
+    relay OOM
     kill; or no relay container in a `docker ps` that worked (a failed
     listing is not a break). At its limit a relay usually fails by timing
     out, so a timeout is the relay's; a stalled generator still shows in
@@ -495,6 +499,37 @@ before `tenant_sim` ends.
 | Media: a transport error or a timeout, no answer | `media_unanswered` | a relay break |
 | Git: writing the blob, `add`, `commit` or `branch` | `git_local_failed` | the generator's error |
 | Git: the push, refused, failed or past the 90 s timeout | `git_push_failed` | a relay break |
+| Agent read: building or signing the request, before it goes out | `read_client_failed` | the generator's error |
+| Agent read: an answer that isn't 2xx, or isn't JSON | `read_refused` | a relay break |
+| Agent read: a transport error or a timeout, no answer | `read_unanswered` | a relay break |
+| Agent read: a 429 from the relay's per-key rate limit | `read_rate_limited` | apart: neither |
+
+## Agent per-turn reads
+
+Reads are the database's main cost, so agents read as well as write. On
+each agent turn (each `turn_metric` it sends: 20 an hour in steady, 4x at
+peak) `tenant_sim` makes the reads an agent harness makes, one after
+another, over the relay's HTTP bridge with NIP-98, as Buzz's own harness
+does (`buzz-acp`: every read is `POST /query` with NIP-98, and a NIP-OA
+agent sends its credential in `x-auth-tag`). The NIP-98 event carries the
+`u`, `method`, `payload` and a fresh `nonce` tag, and the request goes to
+the checked `--http-url` through the guarded client: no proxy, no redirect.
+
+**The mix is a default until calibration replaces it.** Five reads a turn,
+a sixth on one turn in four:
+
+| # | Read | Filter |
+|---|---|---|
+| 1 | The thread's context, in one query | the root (an event the agent saw in the channel) by id; its replies, kinds 9 and 40002 with `#e` root and `#h` channel, limit 51; the agent's own last reply, limit 1 |
+| 2 | Profiles | kind 0 for up to 5 authors seen |
+| 3 | Memory | kind 30174, `authors` the agent, its `#d`, `#p` its owner, limit 16 |
+| 4 | Channel history (the agent's own tool use) | kind 9 `#h` channel, limit 50 |
+| 5 | Canvas | kind 40100 `#h` channel, limit 1 |
+| 6 | On one turn in four: a count | `POST /count` of the thread's replies |
+
+Every filter names its kinds, and none is a p-gated kind. Each read's time
+counts in its band (`reads`, `read_ms`), and the run's totals in
+`summary.json`'s `reads`. Where a read fails is in the table below.
 
 **Per-key rate limits are counted apart.** relay-v0.2.1 answers an
 over-quota event with a `NOTICE` ("rate-limited: ...") and no `OK`. In a
