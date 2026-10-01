@@ -1585,6 +1585,11 @@ def client_from_summary(summary: dict[str, Any], band: str) -> dict[str, Any] | 
         # (the generator's): each fails acceptance.
         "unanswered": b.get("unanswered", 0),
         "failed": b.get("failed", 0),
+        # Shed by the relay (full, or its admission store out of reach),
+        # and answered with a limit the pinned relay doesn't send: each
+        # fails acceptance. Only the per-key quota is apart.
+        "shed": b.get("shed", 0),
+        "limit_unknown": b.get("limit_unknown", 0),
         "received": b.get("received", 0),
         "ok_ms": b.get("ok_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
         "fanout_ms": b.get("fanout_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
@@ -2226,7 +2231,7 @@ def acceptance_errors(
             errs.append(f"{name} relay events_rejected={rejected}")
         if client_rej:
             errs.append(f"{name} client rejected={client_rej}")
-        for k in ("unanswered", "failed"):
+        for k in ("unanswered", "failed", "shed", "limit_unknown"):
             n = int((band.get("client") or {}).get(k) or 0)
             if n:
                 errs.append(f"{name} client {k}={n}")

@@ -480,6 +480,20 @@ impl Session {
                 );
                 false
             }
+            // The relay full, or unable to admit: its break, not a quota.
+            Ok(Publish::Shed { text }) => {
+                self.stats
+                    .record_send_shed(band.sampled().then(|| band.as_str()), kind);
+                warn!("{} kind {kind} shed by the relay: {text}", self.rec.name);
+                false
+            }
+            // A text the pinned relay doesn't send: the run voids on it.
+            Ok(Publish::UnknownLimit { text }) => {
+                self.stats
+                    .record_limit_unknown(band.sampled().then(|| band.as_str()), kind, &text);
+                warn!("{} kind {kind} got an unknown limit: {text}", self.rec.name);
+                false
+            }
             Ok(Publish::Ok(ok)) => {
                 let ms = start.elapsed().as_secs_f64() * 1e3;
                 if band.sampled() {
@@ -730,6 +744,13 @@ impl Session {
                     .stats
                     .record_read(band.sampled().then(|| band.as_str()), r.what, ms),
                 Err(reads::ReadError::RateLimited) => self.stats.record_read_rate_limited(),
+                Err(reads::ReadError::UnknownLimit(text)) => {
+                    warn!(
+                        "{} read {} got an unknown limit: {text}",
+                        self.rec.name, r.what
+                    );
+                    self.stats.record_read_limit_unknown(&text);
+                }
                 Err(reads::ReadError::Failed { at, err }) => {
                     warn!("{} read {} ({at:?}): {err:#}", self.rec.name, r.what);
                     self.stats.record_read_failed(at);
@@ -835,8 +856,75 @@ impl Session {
     }
 }
 
+/// One identity's task: [`identity_task`], with one rule on top. A task
+/// that joined, then ended for any reason but a stop or a lease (an error,
+/// a panic), is recorded in live.json's `identities_ended` at once, and the
+/// sampler voids the run on it: a lost identity under-loads the run and
+/// over-states the relay's ceiling. An identity that never joined is
+/// reported through `ready` instead (a failed warm-up, or a ramp joiner the
+/// relay didn't take).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_identity(
+    rec: IdentityRecord,
+    keys: Keys,
+    oa_owner: Option<Keys>,
+    role: Role,
+    profile: Arc<Profile>,
+    world: Arc<World>,
+    stats: Arc<Stats>,
+    band_rx: watch::Receiver<Band>,
+    git_repo: Option<GitRepo>,
+    rng_salt: u32,
+    ready: mpsc::Sender<Result<(), String>>,
+    ramp: Option<RampSlot>,
+) -> Result<()> {
+    let name = rec.name.clone();
+    let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (stop, record) = (band_rx.clone(), stats.clone());
+    let task = identity_task(
+        rec,
+        keys,
+        oa_owner,
+        role,
+        profile,
+        world,
+        stats,
+        band_rx,
+        git_repo,
+        rng_salt,
+        ready,
+        ramp,
+        joined.clone(),
+    );
+    guard_identity(&name, &joined, &stop, &record, task).await
+}
+
+/// Runs one identity's task and records it in `identities_ended` if it
+/// joined, then failed or panicked while the run wasn't stopping.
+async fn guard_identity(
+    name: &str,
+    joined: &std::sync::atomic::AtomicBool,
+    stop: &watch::Receiver<Band>,
+    stats: &Stats,
+    task: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    use futures_util::FutureExt;
+    let res = match std::panic::AssertUnwindSafe(task).catch_unwind().await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("{name}'s task panicked")),
+    };
+    if let Err(e) = &res {
+        let stopping = *stop.borrow() == Band::Stop;
+        if joined.load(std::sync::atomic::Ordering::SeqCst) && !stopping {
+            warn!("{name} ended on its own: {e:#}");
+            stats.record_identity_ended(name, &format!("{e:#}"));
+        }
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn identity_task(
     rec: IdentityRecord,
     keys: Keys,
     oa_owner: Option<Keys>,
@@ -849,6 +937,7 @@ pub async fn run_identity(
     rng_salt: u32,
     ready: mpsc::Sender<Result<(), String>>,
     mut ramp: Option<RampSlot>,
+    joined: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     if let Some(slot) = ramp.as_mut() {
         if !wait_switched_on(slot, &mut band_rx).await {
@@ -932,6 +1021,7 @@ pub async fn run_identity(
     if ready.send(Ok(())).await.is_err() {
         return Ok(());
     }
+    joined.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let mut band = *band_rx.borrow();
     let mut band_started = Instant::now();
@@ -1221,9 +1311,74 @@ mod tests {
         assert_eq!(refusing.accepts(), 3);
     }
 
+    /// An identity that joined, then failed or panicked while the run
+    /// wasn't stopping, is in live.json's `identities_ended` at once, with
+    /// why. One that never joined (reported through `ready`), one that
+    /// ended on a stop, or one that ended cleanly, is not.
+    #[tokio::test]
+    async fn an_identity_that_ends_on_its_own_is_recorded_at_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        type Task = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+        fn fails(joined: &Arc<AtomicBool>) -> Task {
+            let j = joined.clone();
+            Box::pin(async move {
+                j.store(true, Ordering::SeqCst);
+                Err(anyhow!("kind 9 sign: no key"))
+            })
+        }
+        fn panics(joined: &Arc<AtomicBool>) -> Task {
+            let j = joined.clone();
+            Box::pin(async move {
+                j.store(true, Ordering::SeqCst);
+                panic!("a bug")
+            })
+        }
+        fn never_joins(_: &Arc<AtomicBool>) -> Task {
+            Box::pin(async move { Err(anyhow!("h1 subscribe: no EOSE")) })
+        }
+        fn clean(joined: &Arc<AtomicBool>) -> Task {
+            let j = joined.clone();
+            Box::pin(async move {
+                j.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+        type Row = (
+            &'static str,
+            fn(&Arc<AtomicBool>) -> Task,
+            Band,
+            Option<&'static str>,
+        );
+        let rows: [Row; 5] = [
+            ("failed", fails, Band::Steady, Some("kind 9 sign: no key")),
+            ("panicked", panics, Band::Steady, Some("h7's task panicked")),
+            ("failed on a stop", fails, Band::Stop, None),
+            ("never joined", never_joins, Band::Steady, None),
+            ("ended cleanly", clean, Band::Steady, None),
+        ];
+        for (name, task, band, want) in rows {
+            let stats = Stats::new();
+            let joined = Arc::new(AtomicBool::new(false));
+            let (_tx, stop) = watch::channel(band);
+            let res = guard_identity("h7", &joined, &stop, &stats, task(&joined)).await;
+            assert_eq!(res.is_err(), name != "ended cleanly", "{name}");
+            let ended = stats.live(1).identities_ended;
+            match want {
+                Some(why) => assert_eq!(
+                    ended,
+                    std::collections::BTreeMap::from([("h7".to_string(), why.to_string())]),
+                    "{name}"
+                ),
+                None => assert!(ended.is_empty(), "{name}: {ended:?}"),
+            }
+        }
+    }
+
     /// One counter per send, never two and never none: accepted, rejected,
     /// written and never answered (no OK in time, or the socket failing
-    /// after the write), or not written at all (the socket already closed).
+    /// after the write), not written at all (the socket already closed),
+    /// and each `rate-limited:` text: the quota apart, the relay full or
+    /// unable to admit shed, any other text unknown.
     #[tokio::test]
     async fn each_send_ends_in_exactly_one_counter() {
         use crate::sim::admission::testrelay::{relay_with, Answer};
@@ -1239,23 +1394,51 @@ mod tests {
         fn close(_: u64) -> Answer {
             Answer::Close
         }
+        fn quota(_: u64) -> Answer {
+            Answer::Notice("rate-limited: quota exceeded; retry in 7s")
+        }
+        fn full(_: u64) -> Answer {
+            Answer::Notice("rate-limited: too many concurrent requests")
+        }
+        fn no_admission(_: u64) -> Answer {
+            Answer::Notice("rate-limited: shared admission unavailable")
+        }
+        fn unknown(_: u64) -> Answer {
+            Answer::Notice("rate-limited: slow down")
+        }
+        // (accepted, rejected, rate_limited, send_unanswered, send_failed,
+        // relay_shed, limit_unknown)
         type Row = (
             &'static str,
             fn(u64) -> Answer,
             bool,
-            (u64, u64, u64, u64, u64),
+            (u64, u64, u64, u64, u64, u64, u64),
         );
-        let rows: [Row; 5] = [
-            ("accepted", accept, false, (1, 0, 0, 0, 0)),
-            ("rejected", reject, false, (0, 1, 0, 0, 0)),
-            ("no OK in time", silent, false, (0, 0, 0, 1, 0)),
+        let rows: [Row; 9] = [
+            ("accepted", accept, false, (1, 0, 0, 0, 0, 0, 0)),
+            ("rejected", reject, false, (0, 1, 0, 0, 0, 0, 0)),
+            ("no OK in time", silent, false, (0, 0, 0, 1, 0, 0, 0)),
             (
                 "the socket fails after the write",
                 close,
                 false,
-                (0, 0, 0, 1, 0),
+                (0, 0, 0, 1, 0, 0, 0),
             ),
-            ("the socket already closed", accept, true, (0, 0, 0, 0, 1)),
+            (
+                "the socket already closed",
+                accept,
+                true,
+                (0, 0, 0, 0, 1, 0, 0),
+            ),
+            ("the quota", quota, false, (0, 0, 1, 0, 0, 0, 0)),
+            ("the relay full", full, false, (0, 0, 0, 0, 0, 1, 0)),
+            (
+                "the relay's admission store unreachable",
+                no_admission,
+                false,
+                (0, 0, 0, 0, 0, 1, 0),
+            ),
+            ("an unknown limit", unknown, false, (0, 0, 0, 0, 0, 0, 1)),
         ];
         for (name, answer, closed_first, want) in rows {
             let relay = relay_with(answer).await;
@@ -1293,11 +1476,20 @@ mod tests {
                     live.rejected,
                     live.rate_limited,
                     live.send_unanswered,
-                    failed
+                    failed,
+                    live.relay_shed,
+                    live.limit_unknown.values().sum::<u64>()
                 ),
                 want,
                 "{name}"
             );
+            if want.6 > 0 {
+                assert_eq!(
+                    live.limit_unknown,
+                    std::collections::BTreeMap::from([("rate-limited: slow down".to_string(), 1)]),
+                    "{name}: the text is kept"
+                );
+            }
             assert_eq!(live.sent, 1, "{name}: the send counted once");
             // The band's line in summary.json, by the names a local run's
             // acceptance reads (tenant_cogs.py client_from_summary).
@@ -1307,9 +1499,17 @@ mod tests {
                 (
                     band["sent"].as_u64(),
                     band["unanswered"].as_u64(),
-                    band["failed"].as_u64()
+                    band["failed"].as_u64(),
+                    band["shed"].as_u64(),
+                    band["limit_unknown"].as_u64()
                 ),
-                (Some(1), Some(want.3), Some(want.4)),
+                (
+                    Some(1),
+                    Some(want.3),
+                    Some(want.4),
+                    Some(want.5),
+                    Some(want.6)
+                ),
                 "{name}"
             );
         }

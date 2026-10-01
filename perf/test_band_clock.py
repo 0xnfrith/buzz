@@ -49,7 +49,7 @@ class World:
         self.breaks: dict[str, dict[str, Any]] = {}
         self.void: dict[str, Any] | None = None
         self.fail: dict[str, tuple[int, str]] = {}  # "event arg" -> (exit, stderr)
-        self.provision = {g: {"events": 10, "rate_limited": 0, "seconds": 1.0} for g in gens}
+        self.provision = {g: {"events": 10, "rate_limited": 0, "relay_shed": 0, "seconds": 1.0} for g in gens}
         self.setup_fails: dict[str, str] = {}
         self.never_setup: set[str] = set()
         self.at: list[tuple[float, Any]] = []  # (time, fn) run once time passes it
@@ -216,6 +216,26 @@ class Profiles(unittest.TestCase):
         w = World(["a", "b"])
         w.provision["b"]["rate_limited"] = 3
         self.assertEqual(w.clock_for([bc.load_item(profile(self.d, "solo"))], self.d / "ok").run(), 0)
+
+    def test_a_setup_the_relay_shed_is_refused_when_the_limits_are_raised(self) -> None:
+        """Shedding (the relay full, or its admission store out of reach) is
+        read apart from the quota, and refused the same; a provision with no
+        count at all is refused too."""
+        for name, shed, want in [
+            ("shed", 2, "the relay shed 2 of b's setup events: full, or unable to reach its admission store"),
+            ("missing", None, "the relay shed None of b's setup events: full, or unable to reach its admission store"),
+        ]:
+            with self.subTest(name):
+                w = World(["a", "b"])
+                if shed is None:
+                    del w.provision["b"]["relay_shed"]
+                else:
+                    w.provision["b"]["relay_shed"] = shed
+                out = self.d / name
+                code = w.clock_for([bc.load_item(profile(self.d, "solo"))], out, setup_must_not_rate_limit=True).run()
+                self.assertEqual(code, 6)
+                self.assertEqual(json.loads((out / "clock.json").read_text())["stopped"], want)
+                self.assertNotIn("fleet", w.kinds())
 
     def test_end_runs_once_and_its_failure_is_reported(self) -> None:
         w = World(["a"])
@@ -410,7 +430,7 @@ class Cli(unittest.TestCase):
                 ev = sys.argv[1:]
                 open({str(log)!r}, "a").write(" ".join(ev) + "\\n")
                 if ev[0] == "phases":
-                    print(json.dumps({{"phase": "setup-done", "provision": {{"rate_limited": 0}}}}))
+                    print(json.dumps({{"phase": "setup-done", "provision": {{"rate_limited": 0, "relay_shed": 0}}}}))
                     print(json.dumps({{"phase": "ready"}}))
                 elif ev[0] == "status":
                     print(json.dumps({{"void": None, "breaks": None, "sampler": "active",

@@ -25,6 +25,7 @@ use nostr::{EventBuilder, Keys, Kind, Tag};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::admission::{self, Limit};
 use super::guard::{HttpClient, Target};
 use super::profile::KindTable;
 use super::stats::ReadFailure;
@@ -120,6 +121,8 @@ pub enum ReadError {
     /// The relay's per-key HTTP rate limit turned it away (429): counted
     /// apart, like a rate-limited send.
     RateLimited,
+    /// A `rate-limited:` text the pinned relay doesn't send: the run voids.
+    UnknownLimit(String),
 }
 
 /// `Authorization: Nostr <base64 event>`, NIP-98 for `POST url` with
@@ -150,7 +153,10 @@ pub fn nip98_header(keys: &Keys, url: &str, body: &[u8]) -> Result<String> {
 ///   header) is caught here too.
 /// - An answer that isn't 2xx, or one that isn't JSON: `Refused`.
 /// - No answer, a transport error or a timeout: `Unanswered`.
-/// - A 429 the relay's per-key rate limit sends: `RateLimited`, apart.
+/// - A `rate-limited:` answer, by its text ([`admission::classify_limit`]):
+///   the per-key quota is `RateLimited`, apart; the relay full or unable to
+///   admit (a 503) is `Refused`, a relay break; any other text is
+///   `UnknownLimit`.
 pub async fn read(
     http: &HttpClient,
     http_url: &Target,
@@ -195,10 +201,17 @@ pub async fn read(
         }
     };
     let ms = start.elapsed().as_secs_f64() * 1e3;
-    if status.as_u16() == 429 && text.contains("rate-limited") {
-        return Err(ReadError::RateLimited);
-    }
     if !status.is_success() {
+        // The relay's HTTP errors are `{"error": "<text>"}`.
+        let why = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| text.clone());
+        match admission::classify_limit(&why) {
+            Some(Limit::Quota { .. }) => return Err(ReadError::RateLimited),
+            Some(Limit::Unknown { text }) => return Err(ReadError::UnknownLimit(text)),
+            Some(Limit::Shed { .. }) | None => {}
+        }
         return Err(ReadError::Failed {
             at: ReadFailure::Refused,
             err: anyhow!("{} HTTP {status}: {text}", r.what),
@@ -329,6 +342,35 @@ mod tests {
             failed_at(one(&other, Duration::from_secs(5), None).await).0,
             ReadFailure::Refused
         );
+    }
+
+    /// The relay full or unable to admit is refused, a relay break, never
+    /// apart; a `rate-limited:` text the pinned relay doesn't send is
+    /// unknown, whatever its status.
+    #[tokio::test]
+    async fn a_read_the_relay_shed_is_refused_and_an_unknown_limit_is_kept() {
+        for (status, body) in [
+            (
+                503,
+                r#"{"error":"rate-limited: shared admission unavailable"}"#,
+            ),
+            (
+                429,
+                r#"{"error":"rate-limited: too many concurrent requests"}"#,
+            ),
+        ] {
+            let shed = Server::start("127.0.0.1:0", testsrv::status(status, body));
+            let (at, err) = failed_at(one(&shed, Duration::from_secs(5), None).await);
+            assert_eq!(at, ReadFailure::Refused, "{body}: {err}");
+        }
+        let unknown = Server::start(
+            "127.0.0.1:0",
+            testsrv::status(429, r#"{"error":"rate-limited: slow down"}"#),
+        );
+        match one(&unknown, Duration::from_secs(5), None).await {
+            Err(ReadError::UnknownLimit(text)) => assert_eq!(text, "rate-limited: slow down"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The header verifies with the relay's own NIP-98 check, for the URL

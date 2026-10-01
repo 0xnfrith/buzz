@@ -84,7 +84,11 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 LIVE_TOTALS = ("sent", "accepted", "rejected", "rate_limited", "media_client_failed", "media_refused",
                "media_unanswered", "git_local_failed", "git_push_failed",
                "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-               "lost", "joined")
+               "relay_shed", "lost", "joined")
+# Two maps the loop reads besides: `rate-limited:` texts the pinned relay
+# doesn't send, by text, and identities whose task ended on its own, by
+# name. Either one voids the run.
+LIVE_MAPS = ("limit_unknown", "identities_ended")
 # tenant_sim's ack-time histogram: accepted sends within each bound, in ms,
 # cumulative. 500 ms is a bound, so the service level's share is exact.
 ACK_BOUNDS = ("10", "25", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf")
@@ -116,6 +120,11 @@ RELAY_FAILURE_TOTALS = {
     # to read its answers also shows in the generator box's own CPU and
     # memory limits, which void the run.
     "send_unanswered": "the relay didn't answer {n} sends",
+    # `rate-limited: too many concurrent requests` (the relay's one
+    # relay-wide handler limit full) or `rate-limited: shared admission
+    # unavailable` (its admission store out of reach): the relay failing,
+    # not a quota. The per-key quota is apart, in rate_limited.
+    "relay_shed": "the relay shed {n} sends: full, or unable to reach its admission store",
 }
 # tenant_sim rewrites live.json every 2 s. Older than this (five writes
 # missed), or this far ahead of the clock, the file is no longer live.
@@ -586,15 +595,30 @@ class Monitor:
         if stale:
             return self._settle([Limit(f"{name} {stale}", "generator", t)], defer)
         out: list[Limit] = []
-        # Each read is compared with the one before, so one rise is
-        # reported once.
+        who = "the generator" + (f" for {role}" if role else "")
+        # Each read is compared with the one before (or none), so one rise
+        # is reported once. A limit text the pinned relay doesn't send means
+        # its pin moved: a void at any time. An identity whose task ended on
+        # its own leaves the run under-loaded: the generator's own error.
+        unknown0 = (last or {}).get("limit_unknown") or {}
+        new_texts = {k: n for k, n in sorted(live["limit_unknown"].items()) if n > unknown0.get(k, 0)}
+        if new_texts:
+            out.append(Limit(f"{who} got a limit the pinned relay doesn't send: "
+                             + ", ".join(f"{k!r} x{n - unknown0.get(k, 0)}" for k, n in new_texts.items())
+                             + "; the relay's pin moved", "generator", t))
+        ended0 = (last or {}).get("identities_ended") or {}
+        new_ended = {k: why for k, why in sorted(live["identities_ended"].items()) if k not in ended0}
+        if new_ended:
+            first, why = next(iter(new_ended.items()))
+            more = f" (and {len(new_ended) - 1} more)" if len(new_ended) > 1 else ""
+            out.append(Limit(f"{who}: an identity's task ended on its own: {first}: {why}{more}",
+                             "generator", t, waits, after_break=True))
         ce = live.get("client_errors") or {}
         if last is not None:
             c0 = last.get("client_errors") or {}
             rose = {k: ce.get(k, 0) - c0.get(k, 0) for k in GEN_ERROR_KINDS if ce.get(k, 0) > c0.get(k, 0)}
             rose.update({k: live[k] - last[k] for k in GEN_FAILURE_TOTALS if live[k] > last[k]})
             if rose:
-                who = "the generator" + (f" for {role}" if role else "")
                 out.append(Limit(f"{who} reported its own errors: " + ", ".join(f"{k} +{v}" for k, v in sorted(rose.items())),
                                  "generator", t, waits, after_break=True))
             if live["rejected"] > last["rejected"]:
@@ -628,7 +652,8 @@ class Monitor:
         level's ack test on it. Under SLO_ACK_SHARE % of at least
         SLO_MIN_ACKS acks within SLO_ACK_MS is the relay breaking, at the
         band's end."""
-        d = {k: live1[k] - live0[k] for k in ("sent", "accepted", "rejected", "rate_limited", "send_unanswered", "lost",
+        d = {k: live1[k] - live0[k] for k in ("sent", "accepted", "rejected", "rate_limited", "send_unanswered",
+                                               "relay_shed", "lost",
                                                "read_refused", "read_unanswered", "read_rate_limited")}
         le0, le1 = live0["ack_ms_le"], live1["ack_ms_le"]
         acks, within = le1["+Inf"] - le0["+Inf"], le1[SLO_ACK_MS] - le0[SLO_ACK_MS]
@@ -664,6 +689,13 @@ def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
     for k in LIVE_TOTALS:
         if k not in v:
             return None, f"{path} has no {k}"
+    for k in LIVE_MAPS:
+        if not isinstance(v.get(k), dict):
+            return None, f"{path} has no {k}"
+    if not all(isinstance(t, str) and type(n) is int and n > 0 for t, n in v["limit_unknown"].items()):
+        return None, f"{path}: limit_unknown is not a count per text"
+    if not all(isinstance(why, str) for why in v["identities_ended"].values()):
+        return None, f"{path}: identities_ended is not a reason per identity"
     if "ended" in v and v["ended"] not in LIVE_ENDED:
         return None, f"{path}: ended {json.dumps(v['ended'])} is not one of {sorted(LIVE_ENDED)}"
     le = v.get("ack_ms_le")

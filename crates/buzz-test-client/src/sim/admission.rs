@@ -20,7 +20,69 @@ const DEFAULT_RETRY: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub enum Publish {
     Ok(OkResponse),
-    RateLimited { retry_in: Duration },
+    /// This key's own quota: counted apart.
+    RateLimited {
+        retry_in: Duration,
+    },
+    /// The relay shed the event, full or cut off from its admission store:
+    /// the relay failing (see [`Limit::Shed`]).
+    Shed {
+        text: String,
+    },
+    /// A `rate-limited:` text the pinned relay doesn't send.
+    UnknownLimit {
+        text: String,
+    },
+}
+
+/// What a relay's `rate-limited:` message says, by its exact text. The
+/// relay this harness pins (`sha-6e5c462`, `crates/buzz-relay/src`) sends
+/// three:
+///
+/// - `rate-limited: quota exceeded; retry in {n}s`, this key's own quota
+///   (`connection.rs:691`; HTTP 429, `api/bridge.rs:45`);
+/// - `rate-limited: too many concurrent requests`, its one relay-wide
+///   handler semaphore full, not per key or per connection
+///   (`connection.rs:542` EVENT, `:571` REQ, `:592` COUNT);
+/// - `rate-limited: shared admission unavailable`, the relay unable to
+///   reach its own admission store (`connection.rs:699`; HTTP 503,
+///   `api/bridge.rs:52`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Limit {
+    /// The quota: counted apart, neither a break nor the generator's error.
+    Quota { retry_in: Duration },
+    /// The relay full, or failing to admit: a relay break.
+    Shed { text: String },
+    /// Any other `rate-limited:` text. The relay is pinned, so this means
+    /// the pin moved: the run voids.
+    Unknown { text: String },
+}
+
+const QUOTA_TEXT: &str = "rate-limited: quota exceeded";
+const SHED_TEXTS: [&str; 2] = [
+    "rate-limited: too many concurrent requests",
+    "rate-limited: shared admission unavailable",
+];
+
+/// The [`Limit`] a relay message's text is, or None when it isn't a
+/// `rate-limited:` message at all.
+pub fn classify_limit(text: &str) -> Option<Limit> {
+    if !text.starts_with("rate-limited:") {
+        return None;
+    }
+    Some(if text.starts_with(QUOTA_TEXT) {
+        Limit::Quota {
+            retry_in: rate_limit_retry(text).unwrap_or(DEFAULT_RETRY),
+        }
+    } else if SHED_TEXTS.iter().any(|t| text.starts_with(t)) {
+        Limit::Shed {
+            text: text.to_string(),
+        }
+    } else {
+        Limit::Unknown {
+            text: text.to_string(),
+        }
+    })
 }
 
 /// Why a send got no answer, by whose it is.
@@ -51,9 +113,9 @@ impl std::fmt::Display for SendError {
     }
 }
 
-/// Sends `event` and waits up to `ok_timeout` for its answer: its OK, or the
-/// relay's per-key rate-limit NOTICE (relay-v0.2.1 sends that NOTICE instead
-/// of an OK, so waiting for the OK alone times out). Every other message
+/// Sends `event` and waits up to `ok_timeout` for its answer: its OK, or a
+/// `rate-limited:` NOTICE, which the relay sends instead of an OK (so
+/// waiting for the OK alone times out), told apart by [`classify_limit`]. Every other message
 /// that arrives meanwhile (a subscription's events, other notices) is
 /// returned, in order, for the caller to handle; none is dropped. A failure
 /// says whether the event was written ([`SendError`]).
@@ -82,19 +144,25 @@ pub async fn send_tracked(
             .map_err(SendError::Unanswered)?
         {
             RelayMessage::Ok(ok) if ok.event_id == id => return Ok((Publish::Ok(ok), others)),
-            RelayMessage::Notice { message } if rate_limit_retry(&message).is_some() => {
-                let retry_in = rate_limit_retry(&message).unwrap_or(DEFAULT_RETRY);
-                return Ok((Publish::RateLimited { retry_in }, others));
+            RelayMessage::Notice { message } => {
+                let answer = match classify_limit(&message) {
+                    Some(Limit::Quota { retry_in }) => Publish::RateLimited { retry_in },
+                    Some(Limit::Shed { text }) => Publish::Shed { text },
+                    Some(Limit::Unknown { text }) => Publish::UnknownLimit { text },
+                    None => {
+                        others.push(RelayMessage::Notice { message });
+                        continue;
+                    }
+                };
+                return Ok((answer, others));
             }
             other => others.push(other),
         }
     }
 }
 
-/// Parse a relay `NOTICE` into a retry delay if it is a rate-limit rejection.
-///
-/// relay-v0.2.1 sends `rate-limited: quota exceeded; retry in {n}s` or
-/// `rate-limited: shared admission unavailable`.
+/// The wait a `rate-limited:` text asks for (`retry in {n}s`), or
+/// DEFAULT_RETRY when it names none; None when it isn't a rate limit.
 pub fn rate_limit_retry(notice: &str) -> Option<Duration> {
     let rest = notice.strip_prefix("rate-limited:")?;
     let secs = rest
@@ -135,6 +203,8 @@ pub(crate) mod testrelay {
         Close,
         /// The per-key rate limit's NOTICE, no OK.
         RateLimit,
+        /// A NOTICE with this text, no OK.
+        Notice(&'static str),
         /// Nothing at all: the event is never answered.
         Silent,
     }
@@ -201,6 +271,7 @@ pub(crate) mod testrelay {
                                     "NOTICE",
                                     "rate-limited: quota exceeded; retry in 60s"
                                 ]),
+                                Answer::Notice(text) => serde_json::json!(["NOTICE", text]),
                             },
                             Some("REQ") => serde_json::json!(["EOSE", v[1]]),
                             _ => continue,
@@ -352,6 +423,44 @@ mod tests {
             rate_limit_retry("rate-limited: shared admission unavailable"),
             Some(DEFAULT_RETRY)
         );
+    }
+
+    /// Each text the pinned relay sends, and one it doesn't: the quota is
+    /// apart, the two the relay sends when it is full or can't admit are
+    /// shed, and any other `rate-limited:` text is unknown.
+    #[test]
+    fn each_rate_limit_text_is_told_apart() {
+        let rows = [
+            (
+                "rate-limited: quota exceeded; retry in 7s",
+                Some(Limit::Quota {
+                    retry_in: Duration::from_secs(7),
+                }),
+            ),
+            (
+                "rate-limited: too many concurrent requests",
+                Some(Limit::Shed {
+                    text: "rate-limited: too many concurrent requests".into(),
+                }),
+            ),
+            (
+                "rate-limited: shared admission unavailable",
+                Some(Limit::Shed {
+                    text: "rate-limited: shared admission unavailable".into(),
+                }),
+            ),
+            (
+                "rate-limited: slow down",
+                Some(Limit::Unknown {
+                    text: "rate-limited: slow down".into(),
+                }),
+            ),
+            ("auth-required: please authenticate", None),
+            ("quota exceeded", None),
+        ];
+        for (text, want) in rows {
+            assert_eq!(classify_limit(text), want, "{text}");
+        }
     }
 
     #[test]

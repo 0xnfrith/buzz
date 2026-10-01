@@ -17,7 +17,9 @@
  "ended": "stop",
  "git_local_failed": 0,
  "git_push_failed": 0,
+ "identities_ended": {},
  "joined": 18,
+ "limit_unknown": {},
  "lost": 0,
  "media_client_failed": 0,
  "media_refused": 0,
@@ -29,7 +31,8 @@
  "read_unanswered": 6,
  "received": 0,
  "rejected": 0,
+ "relay_shed": 0,
  "send_unanswered": 0,
  "sent": 21,
- "t_unix": 1790888012
+ "t_unix": 1790896207
 }

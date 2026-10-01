@@ -153,6 +153,9 @@ struct Args {
 struct SetupStats {
     events: u64,
     rate_limited: u64,
+    /// Setup events the relay shed, full or unable to admit, each waited
+    /// out and resent like a rate limit.
+    relay_shed: u64,
     stop: Option<tokio::sync::watch::Receiver<sim::roles::Band>>,
 }
 
@@ -200,9 +203,10 @@ fn direct_members<'a>(profile: &Profile, pop: &'a Population) -> Vec<&'a Identit
     }
 }
 
-/// Owner-socket publish. A relay rate-limit NOTICE waits out the window and
-/// resends the same event (the relay did not process it); a transport error
-/// reconnects. Both are bounded.
+/// Owner-socket publish. A relay rate-limit NOTICE, the quota or the relay
+/// shedding, waits out the window and resends the same event (the relay did
+/// not process it); a transport error reconnects. Both are bounded. A
+/// `rate-limited:` text the pinned relay doesn't send fails at once.
 async fn send_with_retry(
     client: &mut BuzzTestClient,
     keys: &nostr::Keys,
@@ -223,6 +227,15 @@ async fn send_with_retry(
                 setup.rate_limited += 1;
                 last = anyhow::anyhow!("{what}: still rate-limited after {waits} waits");
                 setup.sleep(retry_in, what).await?;
+            }
+            Ok(Publish::Shed { text }) => {
+                waits += 1;
+                setup.relay_shed += 1;
+                last = anyhow::anyhow!("{what}: still shed after {waits} waits: {text}");
+                setup.sleep(Duration::from_secs(1), what).await?;
+            }
+            Ok(Publish::UnknownLimit { text }) => {
+                bail!("{what}: the relay sent a limit it doesn't send: {text}");
             }
             Err(e) => {
                 last = anyhow::anyhow!("{what}: {e}");
@@ -667,6 +680,7 @@ async fn run(args: Args) -> Result<i32> {
         "provision": {
             "events": setup.events,
             "rate_limited": setup.rate_limited,
+            "relay_shed": setup.relay_shed,
             "seconds": provision_s,
         },
     }));

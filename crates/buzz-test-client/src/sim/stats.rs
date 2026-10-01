@@ -53,6 +53,12 @@ pub struct BandClient {
     pub unanswered: u64,
     /// Sends that failed before anything was written: the generator's own.
     pub failed: u64,
+    /// Sends the relay shed, full or unable to admit (see
+    /// `admission::Limit::Shed`): a relay break.
+    pub shed: u64,
+    /// Sends answered with a `rate-limited:` text the pinned relay doesn't
+    /// send: the run voids.
+    pub limit_unknown: u64,
     pub received: u64,
     /// Sends in this band by event kind; acceptance checks the floor with it.
     pub sent_by_kind: BTreeMap<String, u64>,
@@ -123,6 +129,8 @@ struct BandAcc {
     rate_limited: u64,
     unanswered: u64,
     failed: u64,
+    shed: u64,
+    limit_unknown: u64,
     received: u64,
     sent_by_kind: BTreeMap<String, u64>,
     ok_ms: Vec<f64>,
@@ -151,6 +159,12 @@ struct Inner {
     git_push_ms: Vec<f64>,
     /// Sends the relay never answered, in any band.
     send_unanswered: u64,
+    /// Sends the relay shed, in any band.
+    relay_shed: u64,
+    /// Unknown `rate-limited:` texts, sends and reads, by text.
+    limit_unknown: BTreeMap<String, u64>,
+    /// Identities whose task ended on its own, by name: why.
+    identities_ended: BTreeMap<String, String>,
     /// Accepted sends by ack time, one count per bound in ACK_MS_BOUNDS
     /// and one past the last; cumulative in live.json.
     ack_ms_buckets: [u64; ACK_MS_BOUNDS.len() + 1],
@@ -243,6 +257,16 @@ pub struct Live {
     /// that failed before anything was written is `send_failed` in
     /// `client_errors`, the generator's own.
     pub send_unanswered: u64,
+    /// Sends the relay shed in any band, full (its relay-wide handler limit)
+    /// or unable to reach its admission store: a relay break. The relay's
+    /// per-key quota is apart, in `rate_limited`.
+    pub relay_shed: u64,
+    /// `rate-limited:` texts the pinned relay doesn't send, sends and
+    /// reads, by text: any voids the run (the relay's pin moved).
+    pub limit_unknown: BTreeMap<String, u64>,
+    /// Identities whose task ended on its own, not on a stop or a lease,
+    /// by name: why. Any voids the run: a lost identity under-loads it.
+    pub identities_ended: BTreeMap<String, String>,
     /// Accepted sends (in sampled bands) acknowledged within each bound,
     /// in ms, cumulative like a Prometheus histogram: `"500": n` is every
     /// ack within 500 ms; `"+Inf"` is every ack.
@@ -369,6 +393,49 @@ impl Stats {
                 b.failed += 1;
                 *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
             }
+        });
+    }
+
+    /// A send the relay shed (`band`: a sampled band's name).
+    pub fn record_send_shed(&self, band: Option<&str>, kind: u16) {
+        self.with(|s| {
+            s.relay_shed += 1;
+            if let Some(band) = band {
+                *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.sent += 1;
+                b.shed += 1;
+                *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        });
+    }
+
+    /// A send answered with an unknown `rate-limited:` text.
+    pub fn record_limit_unknown(&self, band: Option<&str>, kind: u16, text: &str) {
+        self.with(|s| {
+            *s.limit_unknown.entry(text.to_string()).or_default() += 1;
+            if let Some(band) = band {
+                *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.sent += 1;
+                b.limit_unknown += 1;
+                *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        });
+    }
+
+    /// A read answered with an unknown `rate-limited:` text.
+    pub fn record_read_limit_unknown(&self, text: &str) {
+        self.with(|s| *s.limit_unknown.entry(text.to_string()).or_default() += 1);
+    }
+
+    /// An identity's task ended on its own (not on a stop or a lease): the
+    /// first reason kept per identity.
+    pub fn record_identity_ended(&self, name: &str, why: &str) {
+        self.with(|s| {
+            s.identities_ended
+                .entry(name.to_string())
+                .or_insert_with(|| why.to_string());
         });
     }
 
@@ -522,6 +589,9 @@ impl Stats {
                 read_unanswered: count(&s.read_failed_by, ReadFailure::Unanswered),
                 read_rate_limited: s.reads_rate_limited,
                 send_unanswered: s.send_unanswered,
+                relay_shed: s.relay_shed,
+                limit_unknown: s.limit_unknown.clone(),
+                identities_ended: s.identities_ended.clone(),
                 ack_ms_le: {
                     let mut out = BTreeMap::new();
                     let mut total = 0;
@@ -562,6 +632,8 @@ impl Stats {
                     rate_limited: acc.rate_limited,
                     unanswered: acc.unanswered,
                     failed: acc.failed,
+                    shed: acc.shed,
+                    limit_unknown: acc.limit_unknown,
                     received: acc.received,
                     sent_by_kind: acc.sent_by_kind.clone(),
                     ok_ms: percentiles(acc.ok_ms.clone()),
@@ -660,6 +732,9 @@ mod tests {
             "read_unanswered",
             "read_rate_limited",
             "send_unanswered",
+            "relay_shed",
+            "limit_unknown",
+            "identities_ended",
             "ack_ms_le",
             "lost",
             "joined",

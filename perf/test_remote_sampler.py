@@ -47,7 +47,8 @@ def relay_sample(t: float, h: str = H1, ws: int = 100, busy: int = 0, oom: int =
 
 TOTALS = ("sent", "accepted", "rate_limited", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed",
           "git_push_failed", "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-          "lost", "joined")
+          "relay_shed", "lost", "joined")
+MAPS = ("limit_unknown", "identities_ended")
 
 
 def acks(within: int = 0, over: int = 0) -> dict:
@@ -61,10 +62,12 @@ def acks(within: int = 0, over: int = 0) -> dict:
 
 def live_counters(t: int = 1, rejected: int = 0, ack_ms_le: dict | None = None, **counts: int) -> dict:
     """tenant_sim's live.json, with every field it writes. Keyword counts
-    named in TOTALS set those totals; the rest are client error kinds."""
+    named in TOTALS set those totals, and those in MAPS those maps; the
+    rest are client error kinds."""
+    maps = {k: counts.pop(k, {}) for k in MAPS}
     totals = {k: counts.pop(k, 0) for k in TOTALS}
     return {"t_unix": t, "rejected": rejected, "received": 0, "ack_ms_le": ack_ms_le or acks(),
-            "client_errors": counts, **totals}
+            "client_errors": counts, **totals, **maps}
 
 
 def gen_sample(t: float, busy: int, idle: int, avail: int = 900, oom: int = 0) -> dict:
@@ -660,6 +663,7 @@ class Voids(unittest.TestCase):
             ("read_refused", "the relay refused 2 agent reads"),
             ("read_unanswered", "the relay didn't answer 2 agent reads"),
             ("send_unanswered", "the relay didn't answer 2 sends"),
+            ("relay_shed", "the relay shed 2 sends: full, or unable to reach its admission store"),
         ]
         for k, why in rows:
             with self.subTest(k):
@@ -763,7 +767,7 @@ class Voids(unittest.TestCase):
     LIVE_FIELDS = {"t_unix", "sent", "accepted", "rejected", "rate_limited", "received", "client_errors",
                    "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed",
                    "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-                   "ack_ms_le", "lost", "joined"}
+                   "relay_shed", "limit_unknown", "identities_ended", "ack_ms_le", "lost", "joined"}
 
     def test_the_loop_reads_what_tenant_sim_writes(self) -> None:
         """A live.json from a real tenant_sim run (testdata/live), read with
@@ -812,10 +816,16 @@ class Voids(unittest.TestCase):
             # tenant_sim writes every total, so a missing one is an error,
             # never 0; a kind missing from client_errors is 0. The totals
             # are this file's own list, not the code's.
-            for k in (*TOTALS, "rejected"):
+            for k in (*TOTALS, "rejected", *MAPS):
                 with self.subTest(missing=k):
                     p.write_text(json.dumps({x: v for x, v in whole.items() if x != k}))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no {k}"))
+            for k, bad, why in (("limit_unknown", {"rate-limited: x": "2"}, "limit_unknown is not a count per text"),
+                                ("limit_unknown", {"rate-limited: x": 0}, "limit_unknown is not a count per text"),
+                                ("identities_ended", {"h1": 3}, "identities_ended is not a reason per identity")):
+                with self.subTest(k=k, bad=bad):
+                    p.write_text(json.dumps({**whole, k: bad}))
+                    self.assertEqual(rs.read_live(str(p)), (None, f"{p}: {why}"))
             for k, bad in (("rejected", 1.5), ("rate_limited", 2.5), ("read_refused", -2), ("media_client_failed", -1), ("git_local_failed", True), ("media_refused", "2"),
                            ("git_push_failed", None), ("media_unanswered", 0.5)):
                 with self.subTest(k=k, bad=bad):
@@ -1260,6 +1270,53 @@ class Loop(unittest.TestCase):
             self.assertEqual(code, 3)
             void = json.loads((Path(d) / "samples" / "void.json").read_text())
             self.assertEqual(void["reason"], "the generator for b reported its own errors: send_failed +4, before the relay broke")
+
+    def test_each_limit_text_is_apart_a_break_or_a_void(self) -> None:
+        """The relay's per-key quota is apart: no break, no void. The relay
+        shedding (full, or its admission store out of reach) is its break.
+        A limit text the pinned relay doesn't send voids the run, naming
+        the text. The shed counted apart, as rate_limited, would hide b's
+        break."""
+        def quota(t: int, r: str) -> dict:
+            return live_counters(t, rate_limited=4 if r == "b" and t >= 1050 else 0)
+
+        def shed(t: int, r: str) -> dict:
+            return live_counters(t, relay_shed=4 if r == "b" and t >= 1050 else 0)
+
+        def unknown(t: int, r: str) -> dict:
+            return live_counters(t, limit_unknown={"rate-limited: slow down": 2} if r == "b" and t >= 1050 else {})
+        with tempfile.TemporaryDirectory() as d:
+            code, _, _, seen = self.run_lives(Path(d), quota, {0: "steady"}, 100.0)
+            self.assertEqual(code, 0, self.stderr)
+            self.assertFalse((Path(d) / "samples" / "void.json").exists())
+            self.assertEqual(seen[-1].get("relays"), {})
+        with tempfile.TemporaryDirectory() as d:
+            code, _, _, seen = self.run_lives(Path(d), shed, {0: "steady"}, 100.0)
+            self.assertEqual(code, 0, self.stderr)
+            self.assertFalse((Path(d) / "samples" / "void.json").exists())
+            self.assertEqual(seen[-1], {"relays": {"b": {"t_unix": 1050.0, "band": "steady",
+                                                         "why": "the relay shed 4 sends: full, or unable to reach its admission store"}},
+                                        "first_t_unix": 1050.0})
+        with tempfile.TemporaryDirectory() as d:
+            code, _, _, _ = self.run_lives(Path(d), unknown, {0: "steady"}, 100.0)
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual(void["reason"], "the generator for b got a limit the pinned relay doesn't send: "
+                                             "'rate-limited: slow down' x2; the relay's pin moved")
+
+    def test_an_identity_that_ended_on_its_own_voids_the_run(self) -> None:
+        """An identity's task ended on its own (here, its signing failed):
+        the run voids at once, naming it, never only at the end."""
+        def write(t: int, r: str) -> dict:
+            ended = {"a7": "kind 9 sign: no key"} if r == "a" and t >= 1050 else {}
+            return live_counters(t, identities_ended=ended)
+        with tempfile.TemporaryDirectory() as d:
+            code, _, _, _ = self.run_lives(Path(d), write, {0: "steady"}, 100.0)
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual(void["reason"], "the generator for a: an identity's task ended on its own: a7: kind 9 sign: no key, "
+                                             "before the relay broke")
+            self.assertEqual(void["t_unix"], 1050.0, "at the tick it was read")
 
     def test_bands_and_the_end_of_a_run(self) -> None:
         with tempfile.TemporaryDirectory() as d:

@@ -291,6 +291,10 @@ class Clock:
                 if n != 0:
                     raise Stop(EXIT_RATE_LIMITED,
                                f"setup for {g} was rate-limited {n} times; the setup limits are raised, so its setup is wrong")
+                n = p.get("relay_shed")
+                if n != 0:
+                    raise Stop(EXIT_RATE_LIMITED,
+                               f"the relay shed {n} of {g}'s setup events: full, or unable to reach its admission store")
         self.call("fleet")
         for g in sorted(self._running):
             self.send(g, f"continue {self.lease(self.opts.ready_timeout_s)}")

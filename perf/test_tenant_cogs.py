@@ -453,13 +453,18 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(tenant_cogs.acceptance_errors(line, self.summary_ok(), 0), [])
 
     def test_sends_unanswered_or_not_sent_fail_acceptance(self) -> None:
-        """A send the relay never answered, and one that failed before it
-        was written, each fail a local run: neither is a reject, so the
-        rejected gate alone would pass them."""
+        """A send the relay never answered, one that failed before it was
+        written, one the relay shed, and one answered with an unknown limit,
+        each fail a local run: none is a reject, so the rejected gate alone
+        would pass them."""
         rows = [
             ({"unanswered": 0, "failed": 0}, []),
             ({"unanswered": 3, "failed": 0}, ["steady client unanswered=3"]),
             ({"unanswered": 0, "failed": 2}, ["steady client failed=2"]),
+            # Shed by the relay, or a limit text the pinned relay doesn't
+            # send: neither is the quota, which alone is apart.
+            ({"shed": 4}, ["steady client shed=4"]),
+            ({"limit_unknown": 1}, ["steady client limit_unknown=1"]),
         ]
         for counts, want in rows:
             with self.subTest(counts=counts):

@@ -32,6 +32,8 @@ pub struct SeedReport {
     pub acked: u64,
     pub rejected: u64,
     pub rate_limited: u64,
+    /// Events the relay shed, full or unable to admit, each resent.
+    pub shed: u64,
     pub errors: u64,
     pub writers: u64,
     pub seconds: f64,
@@ -44,6 +46,7 @@ struct Counters {
     acked: AtomicU64,
     rejected: AtomicU64,
     rate_limited: AtomicU64,
+    shed: AtomicU64,
     errors: AtomicU64,
     first_reject: Mutex<Option<String>>,
 }
@@ -123,6 +126,21 @@ async fn writer(
                 let left = deadline.saturating_duration_since(Instant::now());
                 tokio::time::sleep(retry_in.min(left)).await;
             }
+            // The relay shed it: resent after a pause, counted apart.
+            Ok(Publish::Shed { text }) => {
+                warn!("seed {} shed: {text}", rec.name);
+                c.shed.fetch_add(1, Ordering::Relaxed);
+                pending = Some((i, event));
+                let left = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(Duration::from_secs(1).min(left)).await;
+            }
+            // A text the pinned relay doesn't send: an error, not resent.
+            Ok(Publish::UnknownLimit { text }) => {
+                warn!("seed {} unknown limit: {text}", rec.name);
+                c.errors.fetch_add(1, Ordering::Relaxed);
+                let mut first = c.first_reject.lock().unwrap_or_else(|p| p.into_inner());
+                first.get_or_insert(text);
+            }
             Err(e) => {
                 warn!("seed {} publish: {e}", rec.name);
                 c.errors.fetch_add(1, Ordering::Relaxed);
@@ -191,6 +209,7 @@ pub async fn seed(
         acked,
         rejected: c.rejected.load(Ordering::Relaxed),
         rate_limited: c.rate_limited.load(Ordering::Relaxed),
+        shed: c.shed.load(Ordering::Relaxed),
         errors: c.errors.load(Ordering::Relaxed),
         writers,
         seconds,

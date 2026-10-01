@@ -589,11 +589,21 @@ python3 perf/tenant_cogs.py remote-sample \
     or branch that failed (`git_local_failed`), or an agent's read that
     failed before it went out (`read_client_failed`). A missing or unreadable
     `--live-file` is a void too, never "no errors", and so is a file
-    without `rejected`, `rate_limited`, `send_unanswered`,
-    `media_client_failed`, `media_refused`,
+    without `rejected`, `rate_limited`, `send_unanswered`, `relay_shed`,
+    `limit_unknown`, `identities_ended`, `media_client_failed`, `media_refused`,
     `media_unanswered`, `git_local_failed`, `git_push_failed`,
     `read_client_failed`, `read_refused`, `read_unanswered` or
     `read_rate_limited`: a total missing is never read as 0.
+  - **An identity that ended on its own:** an identity's task that joined,
+    then ended for any reason but a stop or a lease (an error, such as an
+    event it couldn't sign, or a panic), is in `identities_ended` at once,
+    with why, and voids the run naming it (a note after the break). A
+    silently lost identity under-loads the run and over-states the
+    relay's ceiling. One that never joined is a failed warm-up, or a ramp
+    joiner the relay didn't take (`join_failed`, a break).
+  - **A limit the pinned relay doesn't send:** a `rate-limited:` text
+    other than the relay's three (below), in `limit_unknown` by text,
+    voids the run at any time, naming the text: the relay's pin moved.
   - `tenant_sim`'s live counters stop being live: `t_unix` missing or not
     a whole number of seconds, more than 10 s old or 10 s ahead of the
     clock when the loop reads it, or lower than the last one read; or its
@@ -613,7 +623,8 @@ python3 perf/tenant_cogs.py remote-sample \
     - **lost or rejected:** events found lost after a recheck (`lost`);
       relay rejects (not rate limits); sends the relay didn't answer
       (`send_unanswered`: written, then no OK in 30 s or the socket failed
-      before it); media uploads, git pushes or agent
+      before it); sends the relay shed (`relay_shed`: full, or unable to
+      reach its admission store); media uploads, git pushes or agent
       reads the relay refused or didn't answer (`media_refused`,
       `media_unanswered`, `git_push_failed`, `read_refused`,
       `read_unanswered`; a timeout included);
@@ -629,8 +640,8 @@ python3 perf/tenant_cogs.py remote-sample \
     void, a generator too busy to read its sockets would look like a relay
     that stopped answering. A send that failed before anything was written
     (encoding, a socket already closed) is `send_failed`, the generator's
-    own error. Rate limits are counted apart: never a break. A
-    generator event after the break is a note, not a void, written once.
+    own error. The relay's per-key quota is counted apart: never a break.
+    A generator event after the break is a note, not a void, written once.
   - **Whose break.** A relay's break is its box's own signals, those in the
     live file bound to it, or those in a live file bound to no relay
     (`--live-file`), whichever came first; another relay's doesn't count
@@ -658,8 +669,9 @@ python3 perf/tenant_cogs.py remote-sample \
   second signal while the summaries or `void.json` are written is ignored.
 
 `tenant_sim` rewrites `<out-dir>/live.json` every 2 s for this: totals of
-sent, accepted, rejected, rate-limited, unanswered (`send_unanswered`) and
-received, its own errors by kind
+sent, accepted, rejected, rate-limited, unanswered (`send_unanswered`),
+shed (`relay_shed`) and received, unknown limits by text (`limit_unknown`),
+identities that ended on their own (`identities_ended`), its own errors by kind
 (`send_failed`, `recv_error`, `reconnect_failed`, `backfill_failed`,
 `connection_dropped`), and media and git failures by where they failed,
 stamped `t_unix`. If a rewrite fails, `tenant_sim` logs it and carries on;
@@ -673,16 +685,34 @@ on a lease or an eof lost its driver, and the loop voids on it. A crash
 writes neither, goes stale, and voids as before.
 
 Each send ends in exactly one of accepted, rejected, rate-limited,
-`send_unanswered` or `send_failed`. Any other `NOTICE` doesn't end a send:
-it is handled like any other message, and the send keeps waiting for its
-`OK`.
+`relay_shed`, `limit_unknown`, `send_unanswered` or `send_failed`. A
+`NOTICE` that isn't `rate-limited:` doesn't end a send: it is handled like
+any other message, and the send keeps waiting for its `OK`.
+
+**The relay's `rate-limited:` texts,** told apart by their exact prefix. The
+relay this harness pins sends three (`crates/buzz-relay/src` at its commit):
+
+| Text | Where | What it means | Counts as |
+|---|---|---|---|
+| `rate-limited: quota exceeded; retry in Ns` | `connection.rs`; HTTP 429 in `api/bridge.rs` | this key's own quota | `rate_limited` (reads: `read_rate_limited`), apart |
+| `rate-limited: too many concurrent requests` | `connection.rs`, for an EVENT, REQ or COUNT | the relay's one relay-wide handler limit (`BUZZ_MAX_CONCURRENT_HANDLERS`) is full: not per key or per connection | `relay_shed`, a relay break |
+| `rate-limited: shared admission unavailable` | `connection.rs`; HTTP 503 in `api/bridge.rs` | the relay can't reach its own admission store | `relay_shed` (reads: `read_refused`), a relay break |
+| any other `rate-limited:` text | none | the pin moved | `limit_unknown`, a void naming the text |
+
+In setup, the quota and a shed are each waited out and the event resent,
+counted in `setup-done`'s `provision.rate_limited` and
+`provision.relay_shed`: setup fails only when the retries give up. An
+unknown text fails setup at once. The seed resends both, counted in its
+report's `rate_limited` and `shed`.
 
 | Failure | live.json total | Counts as |
 |---|---|---|
 | Send: encoding, or a socket already closed, before anything is written | `send_failed` | the generator's error |
 | Send: written, then no OK within 30 s | `send_unanswered` | a relay break |
 | Send: written, then the socket fails before the OK | `send_unanswered` | a relay break |
-| Send: a rate-limit NOTICE | `rate_limited` | apart: neither |
+| Send: the quota's NOTICE (`rate-limited: quota exceeded`) | `rate_limited` | apart: neither |
+| Send: the relay full or unable to admit (`rate-limited: too many concurrent requests`, `rate-limited: shared admission unavailable`) | `relay_shed` | a relay break |
+| Send: any other `rate-limited:` text | `limit_unknown` | a void |
 | Send: an `OK` that rejects | `rejected` | a relay break |
 | Media: encoding the image or signing the auth, before the request goes out | `media_client_failed` | the generator's error |
 | Media: an answer that isn't 2xx | `media_refused` | a relay break |
@@ -692,7 +722,9 @@ it is handled like any other message, and the send keeps waiting for its
 | Agent read: building or signing the request, before it goes out | `read_client_failed` | the generator's error |
 | Agent read: an answer that isn't 2xx, or isn't JSON | `read_refused` | a relay break |
 | Agent read: a transport error or a timeout, no answer | `read_unanswered` | a relay break |
-| Agent read: a 429 from the relay's per-key rate limit | `read_rate_limited` | apart: neither |
+| Agent read: the quota (`rate-limited: quota exceeded`, a 429) | `read_rate_limited` | apart: neither |
+| Agent read: the relay full or unable to admit | `read_refused` | a relay break |
+| Agent read: any other `rate-limited:` text | `limit_unknown` | a void |
 
 ## Agent per-turn reads
 
@@ -779,7 +811,9 @@ at 1800 s.
    within `--setup-timeout` (3600 s), stops the run (exit 5).
 2. With `--setup-must-not-rate-limit`, a `setup-done` whose
    `provision.rate_limited` isn't 0 stops the run (exit 6): the setup
-   limits are raised, so a rate limit there means the setup is wrong.
+   limits are raised, so a rate limit there means the setup is wrong. So
+   does one whose `provision.relay_shed` isn't 0, with its own line: the
+   relay shed setup's events, full or unable to admit.
 3. `fleet`, then `continue` to each generator, then a barrier on `ready`
    (`--ready-timeout`, 300 s), then `sampler start`.
 4. Each band: its line to every generator with a lease of its length plus
