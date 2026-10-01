@@ -602,7 +602,7 @@ class Voids(unittest.TestCase):
             self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no client_errors"))
             for bad in ('"7"', "true", "7.5", "0", "-3", "null"):
                 with self.subTest(t_unix=bad):
-                    p.write_text('{"t_unix": %s, "client_errors": {}, "rejected": 0, "media_failed": 0, "git_failed": 0}' % bad)
+                    p.write_text(json.dumps(live_counters(7)).replace('"t_unix": 7,', '"t_unix": %s,' % bad, 1))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p}: t_unix {bad} is not a whole number of seconds"))
             whole = live_counters(7)
             p.write_text(json.dumps({**whole, "client_errors": {"send_failed": "2"}}))

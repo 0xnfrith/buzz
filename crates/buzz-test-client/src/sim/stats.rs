@@ -106,7 +106,7 @@ struct Inner {
     media_uploads: u64,
     media_bytes: u64,
     media_rejected: u64,
-    media_failed: BTreeMap<MediaFailure, u64>,
+    media_failed_by: BTreeMap<MediaFailure, u64>,
     media_put_ms: Vec<f64>,
     git_pushes: u64,
     git_bytes: u64,
@@ -291,7 +291,7 @@ impl Stats {
     pub fn record_media_failed(&self, why: MediaFailure) {
         self.with(|s| {
             s.media_rejected += 1;
-            *s.media_failed.entry(why).or_default() += 1;
+            *s.media_failed_by.entry(why).or_default() += 1;
         });
     }
 
@@ -346,9 +346,9 @@ impl Stats {
                 rejected,
                 received,
                 client_errors: s.client_errors.clone(),
-                media_client_failed: count(&s.media_failed, MediaFailure::Client),
-                media_refused: count(&s.media_failed, MediaFailure::Refused),
-                media_unanswered: count(&s.media_failed, MediaFailure::Unanswered),
+                media_client_failed: count(&s.media_failed_by, MediaFailure::Client),
+                media_refused: count(&s.media_failed_by, MediaFailure::Refused),
+                media_unanswered: count(&s.media_failed_by, MediaFailure::Unanswered),
                 git_local_failed: count(&s.git_failed_by, GitFailure::Local),
                 git_push_failed: count(&s.git_failed_by, GitFailure::Push),
             }

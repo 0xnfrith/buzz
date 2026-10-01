@@ -590,18 +590,15 @@ mod tests {
     }
 
     /// `git add` failing is the generator's own failure, and nothing is
-    /// pushed.
+    /// pushed. The repo's own index is locked, so `add` fails inside the
+    /// test's repo whatever surrounds the temp dir.
     #[test]
     fn an_add_that_fails_is_local() {
         let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
         let dir = testsrv::tempdir();
-        let not_a_repo = dir.join("plain");
-        std::fs::create_dir_all(&not_a_repo).expect("mkdir");
-        let repo = GitRepo {
-            worktree: not_a_repo,
-            ..local_repo(dir.join("wt"), remote(&refusing))
-        };
-        let e = push_blob(&repo, Path::new("/usr/bin/true"), b"x", 1).expect_err("not a repo");
+        let repo = local_repo(dir.join("wt"), remote(&refusing));
+        std::fs::write(repo.worktree.join(".git").join("index.lock"), b"").expect("lock");
+        let e = push_blob(&repo, Path::new("/usr/bin/true"), b"x", 1).expect_err("index locked");
         assert_eq!(e.at, GitFailure::Local, "{e}");
         assert!(e.to_string().contains("\"add\""), "{e}");
         assert_eq!(refusing.accepts(), 0, "a failed add still pushed");
