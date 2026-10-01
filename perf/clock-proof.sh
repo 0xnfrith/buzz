@@ -8,6 +8,8 @@
 # which one ran. Every image must already be on this machine: the proof
 # never pulls one.
 set -euo pipefail
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cd "$(dirname "$0")/.."
 cargo build --release -p buzz-test-client --bin tenant_sim
 cargo build --release -p git-credential-nostr

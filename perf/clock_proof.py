@@ -424,6 +424,21 @@ def phase(out: Path, name: str) -> dict[str, Any]:
     return {}
 
 
+class Stopped(Exception):
+    """INT or TERM: the row's end still runs, then exit 130 or 143."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _stop(signum: int, _frame: Any) -> None:
+    # A second signal must not cut the cleanup short.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise Stopped(130 if signum == signal.SIGINT else 143)
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="clock_proof.py", description=__doc__.split("\n\n")[0])
     p.add_argument("--rows", default=",".join(ROWS), help=f"comma-separated, from {', '.join(ROWS)}")
@@ -450,15 +465,22 @@ def main(argv: list[str]) -> int:
         "ramp-starved": proof.row_ramp_starved, "boundary": proof.row_boundary,
         "void": proof.row_void, "crash-gen": proof.row_crash_gen, "crash-clock": proof.row_crash_clock,
         "heavy-seed": proof.row_heavy_seed}
-    for r in rows:
-        print(f"== {r}", flush=True)
-        try:
-            fns[r]()
-        finally:
-            # Whatever happened in the row, nothing of it stays up.
-            cfg = out / r / "config.json"
-            if cfg.exists():
-                subprocess.run([*proof.hook(cfg), "end"], capture_output=True, timeout=600)
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+    try:
+        for r in rows:
+            print(f"== {r}", flush=True)
+            try:
+                fns[r]()
+            finally:
+                # Whatever happened in the row, nothing of it stays up.
+                cfg = out / r / "config.json"
+                if cfg.exists():
+                    subprocess.run([*proof.hook(cfg), "end"], capture_output=True, timeout=600)
+    except Stopped as e:
+        left = proof.leftovers()
+        print(f"\nstopped by a signal: exit {e.code}; left: {left or 'nothing'}", flush=True)
+        return e.code
     left = proof.leftovers()
     proof.check("all", "nothing is left after the proof", not left, left or "")
     failed = [x for x in proof.results if not x[2]]
