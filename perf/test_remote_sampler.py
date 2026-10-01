@@ -45,7 +45,7 @@ def relay_sample(t: float, h: str = H1, ws: int = 100, busy: int = 0, oom: int =
     return row
 
 
-TOTALS = ("media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed")
+TOTALS = ("rate_limited", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed")
 
 
 def live_counters(t: int = 1, rejected: int = 0, **counts: int) -> dict:
@@ -640,6 +640,14 @@ class Voids(unittest.TestCase):
         self.assertEqual(m.notes, [{"t_unix": 2, "relay_break": "the relay didn't answer 1 media uploads"},
                                    {"t_unix": 2, "after_relay_break": "the generator reported its own errors: git_local_failed +1", "relay_break_t": 2}])
 
+    def test_rate_limits_rising_are_neither_a_break_nor_a_void(self) -> None:
+        """Sends the relay's per-key rate limits turned away are counted
+        apart: the service level excludes them."""
+        m = rs.Monitor(expected={}, live_required=True)
+        for t, n in ((1, 0), (2, 4), (3, 9)):
+            self.assertIsNone(m.gen_tick(t, gen_sample(t, 0, 0), live_counters(t, rate_limited=n), None), t)
+        self.assertEqual((m.relay_break_t, m.notes), (None, []))
+
     def test_an_event_after_the_break_is_noted_once(self) -> None:
         m = rs.Monitor(expected={})
         m.relay_break(0, "the relay dropped connections")
@@ -673,7 +681,7 @@ class Voids(unittest.TestCase):
                 with self.subTest(missing=k):
                     p.write_text(json.dumps({x: v for x, v in whole.items() if x != k}))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no {k}"))
-            for k, bad in (("rejected", 1.5), ("media_client_failed", -1), ("git_local_failed", True), ("media_refused", "2"),
+            for k, bad in (("rejected", 1.5), ("rate_limited", 2.5), ("media_client_failed", -1), ("git_local_failed", True), ("media_refused", "2"),
                            ("git_push_failed", None), ("media_unanswered", 0.5)):
                 with self.subTest(k=k, bad=bad):
                     p.write_text(json.dumps({**whole, k: bad}))

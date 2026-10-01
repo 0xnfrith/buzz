@@ -1546,6 +1546,9 @@ def client_from_summary(summary: dict[str, Any], band: str) -> dict[str, Any] | 
         "sent": b.get("sent", 0),
         "accepted": b.get("accepted", 0),
         "rejected": b.get("rejected", 0),
+        # Turned away by the relay's per-key rate limits: counted apart from
+        # rejected, never an acceptance error.
+        "rate_limited": b.get("rate_limited", 0),
         "received": b.get("received", 0),
         "ok_ms": b.get("ok_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
         "fanout_ms": b.get("fanout_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},

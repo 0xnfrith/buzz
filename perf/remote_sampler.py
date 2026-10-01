@@ -70,7 +70,10 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 # The live counters' totals the loop reads besides client_errors. tenant_sim
 # writes every one, so a missing one is an error, never 0. client_errors
 # holds only the kinds that happened, so a kind missing there is 0.
-LIVE_TOTALS = ("rejected", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed")
+# rate_limited (sends the relay's per-key rate limits turned away) is
+# counted apart: neither the relay breaking nor the generator's own error.
+LIVE_TOTALS = ("rejected", "rate_limited", "media_client_failed", "media_refused", "media_unanswered",
+               "git_local_failed", "git_push_failed")
 # Media and git failures, split by where they failed. A media upload that
 # failed before it went out, or a git add, commit or branch, is the
 # generator's own error.

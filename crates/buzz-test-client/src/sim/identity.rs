@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
+use super::admission::{self, Publish};
 use super::git::{self, GitRepo};
 use super::guard::{self, Target};
 use super::kinds;
@@ -24,6 +25,9 @@ use super::roles::{
     in_active_window, next_any_wait, pick_action, rng_f64, rng_usize, scaled_rates, Band, Role,
 };
 use super::stats::Stats;
+
+/// How long a send waits for its OK: buzz-ws-client's own publish window.
+const OK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdentityRecord {
@@ -393,8 +397,29 @@ impl Session {
     async fn send(&mut self, client: &mut BuzzTestClient, band: Band, event: nostr::Event) -> bool {
         let kind = event.kind.as_u16();
         let start = Instant::now();
-        match client.send_event(event.clone()).await {
-            Ok(ok) => {
+        let answer = match admission::send_tracked(client, &event, OK_TIMEOUT).await {
+            Ok((answer, others)) => {
+                // A subscription's events that came in while this send
+                // waited, handled as they would have been.
+                for msg in others {
+                    self.handle_msg(band, msg).await;
+                }
+                Ok(answer)
+            }
+            Err(e) => Err(e),
+        };
+        match answer {
+            Ok(Publish::RateLimited { retry_in }) => {
+                if band.sampled() {
+                    self.stats.record_rate_limited(band.as_str(), kind);
+                }
+                warn!(
+                    "{} kind {kind} rate-limited (retry in {retry_in:?})",
+                    self.rec.name
+                );
+                false
+            }
+            Ok(Publish::Ok(ok)) => {
                 let ms = start.elapsed().as_secs_f64() * 1e3;
                 if band.sampled() {
                     self.stats
@@ -897,6 +922,84 @@ pub fn uuid_v4(rng: &mut StdRng) -> uuid::Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::admission::testrelay::fake_relay;
+    use crate::sim::guard::{Cidr, TargetGuard};
+
+    /// A human's session in the team profile, its world on loopback.
+    fn test_session(stats: Arc<Stats>) -> Session {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../perf/profiles/10h-20a.toml");
+        let profile = Arc::new(crate::sim::profile::load_profile(&path).expect("profile"));
+        let pop = generate_population(&profile);
+        let rec = pop.humans[0].clone();
+        let keys = pop.keys_of(&rec).expect("keys");
+        let guard = TargetGuard::new(vec![Cidr::parse("127.0.0.0/8").expect("allow")], vec![])
+            .expect("guard");
+        let world = Arc::new(World {
+            relay_url: guard.check_url("ws://127.0.0.1:1", &["ws"]).expect("relay"),
+            http_url: guard
+                .check_url("http://127.0.0.1:1", &["http"])
+                .expect("http"),
+            channels: vec!["chan-a".into()],
+            human_pubkeys: pop.humans.iter().map(|h| h.pubkey.clone()).collect(),
+            repos: vec![],
+            git_helper: PathBuf::from("/usr/bin/true"),
+            out_dir: std::env::temp_dir(),
+            blink: false,
+        });
+        let (_tx, band_rx) = watch::channel(Band::Steady);
+        Session {
+            rng: std_rng(profile.seed, 1),
+            rec,
+            keys,
+            role: Role::Human,
+            oa_owner: None,
+            auth_tag: None,
+            git_push_scale: 0.0,
+            profile,
+            world,
+            stats,
+            band_rx,
+            seq: 0,
+            own: VecDeque::new(),
+            seen: VecDeque::new(),
+            expected: HashMap::new(),
+            missing: HashSet::new(),
+            last_seen_created_at: unix_now(),
+            git_repo: None,
+            http: guard::http_client(Duration::from_secs(5)).expect("http client"),
+        }
+    }
+
+    /// A send the relay's per-key rate limiter turns away during a band
+    /// (a NOTICE, no OK) is counted as rate-limited: not rejected, and not a
+    /// send that failed, which the sampler would read as the generator's
+    /// own error and void on.
+    #[tokio::test]
+    async fn a_rate_limited_send_in_a_band_is_counted_apart() {
+        let url = fake_relay(vec![
+            r#"["NOTICE","rate-limited: quota exceeded; retry in 7s"]"#.to_string(),
+        ])
+        .await;
+        let stats = Arc::new(Stats::new());
+        let mut sess = test_session(stats.clone());
+        let mut client = BuzzTestClient::connect_unauthenticated(&url)
+            .await
+            .expect("connect");
+        let ev = kinds::presence(&sess.keys, &sess.profile.kinds).expect("event");
+        let started = Instant::now();
+        assert!(!sess.send(&mut client, Band::Steady, ev).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the send waited out the OK window"
+        );
+        let live = stats.live(1);
+        assert_eq!(
+            (live.sent, live.accepted, live.rejected, live.rate_limited),
+            (1, 0, 0, 1)
+        );
+        assert!(live.client_errors.is_empty(), "{:?}", live.client_errors);
+    }
 
     #[test]
     fn repo_owners_carry_the_populations_pushes() {

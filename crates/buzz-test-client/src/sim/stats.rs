@@ -39,6 +39,10 @@ pub struct BandClient {
     pub sent: u64,
     pub accepted: u64,
     pub rejected: u64,
+    /// Sends the relay's per-key rate limiter turned away (a NOTICE, no OK):
+    /// counted apart from `rejected`, neither a break nor the generator's
+    /// error.
+    pub rate_limited: u64,
     pub received: u64,
     /// Sends in this band by event kind; acceptance checks the floor with it.
     pub sent_by_kind: BTreeMap<String, u64>,
@@ -89,6 +93,7 @@ struct BandAcc {
     sent: u64,
     accepted: u64,
     rejected: u64,
+    rate_limited: u64,
     received: u64,
     sent_by_kind: BTreeMap<String, u64>,
     ok_ms: Vec<f64>,
@@ -154,6 +159,9 @@ pub struct Live {
     pub sent: u64,
     pub accepted: u64,
     pub rejected: u64,
+    /// Sends the relay's per-key rate limiter turned away, apart from
+    /// `rejected`.
+    pub rate_limited: u64,
     pub received: u64,
     /// The generator's own failures, by kind: `send_failed` (no answer to a
     /// send), `recv_error`, `reconnect_failed`, `backfill_failed`, and
@@ -248,6 +256,17 @@ impl Stats {
         });
     }
 
+    /// A send the relay's per-key rate limiter turned away.
+    pub fn record_rate_limited(&self, band: &str, kind: u16) {
+        self.with(|s| {
+            *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            let b = s.bands.entry(band.to_string()).or_default();
+            b.sent += 1;
+            b.rate_limited += 1;
+            *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+        });
+    }
+
     pub fn record_recv(&self, band: &str, fanout_ms: Option<f64>) {
         self.with(|s| {
             let b = s.bands.entry(band.to_string()).or_default();
@@ -332,11 +351,13 @@ impl Stats {
     /// The live counters, stamped `t_unix`.
     pub fn live(&self, t_unix: u64) -> Live {
         self.with(|s| {
-            let (mut sent, mut accepted, mut rejected, mut received) = (0, 0, 0, 0);
+            let (mut sent, mut accepted, mut rejected, mut rate_limited, mut received) =
+                (0, 0, 0, 0, 0);
             for b in s.bands.values() {
                 sent += b.sent;
                 accepted += b.accepted;
                 rejected += b.rejected;
+                rate_limited += b.rate_limited;
                 received += b.received;
             }
             Live {
@@ -344,6 +365,7 @@ impl Stats {
                 sent,
                 accepted,
                 rejected,
+                rate_limited,
                 received,
                 client_errors: s.client_errors.clone(),
                 media_client_failed: count(&s.media_failed_by, MediaFailure::Client),
@@ -373,6 +395,7 @@ impl Stats {
                     sent: acc.sent,
                     accepted: acc.accepted,
                     rejected: acc.rejected,
+                    rate_limited: acc.rate_limited,
                     received: acc.received,
                     sent_by_kind: acc.sent_by_kind.clone(),
                     ok_ms: percentiles(acc.ok_ms.clone()),

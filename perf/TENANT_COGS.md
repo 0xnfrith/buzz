@@ -449,15 +449,15 @@ python3 perf/tenant_cogs.py remote-sample \
     failed before it went out (`media_client_failed`), or a git add, commit
     or branch that failed (`git_local_failed`). A missing or unreadable
     `--live-file` is a void too, never "no errors", and so is a file
-    without `rejected`, `media_client_failed`, `media_refused`,
+    without `rejected`, `rate_limited`, `media_client_failed`, `media_refused`,
     `media_unanswered`, `git_local_failed` or `git_push_failed`: a total
     missing is never read as 0.
   - `tenant_sim`'s live counters stop being live: `t_unix` missing or not
     a whole number of seconds, more than 10 s old or 10 s ahead of the
     clock when the loop reads it, or lower than the last one read. The
     writer and the loop share the generator box's clock.
-  - "The relay breaks" is the first of: relay rejects or dropped
-    connections rising in the live counters; media uploads the relay
+  - "The relay breaks" is the first of: relay rejects (not rate limits)
+    or dropped connections rising in the live counters; media uploads the relay
     refused (`media_refused`, an answer that isn't 2xx) or didn't answer
     (`media_unanswered`, a transport error or a timeout); git pushes that
     failed (`git_push_failed`, the 90 s timeout included); a relay OOM
@@ -481,7 +481,7 @@ python3 perf/tenant_cogs.py remote-sample \
   second signal while the summaries or `void.json` are written is ignored.
 
 `tenant_sim` rewrites `<out-dir>/live.json` every 2 s for this: totals of
-sent, accepted, rejected and received, its own errors by kind
+sent, accepted, rejected, rate-limited and received, its own errors by kind
 (`send_failed`, `recv_error`, `reconnect_failed`, `backfill_failed`,
 `connection_dropped`), and media and git failures by where they failed,
 stamped `t_unix`. If a rewrite fails, `tenant_sim` logs it and carries on;
@@ -495,6 +495,15 @@ before `tenant_sim` ends.
 | Media: a transport error or a timeout, no answer | `media_unanswered` | a relay break |
 | Git: writing the blob, `add`, `commit` or `branch` | `git_local_failed` | the generator's error |
 | Git: the push, refused, failed or past the 90 s timeout | `git_push_failed` | a relay break |
+
+**Per-key rate limits are counted apart.** relay-v0.2.1 answers an
+over-quota event with a `NOTICE` ("rate-limited: ...") and no `OK`. In a
+band, `tenant_sim` reads that notice as the send's answer, counts it as
+`rate_limited` (in `live.json` and in each band of `summary.json`), and
+doesn't resend. It is neither a reject, nor a break, nor the generator's
+own error, so the loop never voids on it and acceptance never fails on
+it: the service level counts rate limits apart. Messages that arrive
+while a send waits for its answer are handled, never dropped.
 
 Each blob is a new file, so `commit` always has a change in a healthy run.
 `summary.json` keeps its meaning: its media `rejected` and git `failed`
