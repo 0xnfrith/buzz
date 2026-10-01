@@ -45,10 +45,15 @@ def relay_sample(t: float, h: str = H1, ws: int = 100, busy: int = 0, oom: int =
     return row
 
 
-def live_counters(t: int = 1, rejected: int = 0, media_failed: int = 0, git_failed: int = 0, **client_errors: int) -> dict:
-    """tenant_sim's live.json, with every field it writes."""
+TOTALS = ("media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed")
+
+
+def live_counters(t: int = 1, rejected: int = 0, **counts: int) -> dict:
+    """tenant_sim's live.json, with every field it writes. Keyword counts
+    named in TOTALS set those totals; the rest are client error kinds."""
+    totals = {k: counts.pop(k, 0) for k in TOTALS}
     return {"t_unix": t, "sent": 0, "accepted": 0, "rejected": rejected, "received": 0,
-            "client_errors": client_errors, "media_failed": media_failed, "git_failed": git_failed}
+            "client_errors": counts, **totals}
 
 
 def gen_sample(t: float, busy: int, idle: int, avail: int = 900, oom: int = 0) -> dict:
@@ -500,9 +505,11 @@ class Voids(unittest.TestCase):
         for t, lt in ((1000, 990), (1005, 995), (1010, 1000), (1010, 1000), (1015, 1025)):
             self.assertIsNone(m.gen_tick(t, gen_sample(t, 0, 0), live_counters(lt), None), (t, lt))
 
-    def test_media_and_git_failures_are_the_generators_own_errors(self) -> None:
-        """Each rising before the relay breaks voids; after it, a note."""
-        for k in ("media_failed", "git_failed"):
+    def test_local_media_and_git_failures_are_the_generators_own_errors(self) -> None:
+        """A media upload that failed before it went out, or a git add,
+        commit or branch: each rising before the relay breaks voids; after
+        it, a note."""
+        for k in ("media_client_failed", "git_local_failed"):
             with self.subTest(k, relay_broke=False):
                 m = rs.Monitor(expected={}, live_required=True)
                 self.assertIsNone(m.gen_tick(1, gen_sample(1, 0, 0), live_counters(1), None))
@@ -521,8 +528,35 @@ class Voids(unittest.TestCase):
     def test_media_git_and_client_errors_rising_together_are_one_void(self) -> None:
         m = rs.Monitor(expected={}, live_required=True)
         self.assertIsNone(m.gen_tick(1, gen_sample(1, 0, 0), live_counters(1), None))
-        v = m.gen_tick(2, gen_sample(2, 0, 0), live_counters(2, media_failed=1, git_failed=3, recv_error=1), None)
-        self.assertEqual(v.reason, "the generator reported its own errors: git_failed +3, media_failed +1, recv_error +1, before the relay broke")
+        v = m.gen_tick(2, gen_sample(2, 0, 0), live_counters(2, media_client_failed=1, git_local_failed=3, recv_error=1), None)
+        self.assertEqual(v.reason, "the generator reported its own errors: git_local_failed +3, media_client_failed +1, recv_error +1, before the relay broke")
+
+    def test_media_and_git_failures_at_the_relay_are_a_relay_break(self) -> None:
+        """A refused or unanswered upload, or a failed push, with no other
+        signal: a relay break and its note, not a void. A generator error
+        after it is a note too."""
+        rows = [
+            ("media_refused", "the relay refused 2 media uploads"),
+            ("media_unanswered", "the relay didn't answer 2 media uploads"),
+            ("git_push_failed", "2 git pushes to the relay failed"),
+        ]
+        for k, why in rows:
+            with self.subTest(k):
+                m = rs.Monitor(expected={}, live_required=True)
+                self.assertIsNone(m.gen_tick(1, gen_sample(1, 0, 0), live_counters(1), None))
+                self.assertIsNone(m.gen_tick(2, gen_sample(2, 0, 0), live_counters(2, **{k: 2}), None))
+                self.assertEqual((m.relay_break_t, m.notes), (2, [{"t_unix": 2, "relay_break": why}]))
+                self.assertIsNone(m.gen_tick(3, gen_sample(3, 0, 0), live_counters(3, media_client_failed=1, **{k: 2}), None))
+                self.assertEqual(m.notes[-1], {"t_unix": 3, "after_relay_break": "the generator reported its own errors: media_client_failed +1", "relay_break_t": 2})
+
+    def test_a_relay_failure_in_the_same_tick_as_a_generator_error_comes_first(self) -> None:
+        """Both read from one live.json: the relay break is recorded first,
+        so the generator error is a note."""
+        m = rs.Monitor(expected={}, live_required=True)
+        self.assertIsNone(m.gen_tick(1, gen_sample(1, 0, 0), live_counters(1), None))
+        self.assertIsNone(m.gen_tick(2, gen_sample(2, 0, 0), live_counters(2, media_unanswered=1, git_local_failed=1), None))
+        self.assertEqual(m.notes, [{"t_unix": 2, "relay_break": "the relay didn't answer 1 media uploads"},
+                                   {"t_unix": 2, "after_relay_break": "the generator reported its own errors: git_local_failed +1", "relay_break_t": 2}])
 
     def test_an_event_after_the_break_is_noted_once(self) -> None:
         m = rs.Monitor(expected={})
@@ -557,7 +591,8 @@ class Voids(unittest.TestCase):
                 with self.subTest(missing=k):
                     p.write_text(json.dumps({x: v for x, v in whole.items() if x != k}))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p} has no {k}"))
-            for k, bad in (("rejected", 1.5), ("media_failed", -1), ("git_failed", True), ("media_failed", "2"), ("git_failed", None)):
+            for k, bad in (("rejected", 1.5), ("media_client_failed", -1), ("git_local_failed", True), ("media_refused", "2"),
+                           ("git_push_failed", None), ("media_unanswered", 0.5)):
                 with self.subTest(k=k, bad=bad):
                     p.write_text(json.dumps({**whole, k: bad}))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p} has a counter that is not a whole number"))

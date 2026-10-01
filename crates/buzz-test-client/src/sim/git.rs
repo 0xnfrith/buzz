@@ -10,8 +10,27 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 
 use super::guard::Target;
+use super::stats::GitFailure;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// A failed push, and where it failed: the live counters keep the
+/// generator's own failures apart from the relay's.
+#[derive(Debug)]
+pub struct PushError {
+    pub at: GitFailure,
+    pub err: anyhow::Error,
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.err)
+    }
+}
+
+fn failed(at: GitFailure) -> impl Fn(anyhow::Error) -> PushError {
+    move |err| PushError { at, err }
+}
 
 pub struct GitRepo {
     pub name: String,
@@ -206,25 +225,39 @@ pub fn clone_repo(
     })
 }
 
-pub fn push_blob(repo: &GitRepo, helper: &Path, bytes: &[u8], seq: u64) -> Result<(u64, f64)> {
+/// Commits `bytes` as a new file and pushes it. Writing the file, `add`,
+/// `commit` and `branch` are the generator's own work (`Local`); the push
+/// is the relay's (`Push`). Each blob is a new file, so `commit` always has
+/// a change to commit.
+pub fn push_blob(
+    repo: &GitRepo,
+    helper: &Path,
+    bytes: &[u8],
+    seq: u64,
+) -> std::result::Result<(u64, f64), PushError> {
+    let local = failed(GitFailure::Local);
     let file = repo.worktree.join(format!("blob-{seq}.bin"));
-    std::fs::write(&file, bytes)?;
+    std::fs::write(&file, bytes)
+        .with_context(|| format!("write {}", file.display()))
+        .map_err(&local)?;
     let tag = repo.owner_auth_tag.as_deref();
-    git_ok(&["add", "."], &repo.worktree, helper, &repo.owner_nsec, tag)?;
-    let _ = git_ok(
+    git_ok(&["add", "."], &repo.worktree, helper, &repo.owner_nsec, tag).map_err(&local)?;
+    git_ok(
         &["commit", "--quiet", "-m", &format!("sim {seq}")],
         &repo.worktree,
         helper,
         &repo.owner_nsec,
         tag,
-    );
-    let _ = git_ok(
+    )
+    .map_err(&local)?;
+    git_ok(
         &["branch", "-M", "main"],
         &repo.worktree,
         helper,
         &repo.owner_nsec,
         tag,
-    );
+    )
+    .map_err(&local)?;
     let start = Instant::now();
     git_ok(
         &["push", "--quiet", repo.url.as_str(), "main"],
@@ -232,7 +265,8 @@ pub fn push_blob(repo: &GitRepo, helper: &Path, bytes: &[u8], seq: u64) -> Resul
         helper,
         &repo.owner_nsec,
         tag,
-    )?;
+    )
+    .map_err(failed(GitFailure::Push))?;
     Ok((bytes.len() as u64, start.elapsed().as_secs_f64() * 1e3))
 }
 
@@ -438,6 +472,92 @@ mod tests {
         let _ = push_blob(&repo, helper, b"blob", 1);
         assert!(checked.accepts() >= 1, "push did not reach the checked URL");
         assert_eq!(elsewhere.accepts(), 0, "push went to origin");
+    }
+
+    /// A fresh worktree whose pushes go to `url`.
+    fn local_repo(wt: PathBuf, url: Target) -> GitRepo {
+        std::fs::create_dir_all(&wt).expect("mkdir");
+        git_ok(
+            &["init", "--quiet"],
+            &wt,
+            Path::new("/usr/bin/true"),
+            NSEC,
+            None,
+        )
+        .expect("init");
+        GitRepo {
+            name: "r".into(),
+            owner_hex: OWNER.into(),
+            owner_nsec: NSEC.into(),
+            owner_auth_tag: None,
+            worktree: wt,
+            url,
+        }
+    }
+
+    fn remote(server: &Server) -> Target {
+        guard()
+            .check_url(&server.http(), &["http"])
+            .and_then(|t| t.join(&format!("/git/{OWNER}/r")))
+            .expect("allowed")
+    }
+
+    /// Each blob is a new file, so `add`, `commit` and `branch` succeed on
+    /// every push of a healthy run: a push the relay refuses fails as the
+    /// relay's (`Push`), never as the generator's (`Local`).
+    #[test]
+    fn a_healthy_run_never_fails_commit() {
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let dir = testsrv::tempdir();
+        let repo = local_repo(dir.join("wt"), remote(&refusing));
+        let helper = Path::new("/usr/bin/true");
+        for seq in 1..=3u64 {
+            let e = push_blob(&repo, helper, &[seq as u8; 32], seq).expect_err("a push to a 404");
+            assert_eq!(e.at, GitFailure::Push, "push {seq}: {e}");
+        }
+        let n = git_ok(
+            &["rev-list", "--count", "main"],
+            &repo.worktree,
+            helper,
+            NSEC,
+            None,
+        )
+        .expect("rev-list");
+        assert_eq!(n.trim(), "3", "every push committed its blob");
+        assert!(refusing.accepts() >= 3);
+    }
+
+    /// `commit` failing is the generator's own failure. A healthy run can't
+    /// reach it (each blob is a new file); the same blob twice does.
+    #[test]
+    fn a_commit_with_nothing_new_is_local() {
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let dir = testsrv::tempdir();
+        let repo = local_repo(dir.join("wt"), remote(&refusing));
+        let helper = Path::new("/usr/bin/true");
+        let first = push_blob(&repo, helper, b"same", 7).expect_err("a push to a 404");
+        assert_eq!(first.at, GitFailure::Push, "{first}");
+        let again = push_blob(&repo, helper, b"same", 7).expect_err("nothing to commit");
+        assert_eq!(again.at, GitFailure::Local, "{again}");
+        assert!(again.to_string().contains("commit"), "{again}");
+    }
+
+    /// `git add` failing is the generator's own failure, and nothing is
+    /// pushed.
+    #[test]
+    fn an_add_that_fails_is_local() {
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let dir = testsrv::tempdir();
+        let not_a_repo = dir.join("plain");
+        std::fs::create_dir_all(&not_a_repo).expect("mkdir");
+        let repo = GitRepo {
+            worktree: not_a_repo,
+            ..local_repo(dir.join("wt"), remote(&refusing))
+        };
+        let e = push_blob(&repo, Path::new("/usr/bin/true"), b"x", 1).expect_err("not a repo");
+        assert_eq!(e.at, GitFailure::Local, "{e}");
+        assert!(e.to_string().contains("\"add\""), "{e}");
+        assert_eq!(refusing.accepts(), 0, "a failed add still pushed");
     }
 
     #[test]

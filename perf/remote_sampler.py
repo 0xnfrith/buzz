@@ -16,7 +16,8 @@ the conditions that void a run:
 - the generator overloads before the relay breaks: CPU averaging over 70% on
   two 60 s windows in a row, MemAvailable under 10% of MemTotal for 3 ticks,
   an out-of-memory kill on its box, or its own errors rising in tenant_sim's
-  live counters, media and git failures included;
+  live counters: a client error kind, a media upload that failed before it
+  went out, or a git add, commit or branch that failed;
 - tenant_sim's live counters are missing, unreadable, stale, ahead of the
   clock, or go backwards;
 
@@ -63,9 +64,20 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 # The live counters' totals the loop reads besides client_errors. tenant_sim
 # writes every one, so a missing one is an error, never 0. client_errors
 # holds only the kinds that happened, so a kind missing there is 0.
-LIVE_TOTALS = ("rejected", "media_failed", "git_failed")
-# Media uploads and git pushes that failed: the generator's own errors too.
-GEN_FAILURE_TOTALS = ("media_failed", "git_failed")
+LIVE_TOTALS = ("rejected", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed")
+# Media and git failures, split by where they failed. A media upload that
+# failed before it went out, or a git add, commit or branch, is the
+# generator's own error.
+GEN_FAILURE_TOTALS = ("media_client_failed", "git_local_failed")
+# An upload the relay refused (an answer that isn't 2xx) or never answered
+# (a transport error or a timeout), or a push that failed, is the relay
+# breaking: at its limit, a relay usually fails by timing out. A stalled
+# generator still shows in its CPU, its memory and a stale live.json.
+RELAY_FAILURE_TOTALS = {
+    "media_refused": "the relay refused {n} media uploads",
+    "media_unanswered": "the relay didn't answer {n} media uploads",
+    "git_push_failed": "{n} git pushes to the relay failed",
+}
 # tenant_sim rewrites live.json every 2 s. Older than this (five writes
 # missed), or this far ahead of the clock, the file is no longer live.
 LIVE_MAX_AGE_S = 10.0
@@ -392,6 +404,9 @@ class Monitor:
                     events.append("the generator reported its own errors: " + ", ".join(f"{k} +{v}" for k, v in sorted(rose.items())))
                 if live["rejected"] > self._live0["rejected"]:
                     self.relay_break(t, f"the relay rejected {live['rejected'] - self._live0['rejected']} events")
+                for k, why in RELAY_FAILURE_TOTALS.items():
+                    if live[k] > self._live0[k]:
+                        self.relay_break(t, why.format(n=live[k] - self._live0[k]))
                 if ce.get("connection_dropped", 0) > c0.get("connection_dropped", 0):
                     self.relay_break(t, "the relay dropped connections")
             self._live0 = live

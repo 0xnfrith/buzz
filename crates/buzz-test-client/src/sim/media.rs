@@ -11,6 +11,25 @@ use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
 use sha2::{Digest, Sha256};
 
 use super::guard::{HttpClient, Target};
+use super::stats::MediaFailure;
+
+/// A failed upload, and where it failed: the live counters keep the
+/// generator's own failures apart from the relay's.
+#[derive(Debug)]
+pub struct UploadError {
+    pub at: MediaFailure,
+    pub err: anyhow::Error,
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.err)
+    }
+}
+
+fn failed(at: MediaFailure) -> impl Fn(anyhow::Error) -> UploadError {
+    move |err| UploadError { at, err }
+}
 
 pub struct UploadResult {
     pub url: String,
@@ -194,17 +213,27 @@ pub async fn upload(
     keys: &Keys,
     body: Vec<u8>,
     auth_tag: Option<&str>,
-) -> Result<UploadResult> {
+) -> std::result::Result<UploadResult, UploadError> {
+    // Everything before a request goes out is the generator's own work.
+    let client = failed(MediaFailure::Client);
     // Fleet image rejects application/octet-stream, invalid JPEGs, and any
     // COM/APP metadata channel. Encode the incompressible payload as a
     // canonical grayscale JFIF the sanitizer will accept and decode.
-    let body = canonical_jpeg(&body)?;
+    let body = canonical_jpeg(&body).map_err(&client)?;
     let sha = hex::encode(Sha256::digest(&body));
-    let auth = blossom_auth(keys, &sha)?;
+    let auth = blossom_auth(keys, &sha).map_err(&client)?;
     let header = auth_header(&auth);
     let bytes = body.len() as u64;
-    let paths = [http_url.join("/media/upload")?, http_url.join("/upload")?];
-    let mut last_err = anyhow!("media upload failed");
+    let paths = [
+        http_url.join("/media/upload").map_err(&client)?,
+        http_url.join("/upload").map_err(&client)?,
+    ];
+    // The last attempt decides: an answer that isn't 2xx is a refusal, no
+    // answer (a transport error or a timeout) is the relay not answering.
+    let mut last = UploadError {
+        at: MediaFailure::Unanswered,
+        err: anyhow!("media upload failed"),
+    };
     for (i, url) in paths.iter().enumerate() {
         let start = Instant::now();
         let resp = upload_request(
@@ -229,21 +258,80 @@ pub async fn upload(
                         .unwrap_or_else(|| format!("{http_url}/media/{sha}"));
                     return Ok(UploadResult { url, bytes, put_ms });
                 }
-                last_err = anyhow!("media upload HTTP {status}: {text}");
+                last = UploadError {
+                    at: MediaFailure::Refused,
+                    err: anyhow!("media upload HTTP {status}: {text}"),
+                };
                 if i == 0 && (status.as_u16() == 404 || status.as_u16() == 405) {
                     continue;
                 }
                 break;
             }
-            Err(e) => last_err = anyhow!("media upload: {e}"),
+            Err(e) => {
+                last = UploadError {
+                    at: MediaFailure::Unanswered,
+                    err: anyhow!("media upload: {e}"),
+                }
+            }
         }
     }
-    Err(last_err)
+    Err(last)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::guard::testsrv::{self, Server};
+    use crate::sim::guard::{http_client, Cidr, TargetGuard};
+    use std::time::Duration;
+
+    /// One upload to `base`, which must fail: where did it fail?
+    async fn failed_at(base: &str, timeout: Duration) -> UploadError {
+        let guard = TargetGuard::new(vec![Cidr::parse("127.0.0.0/8").expect("allow")], vec![])
+            .expect("guard");
+        let target = guard.check_url(base, &["http"]).expect("allowed");
+        let http = http_client(timeout).expect("client");
+        upload(&http, &target, &Keys::generate(), vec![1, 2, 3], None)
+            .await
+            .map(|_| ())
+            .expect_err("the upload must fail")
+    }
+
+    /// An answer that isn't 2xx is the relay refusing (404 tries the second
+    /// path first).
+    #[tokio::test]
+    async fn an_answer_that_is_not_2xx_is_refused() {
+        for code in [500u16, 413, 404, 401] {
+            let server = Server::start("127.0.0.1:0", testsrv::status(code, ""));
+            let e = failed_at(&server.http(), Duration::from_secs(10)).await;
+            assert_eq!(e.at, MediaFailure::Refused, "{code}: {e}");
+            assert!(e.to_string().contains(&code.to_string()), "{e}");
+        }
+    }
+
+    /// Nothing listening: no answer, the relay's.
+    #[tokio::test]
+    async fn no_listener_is_unanswered() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let e = failed_at(&format!("http://127.0.0.1:{port}"), Duration::from_secs(10)).await;
+        assert_eq!(e.at, MediaFailure::Unanswered, "{e}");
+    }
+
+    /// An answer later than the client's timeout: no answer, the relay's.
+    #[tokio::test]
+    async fn a_timeout_is_unanswered() {
+        let slow = Server::start_after(
+            "127.0.0.1:0",
+            testsrv::status(200, "{}"),
+            Duration::from_secs(3),
+        );
+        let e = failed_at(&slow.http(), Duration::from_secs(1)).await;
+        assert_eq!(e.at, MediaFailure::Unanswered, "{e}");
+    }
 
     #[test]
     fn agent_upload_carries_its_nip_oa_tag() {

@@ -105,10 +105,12 @@ struct Inner {
     media_uploads: u64,
     media_bytes: u64,
     media_rejected: u64,
+    media_failed: BTreeMap<MediaFailure, u64>,
     media_put_ms: Vec<f64>,
     git_pushes: u64,
     git_bytes: u64,
     git_failed: u64,
+    git_failed_by: BTreeMap<GitFailure, u64>,
     git_push_ms: Vec<f64>,
     gaps_detected: u64,
     lost_after_backfill: u64,
@@ -117,6 +119,27 @@ struct Inner {
     /// The generator's own failures, by kind, as opposed to the relay's
     /// rejections (which `record_send` counts as `rejected`).
     client_errors: BTreeMap<String, u64>,
+}
+
+/// Where a media upload failed. Only `Client` is the generator's own
+/// failure; the other two are the relay's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MediaFailure {
+    /// Before the request went out: encoding the image or signing the auth.
+    Client,
+    /// The relay answered, but not with a 2xx.
+    Refused,
+    /// No answer: a transport error or a timeout.
+    Unanswered,
+}
+
+/// Where a git push failed. Only `Local` is the generator's own failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GitFailure {
+    /// Writing the blob, `git add`, `commit` or `branch`.
+    Local,
+    /// The push to the relay: refused, failed, or past git's timeout.
+    Push,
 }
 
 /// The live counters `tenant_sim` rewrites into `<out-dir>/live.json` while
@@ -135,8 +158,14 @@ pub struct Live {
     /// send), `recv_error`, `reconnect_failed`, `backfill_failed`, and
     /// `connection_dropped` (the connection closed under it).
     pub client_errors: BTreeMap<String, u64>,
-    pub media_failed: u64,
-    pub git_failed: u64,
+    /// Media uploads and git pushes that failed, by where they failed (see
+    /// [`MediaFailure`] and [`GitFailure`]): only `media_client_failed` and
+    /// `git_local_failed` are the generator's own.
+    pub media_client_failed: u64,
+    pub media_refused: u64,
+    pub media_unanswered: u64,
+    pub git_local_failed: u64,
+    pub git_push_failed: u64,
 }
 
 /// Writes `live` to `path` whole: a temp file beside it, then a rename, so a
@@ -148,6 +177,10 @@ pub fn write_live(path: &Path, live: &Live) -> std::io::Result<()> {
         serde_json::to_vec(live).map_err(std::io::Error::other)?,
     )?;
     std::fs::rename(&tmp, path)
+}
+
+fn count<K: Ord>(m: &BTreeMap<K, u64>, k: K) -> u64 {
+    m.get(&k).copied().unwrap_or(0)
 }
 
 pub struct Stats {
@@ -217,27 +250,37 @@ impl Stats {
         self.with(|s| s.lost_after_backfill += n);
     }
 
-    pub fn record_media(&self, ok: bool, bytes: u64, put_ms: f64) {
+    pub fn record_media(&self, bytes: u64, put_ms: f64) {
         self.with(|s| {
-            if ok {
-                s.media_uploads += 1;
-                s.media_bytes += bytes;
-                s.media_put_ms.push(put_ms);
-            } else {
-                s.media_rejected += 1;
-            }
+            s.media_uploads += 1;
+            s.media_bytes += bytes;
+            s.media_put_ms.push(put_ms);
         });
     }
 
-    pub fn record_git(&self, ok: bool, bytes: u64, push_ms: f64) {
+    /// A failed upload. summary.json's media `rejected` still counts every
+    /// failure, wherever it failed; live.json splits them.
+    pub fn record_media_failed(&self, why: MediaFailure) {
         self.with(|s| {
-            if ok {
-                s.git_pushes += 1;
-                s.git_bytes += bytes;
-                s.git_push_ms.push(push_ms);
-            } else {
-                s.git_failed += 1;
-            }
+            s.media_rejected += 1;
+            *s.media_failed.entry(why).or_default() += 1;
+        });
+    }
+
+    pub fn record_git(&self, bytes: u64, push_ms: f64) {
+        self.with(|s| {
+            s.git_pushes += 1;
+            s.git_bytes += bytes;
+            s.git_push_ms.push(push_ms);
+        });
+    }
+
+    /// A failed push. summary.json's git `failed` still counts every
+    /// failure, wherever it failed; live.json splits them.
+    pub fn record_git_failed(&self, why: GitFailure) {
+        self.with(|s| {
+            s.git_failed += 1;
+            *s.git_failed_by.entry(why).or_default() += 1;
         });
     }
 
@@ -275,8 +318,11 @@ impl Stats {
                 rejected,
                 received,
                 client_errors: s.client_errors.clone(),
-                media_failed: s.media_rejected,
-                git_failed: s.git_failed,
+                media_client_failed: count(&s.media_failed, MediaFailure::Client),
+                media_refused: count(&s.media_failed, MediaFailure::Refused),
+                media_unanswered: count(&s.media_failed, MediaFailure::Unanswered),
+                git_local_failed: count(&s.git_failed_by, GitFailure::Local),
+                git_push_failed: count(&s.git_failed_by, GitFailure::Push),
             }
         })
     }
@@ -375,6 +421,51 @@ mod tests {
         assert_eq!(live.client_errors.get("send_failed"), Some(&2));
         assert_eq!(live.client_errors.get("reconnect_failed"), Some(&1));
         assert_eq!(live.client_errors.len(), 2);
+    }
+
+    #[test]
+    fn live_splits_media_and_git_failures_by_where_they_failed() {
+        let st = Stats::new();
+        st.record_media(10, 1.0);
+        for why in [
+            MediaFailure::Client,
+            MediaFailure::Refused,
+            MediaFailure::Refused,
+            MediaFailure::Unanswered,
+            MediaFailure::Unanswered,
+            MediaFailure::Unanswered,
+        ] {
+            st.record_media_failed(why);
+        }
+        st.record_git(5, 1.0);
+        for why in [GitFailure::Local, GitFailure::Push, GitFailure::Push] {
+            st.record_git_failed(why);
+        }
+        let live = st.live(7);
+        assert_eq!(
+            (
+                live.media_client_failed,
+                live.media_refused,
+                live.media_unanswered,
+                live.git_local_failed,
+                live.git_push_failed
+            ),
+            (1, 2, 3, 1, 2)
+        );
+        let v = serde_json::to_value(&live).expect("json");
+        for k in [
+            "media_client_failed",
+            "media_refused",
+            "media_unanswered",
+            "git_local_failed",
+            "git_push_failed",
+        ] {
+            assert!(v.get(k).is_some(), "live.json has no {k}");
+        }
+        // summary.json keeps its meaning: every failure, wherever it failed.
+        let summary = st.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
+        assert_eq!((summary.media.uploads, summary.media.rejected), (1, 6));
+        assert_eq!((summary.git.pushes, summary.git.failed), (1, 3));
     }
 
     #[test]

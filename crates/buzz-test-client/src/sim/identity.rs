@@ -563,7 +563,7 @@ impl Session {
                 .await
                 {
                     Ok(up) => {
-                        self.stats.record_media(true, up.bytes, up.put_ms);
+                        self.stats.record_media(up.bytes, up.put_ms);
                         let content = format!("media {}", up.url);
                         self.send_channel(client, band, |seq| {
                             kinds::stream_message(&keys, &k, &ch, &name, seq, &content)
@@ -571,8 +571,8 @@ impl Session {
                         .await?;
                     }
                     Err(e) => {
-                        warn!("{} media: {e}", self.rec.name);
-                        self.stats.record_media(false, 0, 0.0);
+                        warn!("{} media ({:?}): {e}", self.rec.name, e.at);
+                        self.stats.record_media_failed(e.at);
                     }
                 }
             }
@@ -585,10 +585,10 @@ impl Session {
                     self.rng.fill(blob.as_mut_slice());
                     let git_seq = self.seq + 1;
                     match git::push_blob(repo, &self.world.git_helper, &blob, git_seq) {
-                        Ok((bytes, ms)) => self.stats.record_git(true, bytes, ms),
+                        Ok((bytes, ms)) => self.stats.record_git(bytes, ms),
                         Err(e) => {
-                            warn!("{} git push: {e}", self.rec.name);
-                            self.stats.record_git(false, 0, 0.0);
+                            warn!("{} git push ({:?}): {e}", self.rec.name, e.at);
+                            self.stats.record_git_failed(e.at);
                         }
                     }
                 }

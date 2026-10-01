@@ -438,32 +438,49 @@ python3 perf/tenant_cogs.py remote-sample \
   - before the relay breaks, the generator's CPU averages over 70% on two
     60 s windows in a row, its MemAvailable stays under 10% of MemTotal for
     3 ticks, its box has an out-of-memory kill, or its own errors rise in
-    `tenant_sim`'s live counters: its client errors, or its media or git
-    failures. A missing or unreadable `--live-file` is a void too, never
-    "no errors", and so is a file without `rejected`, `media_failed` or
-    `git_failed`: a total missing is never read as 0.
+    `tenant_sim`'s live counters: its client errors, a media upload that
+    failed before it went out (`media_client_failed`), or a git add, commit
+    or branch that failed (`git_local_failed`). A missing or unreadable
+    `--live-file` is a void too, never "no errors", and so is a file
+    without `rejected`, `media_client_failed`, `media_refused`,
+    `media_unanswered`, `git_local_failed` or `git_push_failed`: a total
+    missing is never read as 0.
   - `tenant_sim`'s live counters stop being live: `t_unix` missing or not
     a whole number of seconds, more than 10 s old or 10 s ahead of the
     clock when the loop reads it, or lower than the last one read. The
     writer and the loop share the generator box's clock.
   - "The relay breaks" is the first of: relay rejects or dropped
-    connections rising in the live counters, a relay OOM kill, or no relay
-    container in a `docker ps` that worked (a failed listing is not a
-    break). A generator event after it is a note, not a void, written
-    once.
+    connections rising in the live counters; media uploads the relay
+    refused (`media_refused`, an answer that isn't 2xx) or didn't answer
+    (`media_unanswered`, a transport error or a timeout); git pushes that
+    failed (`git_push_failed`, the 90 s timeout included); a relay OOM
+    kill; or no relay container in a `docker ps` that worked (a failed
+    listing is not a break). At its limit a relay usually fails by timing
+    out, so a timeout is the relay's; a stalled generator still shows in
+    its CPU, its memory and a stale live file. A generator event after
+    the break is a note, not a void, written once.
 - **INT and TERM** write the band summaries, then exit 130 and 143. A
   second signal while the summaries or `void.json` are written is ignored.
 
 `tenant_sim` rewrites `<out-dir>/live.json` every 2 s for this: totals of
 sent, accepted, rejected and received, its own errors by kind
 (`send_failed`, `recv_error`, `reconnect_failed`, `backfill_failed`,
-`connection_dropped`), and media and git failures, stamped `t_unix`. If a
-rewrite fails, `tenant_sim` logs it and carries on; the file then goes
-stale and the loop voids 10 s later, so stop the loop before `tenant_sim`
-ends. A media or git failure
-counts whether the relay refused it or the generator failed to send it, so
-a relay that refuses uploads before any other sign of breaking voids the
-run as the generator's fault.
+`connection_dropped`), and media and git failures by where they failed,
+stamped `t_unix`. If a rewrite fails, `tenant_sim` logs it and carries on;
+the file then goes stale and the loop voids 10 s later, so stop the loop
+before `tenant_sim` ends.
+
+| Failure | live.json total | Counts as |
+|---|---|---|
+| Media: encoding the image or signing the auth, before the request goes out | `media_client_failed` | the generator's error |
+| Media: an answer that isn't 2xx | `media_refused` | a relay break |
+| Media: a transport error or a timeout, no answer | `media_unanswered` | a relay break |
+| Git: writing the blob, `add`, `commit` or `branch` | `git_local_failed` | the generator's error |
+| Git: the push, refused, failed or past the 90 s timeout | `git_push_failed` | a relay break |
+
+Each blob is a new file, so `commit` always has a change in a healthy run.
+`summary.json` keeps its meaning: its media `rejected` and git `failed`
+count every failure, wherever it failed, not only the relay's refusals.
 
 ## What is not in this tree
 
