@@ -193,6 +193,40 @@ class Profiles(unittest.TestCase):
                 self.assertEqual(code, 3)
                 self.assertEqual(json.loads((self.d / name / "clock.json").read_text())["stopped"], want)
 
+    def test_a_generator_that_ends_before_its_phase_stops_the_run_at_once(self) -> None:
+        """A generator that exits during setup, or after `continue` before
+        it is ready, stops the run at the next cadence with its own line,
+        not when the wait's timeout runs out."""
+        def gone_in_setup(w: World) -> None:
+            w.never_setup.add("b")
+            w.at.append((1012.0, lambda w: w.gens.__setitem__("b", "exited 101")))
+
+        def gone_before_ready(w: World) -> None:
+            real = w.hook
+
+            def hook(event: list[str]) -> tuple[int, str, str]:
+                if event[:2] == ["send", "b"] and event[2].startswith("continue"):
+                    w.lines.append(("b", event[2]))
+                    w.gens["b"] = "exited 3"
+                    return 0, "", ""
+                return real(event)
+            w.hook = hook  # type: ignore[method-assign]
+        for name, arrange, want, before in [
+            ("setup-done", gone_in_setup, "the generator for b stopped before its setup-done: exited 101", 1020.0),
+            ("ready", gone_before_ready, "the generator for b stopped before its ready: exited 3", 1010.0),
+        ]:
+            with self.subTest(name):
+                w = World(["a", "b"])
+                arrange(w)
+                out = self.d / name
+                code = w.clock_for([bc.load_item(profile(self.d, "solo"))], out,
+                                   setup_timeout_s=3600, ready_timeout_s=300).run()
+                self.assertEqual(code, 5)
+                self.assertEqual(json.loads((out / "clock.json").read_text())["stopped"], want)
+                stopped_at = max(t for e, t in w.event_t if e == "status")
+                self.assertLessEqual(stopped_at, before, "the clock waited out its timeout")
+                self.assertEqual(w.kinds()[-1], "end")
+
     def test_setup_that_fails_or_hangs_stops_the_run(self) -> None:
         w = World(["a", "b"])
         w.setup_fails["b"] = "9030 h0 rejected: blocked"

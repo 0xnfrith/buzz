@@ -228,19 +228,45 @@ class Clock:
                 return
             self.sleep(min(self.opts.cadence_s, left))
 
+    def gen_states(self) -> dict[str, Any]:
+        """Each generator's state from the hook's status, alone: before the
+        sampler starts, the status has nothing else to judge."""
+        try:
+            st = json.loads(self.call("status"))
+        except json.JSONDecodeError as e:
+            raise Stop(EXIT_HOOK, f"the hook's status is not JSON: {e}") from e
+        if not isinstance(st, dict):
+            raise Stop(EXIT_HOOK, "the hook's status is not a JSON object")
+        gens = st.get("gens")
+        return gens if isinstance(gens, dict) else {}
+
     def wait_phase(self, want: str, timeout_s: float) -> dict[str, dict[str, Any]]:
         """Every running generator's `want` phase line (a barrier). A
-        `setup-failed` line, or the timeout, stops the run."""
+        `setup-failed` line, a generator that stops before its line, or the
+        timeout, stops the run. The generators' state is polled at every
+        cadence, so one that ended stops the run at once."""
         got: dict[str, dict[str, Any]] = {}
         end = self.clock() + timeout_s
+
+        def look(g: str) -> None:
+            for p in self.phases(g):
+                if p.get("phase") == "setup-failed":
+                    raise Stop(EXIT_SETUP, f"setup failed for {g}: {p.get('why')}")
+                if p.get("phase") == want:
+                    got[g] = p
+                    return
         while True:
             for g in sorted(self._running - set(got)):
-                for p in self.phases(g):
-                    if p.get("phase") == "setup-failed":
-                        raise Stop(EXIT_SETUP, f"setup failed for {g}: {p.get('why')}")
-                    if p.get("phase") == want:
-                        got[g] = p
-                        break
+                look(g)
+            if set(got) == self._running:
+                return got
+            states = self.gen_states()
+            for g in sorted(self._running - set(got)):
+                if states.get(g) != "active":
+                    # Its line may have come just before it ended.
+                    look(g)
+                    if g not in got:
+                        raise Stop(EXIT_SETUP, f"the generator for {g} stopped before its {want}: {states.get(g)}")
             if set(got) == self._running:
                 return got
             if self.clock() >= end:

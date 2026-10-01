@@ -816,6 +816,11 @@ at 1800 s.
    relay shed setup's events, full or unable to admit.
 3. `fleet`, then `continue` to each generator, then a barrier on `ready`
    (`--ready-timeout`, 300 s), then `sampler start`.
+
+**Both barriers read `status` every `--cadence`:** a generator that stops
+before its `setup-done` or its `ready` stops the run at once (exit 5, `the
+generator for <g> stopped before its <phase>: <how it ended>`), not when
+the barrier's timeout runs out.
 4. Each band: its line to every generator with a lease of its length plus
    `--lease-slack` (120 s), the sampler told, the band held. After each
    measured band (`floor`, `steady`, `peak`) every generator pauses (`band
