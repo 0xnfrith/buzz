@@ -282,6 +282,47 @@ fn check_targets(args: &Args) -> Result<Targets> {
     })
 }
 
+/// Clones one setup repo for its agent. A missing credential helper or a
+/// clone that fails fails setup, like a refused channel create: a run with
+/// fewer repos than its profile isn't that profile's run.
+async fn clone_setup_repo(
+    helper: &std::path::Path,
+    http: &Target,
+    out_dir: Option<&std::path::Path>,
+    agent: &IdentityRecord,
+    name: &str,
+    auth_tag: Option<String>,
+) -> Result<RepoRef> {
+    if !helper.exists() {
+        bail!(
+            "git-credential helper {} missing; setup can't clone {name}",
+            helper.display()
+        );
+    }
+    let dest = out_dir
+        .map(|p| p.join("git").join(name))
+        .unwrap_or_else(|| PathBuf::from("git").join(name));
+    let repo = git::clone_repo_async(
+        http.clone(),
+        agent.pubkey.clone(),
+        name.to_string(),
+        dest,
+        helper.to_path_buf(),
+        agent.nsec.clone(),
+        auth_tag,
+    )
+    .await
+    .with_context(|| format!("git clone {name} failed"))?;
+    Ok(RepoRef {
+        name: repo.name.clone(),
+        owner_hex: repo.owner_hex.clone(),
+        owner_nsec: repo.owner_nsec.clone(),
+        a_tag: format!("30617:{}:{}", repo.owner_hex, repo.name),
+        clone_url: repo.url.clone(),
+        worktree: repo.worktree.clone(),
+    })
+}
+
 async fn provision(
     profile: &Profile,
     pop: &Population,
@@ -384,41 +425,17 @@ async fn provision(
             }
             let _ = agent_client.disconnect().await;
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if helper.exists() {
-                let dest = args
-                    .out_dir
-                    .as_ref()
-                    .map(|p| p.join("git").join(&name))
-                    .unwrap_or_else(|| PathBuf::from("git").join(&name));
-                match git::clone_repo_async(
-                    targets.http.clone(),
-                    agent.pubkey.clone(),
-                    name.clone(),
-                    dest,
-                    helper.clone(),
-                    agent.nsec.clone(),
-                    auth_tag.clone(),
+            repos.push(
+                clone_setup_repo(
+                    helper,
+                    &targets.http,
+                    args.out_dir.as_deref(),
+                    agent,
+                    &name,
+                    auth_tag,
                 )
-                .await
-                {
-                    Ok(repo) => {
-                        repos.push(RepoRef {
-                            name: repo.name.clone(),
-                            owner_hex: repo.owner_hex.clone(),
-                            owner_nsec: repo.owner_nsec.clone(),
-                            a_tag: format!("30617:{}:{}", repo.owner_hex, repo.name),
-                            clone_url: repo.url.clone(),
-                            worktree: repo.worktree.clone(),
-                        });
-                    }
-                    Err(e) => warn!("git clone {name}: {e}"),
-                }
-            } else {
-                warn!(
-                    "git-credential helper {} missing; skipping clone",
-                    helper.display()
-                );
-            }
+                .await?,
+            );
         }
     }
     let _ = owner.disconnect().await;
@@ -879,6 +896,56 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    /// A setup clone that can't happen fails setup with its own line,
+    /// never a warning and a smaller world: a missing credential helper
+    /// before any git runs, and a clone the remote refuses.
+    #[tokio::test]
+    async fn a_failed_setup_clone_fails_setup() {
+        use sim::guard::testsrv::{self, Server};
+        use sim::guard::{Cidr, TargetGuard};
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let guard = TargetGuard::new(vec![Cidr::parse("127.0.0.0/8").expect("allow")], vec![])
+            .expect("guard");
+        let http = guard
+            .check_url(&refusing.http(), &["http"])
+            .expect("allowed");
+        let pop = generate_population(&shipped_profile());
+        let agent = &pop.agents[0];
+        let dir = testsrv::tempdir();
+
+        let missing = dir.join("no-such-helper");
+        let err = clone_setup_repo(&missing, &http, Some(&dir), agent, "sim-repo-0", None)
+            .await
+            .map(|_| ())
+            .expect_err("no helper");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "git-credential helper {} missing; setup can't clone sim-repo-0",
+                missing.display()
+            )
+        );
+        assert_eq!(refusing.accepts(), 0, "git ran without a helper");
+
+        let err = clone_setup_repo(
+            std::path::Path::new("/usr/bin/true"),
+            &http,
+            Some(&dir),
+            agent,
+            "sim-repo-0",
+            None,
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a refused clone");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("git clone sim-repo-0 failed: "), "{msg}");
+        assert!(
+            refusing.accepts() >= 1,
+            "git never reached the remote: {msg}"
+        );
     }
 
     #[test]
