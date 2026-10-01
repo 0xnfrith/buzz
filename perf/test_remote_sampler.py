@@ -1132,7 +1132,7 @@ class Loop(unittest.TestCase):
             bands = [json.loads(l) for l in (Path(d) / "samples" / "bands.jsonl").read_text().splitlines()]
             self.assertEqual((bands[0]["slow_calls"], bands[0]["slow_missed"]), (13, 0))
 
-    def run_lives(self, d: Path, write, bands: dict[float, str], duration: float):  # type: ignore[no-untyped-def]
+    def run_lives(self, d: Path, write, bands: dict[float, str], duration: float, extra: dict | None = None):  # type: ignore[no-untyped-def]
         """The loop with two live files and no box, as on a workstation:
         `write(t, role)` gives each live file at time t, and `bands` the band
         file's name from each time on. Returns the exit, bands.jsonl's client
@@ -1156,7 +1156,7 @@ class Loop(unittest.TestCase):
 
         tick()
         s = self.settings(d, boxes=[], expected={}, self_role=None, self_config=None, band_file=str(band),
-                          duration=duration, lives=[(r, str(p)) for r, p in paths.items()])
+                          duration=duration, lives=[(r, str(p)) for r, p in paths.items()], **(extra or {}))
         with contextlib.redirect_stderr(io.StringIO()) as err:
             code = rs.run_loop(s, runner=lambda argv: (255, "", ""), clock=lambda: clock["t"], sleep=sleep)
         self.stderr = err.getvalue()
@@ -1210,6 +1210,18 @@ class Loop(unittest.TestCase):
                 # the loop had moved to: what a driver attributes it by.
                 br = json.loads((Path(d) / "samples" / "breaks.json").read_text())["relays"]
                 self.assertEqual(br.get("a", {}).get("band"), "ramp-001" if broke else None, br)
+
+    def test_a_shorter_step_settle(self) -> None:
+        """--step-settle sets how far into a ramp step its window starts."""
+        def write(t: int, r: str) -> dict:
+            n = (t - 1000) // 5
+            return live_counters(t, ack_ms_le=acks(4 * n, 0), sent=4 * n, accepted=4 * n)
+        with tempfile.TemporaryDirectory() as d:
+            code, clients, _, _ = self.run_lives(Path(d), write, {0: "pause", 1100: "ramp-001", 1300: "pause"}, 330.0,
+                                                 {"step_settle_s": 20.0})
+            self.assertEqual(code, 0, self.stderr)
+            step = [c for c in clients if c["band"] == "ramp-001" and c["role"] == "a"][0]["client"]
+            self.assertEqual(step["from_t_unix"], 1120)
 
     def test_breaks_json_comes_as_the_break_does(self) -> None:
         """A relay that rejects events broke there and then: breaks.json has

@@ -830,6 +830,8 @@ class Settings:
     ring_bytes: int
     # Live files bound to the relays they drive, by role (--live).
     lives: list[tuple[str | None, str]] = field(default_factory=list)
+    # How long into a ramp step its window starts (--step-settle).
+    step_settle_s: float = STEP_SETTLE_S
 
 
 class Stop(Exception):
@@ -998,7 +1000,7 @@ def run_loop(s: Settings, runner: Callable[[list[str]], tuple[int, str, str]] | 
                 mon.live_tick(role, t, live, live_err, clock(), limits)
                 if live is not None:
                     read[role] = last_live[role] = live
-                    settle = STEP_SETTLE_S if RAMP_STEP.fullmatch(band) else 0.0
+                    settle = s.step_settle_s if RAMP_STEP.fullmatch(band) else 0.0
                     if role not in win0 and measured(band) and t >= band_t0 + settle:
                         win0[role] = live
             if s.self_role and s.self_config is not None:
@@ -1087,7 +1089,7 @@ def cmd_remote_sample(args: Any, guard: Any, parse_ip: Callable[[str], Any]) -> 
     fast, slow = (30.0, 300.0) if args.soak else (float(args.fast_every), float(args.slow_every))
     s = Settings(boxes, args.ssh_key, args.known_hosts, Path(args.out_dir), expected, args.self_role, self_cfg,
                  args.live_file, args.band_file, fast, slow, args.duration, args.once, args.ring_files, args.ring_bytes,
-                 lives)
+                 lives, args.step_settle)
     return run_loop(s)
 
 
@@ -1102,6 +1104,8 @@ def add_parser(sub: Any) -> None:
     p.add_argument("--self", dest="self_role", default=None, help="the role this box is sampled as (in-process)")
     p.add_argument("--self-config", default=None, help="box_sampler config for this box")
     p.add_argument("--live-file", default=None, help="tenant_sim's <out-dir>/live.json, for every relay; missing or unreadable voids")
+    p.add_argument("--step-settle", type=float, default=STEP_SETTLE_S,
+                   help="seconds into a ramp step before its window starts (its joiners connect first)")
     p.add_argument("--live", action="append", default=[],
                    help="RELAY=PATH: the live.json of the tenant_sim that drives that relay (repeatable)")
     p.add_argument("--band-file", default=None, help="a file holding the current band's name")
