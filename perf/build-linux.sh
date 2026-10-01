@@ -18,10 +18,18 @@ TARGET="x86_64-unknown-linux-musl"
 BINS=(tenant_sim git-credential-nostr)
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
+
+# The Docker endpoint must be a local Unix socket, by the same rule as the
+# sampler (perf/tenant_cogs.py, "Docker endpoint guard"). Every docker call
+# names it, with DOCKER_HOST set to it and DOCKER_CONTEXT removed.
+endpoint="$(python3 "$repo/perf/tenant_cogs.py" docker-endpoint)" || exit 2
+unset DOCKER_CONTEXT
+export DOCKER_HOST="$endpoint"
+
 out="$repo/target/linux-amd64"
 mkdir -p "$out"
 
-docker run --rm --platform linux/amd64 \
+docker --host "$endpoint" run --rm --platform linux/amd64 \
   -v "$repo":/src:ro \
   -v buzz-harness-linux-cargo:/cargo \
   -v buzz-harness-linux-target:/target \

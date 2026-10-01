@@ -42,7 +42,9 @@ Builds both binaries as static musl executables in `rust:1.95.0-alpine`
 home, and prints their sha256. They land in `target/linux-amd64/` and run on
 any x86_64 Linux. The Cargo registry and target directory are two named Docker
 volumes (`buzz-harness-linux-cargo`, `buzz-harness-linux-target`); remove them
-for a clean build. On an arm64 host the build runs emulated.
+for a clean build. On an arm64 host the build runs emulated. The script takes
+the same Docker endpoint rule as the sampler (see "Target guard") and refuses
+before any docker command if the endpoint is not a local Unix socket.
 
 Check a profile on Linux without a relay:
 
@@ -87,9 +89,23 @@ provably inside the test range. The rules are the same in both, and
   `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` removed from its environment.
   Pushes name the checked URL, not `origin`. The sampler reads HTTP through an
   opener with no proxy handler and a redirect handler that refuses.
-- **What the guard does not cover.** The sampler's `docker` commands go to the
-  Docker daemon the environment selects (`DOCKER_HOST`, the docker context).
-  Point them at the local daemon. `sample` and `fingerprint` with
+- **The Docker endpoint must be a local Unix socket.** `run`, `seed-bench`,
+  `sample`, `fingerprint` and `perf/build-linux.sh` first resolve the endpoint
+  the Docker CLI would use: `DOCKER_HOST`, else `DOCKER_CONTEXT`, else the
+  config's `currentContext`, else `unix:///var/run/docker.sock`. They refuse
+  (exit 2, before the lock, an output directory or any docker command) unless
+  it is `unix://` plus an absolute path to an existing socket; a symlink to a
+  socket is fine, as with `/var/run/docker.sock` on OrbStack or Docker
+  Desktop. A `DOCKER_CONTEXT` naming anything else is refused even when
+  `DOCKER_HOST` is local. Every docker and compose command, teardown included,
+  then names the endpoint with `--host` and runs with `DOCKER_HOST` set to it
+  and `DOCKER_CONTEXT` removed; with a host given, the Docker CLI ignores the
+  context store. `python3 perf/tenant_cogs.py docker-endpoint` prints the
+  endpoint or refuses. A remote endpoint (`ssh://`, `tcp://`, a remote
+  context) is never accepted. The check proves the endpoint is a local socket,
+  not where that socket leads: whoever owns the machine can still point a
+  socket at another daemon.
+- **What the guard does not cover.** `sample` and `fingerprint` with
   `--substrate k3s` would reach a host through ssh or kubectl, so they are
   refused.
 
@@ -100,6 +116,7 @@ Every connection and where it is checked:
 | Websocket (owner, identities, reconnects, seed) | `tenant_sim` | `World.relay_url: Target`; `connect_identity` and `send_with_retry` take `&Target` |
 | Media upload (Blossom PUT) | `tenant_sim` | `media::upload` takes `&Target` and `&HttpClient`; only `guard::http_client` builds an `HttpClient` |
 | Git clone and push | `tenant_sim` (`git`, which runs `git-credential-nostr`) | `git::clone_repo` takes `&Target`; `GitRepo.url: Target` |
+| Docker and compose (up, exec, inspect, ls, teardown) | `tenant_cogs.py`, `build-linux.sh` | `resolve_docker_endpoint` → `DockerEndpoint`; `run()` refuses a docker command not built by `docker_cmd` with one |
 | Relay health (`/_readiness`) | `tenant_cogs.py` | `check_targets` → `CheckedUrl`; `http_get` takes nothing else |
 | Relay metrics (`/metrics`) | `tenant_cogs.py` | same |
 

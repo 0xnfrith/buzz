@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 
 SCHEMA = 1
@@ -95,6 +95,15 @@ def run(
     env: dict[str, str] | None = None,
     timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Every command the harness runs. A `docker` command must name a checked
+    endpoint (`docker_cmd`); it then runs with that endpoint as DOCKER_HOST and
+    without DOCKER_CONTEXT, whatever `env` or this process's environment says."""
+    if cmd and cmd[0] == "docker":
+        if len(cmd) < 3 or cmd[1] != "--host" or not isinstance(cmd[2], DockerEndpoint):
+            raise Refused(
+                f"docker command without a checked endpoint: {cmd[:3]}. Nothing was run."
+            )
+        env = docker_env(cmd[2], env)
     return subprocess.run(
         cmd,
         check=check,
@@ -137,6 +146,116 @@ def rate_limit_overrides(container_env: list[str]) -> dict[str, str]:
         name, sep, value = item.partition("=")
         if sep and name in RATE_LIMIT_VARS:
             out[name] = value
+    return out
+
+
+# --- Docker endpoint guard -----------------------------------------------------
+# The Docker control connection is a target too: `run` and `seed-bench` create
+# and delete containers, volumes and networks through it. Before any lock,
+# output directory or docker command, the harness resolves the endpoint the
+# Docker CLI would use (DOCKER_HOST, else DOCKER_CONTEXT, else the config's
+# currentContext, else the default socket) and refuses unless it is a local
+# Unix socket. Every docker command then names that endpoint with `--host` and
+# runs with DOCKER_HOST set to it and DOCKER_CONTEXT removed. With a host
+# given, the Docker CLI uses the default context and never reads the context
+# store. A remote endpoint is never accepted here.
+
+DEFAULT_DOCKER_HOST = "unix:///var/run/docker.sock"
+
+
+class DockerEndpoint(str):
+    """A Docker endpoint resolve_docker_endpoint checked: a local Unix socket."""
+
+
+def docker_config_dir(env: Mapping[str, str]) -> Path:
+    cfg = env.get("DOCKER_CONFIG")
+    return Path(cfg) if cfg else Path(os.path.expanduser("~")) / ".docker"
+
+
+def _docker_refusal(why: str) -> "Refused":
+    return Refused(f"docker endpoint refused: {why}. Nothing was changed.")
+
+
+def _context_host(config_dir: Path, name: str, docker_host: str) -> str:
+    """The endpoint a named Docker context selects."""
+    if name == "default":
+        return docker_host or DEFAULT_DOCKER_HOST
+    meta = config_dir / "contexts" / "meta" / hashlib.sha256(name.encode()).hexdigest() / "meta.json"
+    try:
+        host = json.loads(meta.read_text())["Endpoints"]["docker"]["Host"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise _docker_refusal(f"cannot read docker context {name!r} ({exc})") from None
+    if not isinstance(host, str):
+        raise _docker_refusal(f"docker context {name!r} has no endpoint")
+    return host
+
+
+def _current_context(config_dir: Path) -> str:
+    path = config_dir / "config.json"
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return "default"
+    except (OSError, ValueError) as exc:
+        raise _docker_refusal(f"cannot read {path} ({exc})") from None
+    if not isinstance(data, dict):
+        raise _docker_refusal(f"{path} is not a JSON object")
+    name = data.get("currentContext") or "default"
+    if not isinstance(name, str):
+        raise _docker_refusal(f"{path} has a malformed currentContext")
+    return name
+
+
+def _local_socket(host: str, source: str) -> DockerEndpoint:
+    if not host.startswith("unix://"):
+        raise _docker_refusal(f"{source} selects {host!r}; only a local Unix socket is allowed")
+    path = host[len("unix://"):]
+    if not path.startswith("/"):
+        raise _docker_refusal(f"{source} selects {host!r}; the socket path must be absolute")
+    try:
+        mode = os.stat(path).st_mode  # follows a symlinked /var/run/docker.sock
+    except OSError as exc:
+        raise _docker_refusal(f"{source} selects {host!r}, which does not exist ({exc.strerror})") from None
+    if not stat.S_ISSOCK(mode):
+        raise _docker_refusal(f"{source} selects {host!r}, which is not a Unix socket")
+    return DockerEndpoint(host)
+
+
+def resolve_docker_endpoint(env: Mapping[str, str] | None = None) -> DockerEndpoint:
+    """The endpoint the Docker CLI would use, if it is a local Unix socket.
+
+    A DOCKER_CONTEXT naming anything else is refused even when DOCKER_HOST is
+    set, so no selector in the environment can point at a remote daemon."""
+    env = os.environ if env is None else env
+    config_dir = docker_config_dir(env)
+    host = env.get("DOCKER_HOST", "")
+    context = env.get("DOCKER_CONTEXT", "")
+    from_context = None
+    if context:
+        from_context = _local_socket(
+            _context_host(config_dir, context, host), f"DOCKER_CONTEXT={context}"
+        )
+    if host:
+        return _local_socket(host, "DOCKER_HOST")
+    if from_context is not None:
+        return from_context
+    name = _current_context(config_dir)
+    return _local_socket(_context_host(config_dir, name, ""), f"docker context {name!r}")
+
+
+def docker_cmd(endpoint: DockerEndpoint, *args: str) -> list[str]:
+    """A docker command bound to a checked endpoint."""
+    if not isinstance(endpoint, DockerEndpoint):
+        raise Refused(f"docker needs a checked endpoint, got {endpoint!r}. Nothing was run.")
+    return ["docker", "--host", endpoint, *args]
+
+
+def docker_env(endpoint: DockerEndpoint, env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """`env` (default: this process's) with DOCKER_HOST set to `endpoint` and
+    DOCKER_CONTEXT removed."""
+    src = os.environ if env is None else env
+    out = {k: v for k, v in src.items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
+    out["DOCKER_HOST"] = str(endpoint)
     return out
 
 
@@ -666,9 +785,11 @@ class ExecAdapter:
     kubeconfig: str | None = None
     namespace: str = "buzz-loadtest"
     compose_files: tuple[str, ...] = COMPOSE_FILES
+    # The checked Docker endpoint; compose commands refuse without one.
+    endpoint: DockerEndpoint | None = None
 
     def compose_base(self) -> list[str]:
-        cmd = ["docker", "compose", "-p", self.project]
+        cmd = docker_cmd(self.endpoint, "compose", "-p", self.project)  # type: ignore[arg-type]
         for f in self.compose_files:
             cmd.extend(["-f", f])
         return cmd
@@ -678,7 +799,7 @@ class ExecAdapter:
 
     def exec_cmd(self, service: str, args: list[str], container: str | None = None) -> list[str]:
         if self.kind == "compose":
-            return ["docker", "exec", container or self.container(service), *args]
+            return docker_cmd(self.endpoint, "exec", container or self.container(service), *args)  # type: ignore[arg-type]
         # k3s: service is a kubectl target like "deploy/buzz" or a pod name.
         cmd = ["kubectl"]
         if self.kubeconfig:
@@ -716,14 +837,6 @@ class ExecAdapter:
             "mem_inactive_file": stat.get("inactive_file"),
             "mem_shmem": stat.get("shmem"),
         }
-
-
-def compose_ps_cmd(project: str, files: tuple[str, ...]) -> list[str]:
-    cmd = ["docker", "compose", "-p", project]
-    for f in files:
-        cmd.extend(["-f", f])
-    cmd.append("ps")
-    return cmd
 
 
 class Refused(Exception):
@@ -846,8 +959,15 @@ class ComposeAdapter:
         files: tuple[str, ...] = COMPOSE_FILES,
         env: dict[str, str] | None = None,
         lock: ProjectLock | None = None,
+        *,
+        endpoint: DockerEndpoint,
     ) -> None:
         check_compose_project(project)
+        if not isinstance(endpoint, DockerEndpoint):
+            raise Refused(f"ComposeAdapter needs a checked docker endpoint, got {endpoint!r}")
+        # Every compose and docker command of this stack goes to this endpoint,
+        # including teardown.
+        self.endpoint = endpoint
         self.project = project
         # This process's lock on the project; `up` refuses without it.
         self.lock = lock
@@ -859,7 +979,7 @@ class ComposeAdapter:
         self.owned = False
 
     def cmd(self, *args: str) -> list[str]:
-        out = ["docker", "compose", "-p", self.project]
+        out = docker_cmd(self.endpoint, "compose", "-p", self.project)
         for f in self.files:
             out.extend(["-f", f])
         out.extend(args)
@@ -896,13 +1016,13 @@ class ComposeAdapter:
 
     def relay_rate_limit_overrides(self) -> dict[str, str]:
         proc = run(
-            [
-                "docker",
+            docker_cmd(
+                self.endpoint,
                 "inspect",
                 "--format",
                 "{{json .Config.Env}}",
                 f"{self.project}-relay-1",
-            ],
+            ),
             check=True,
         )
         return rate_limit_overrides(json.loads(proc.stdout or "[]") or [])
@@ -926,9 +1046,9 @@ class ComposeAdapter:
         label = f"label=com.docker.compose.project={self.project}"
         out: dict[str, list[str]] = {}
         for kind, cmd in (
-            ("containers", ["docker", "ps", "-a", "-q", "--filter", label]),
-            ("volumes", ["docker", "volume", "ls", "-q", "--filter", label]),
-            ("networks", ["docker", "network", "ls", "-q", "--filter", label]),
+            ("containers", docker_cmd(self.endpoint, "ps", "-a", "-q", "--filter", label)),
+            ("volumes", docker_cmd(self.endpoint, "volume", "ls", "-q", "--filter", label)),
+            ("networks", docker_cmd(self.endpoint, "network", "ls", "-q", "--filter", label)),
         ):
             out[kind] = run(cmd, check=True, env=self.env).stdout.split()
         return out
@@ -967,7 +1087,7 @@ def emulation_note(fp: dict[str, Any]) -> str | None:
     )
 
 
-def fingerprint_compose(relay_cpu_pin: float = 2.0) -> dict[str, Any]:
+def fingerprint_compose(endpoint: DockerEndpoint, relay_cpu_pin: float = 2.0) -> dict[str, Any]:
     def sysctl(*args: str) -> str | None:
         try:
             return run(["sysctl", "-n", *args]).stdout.strip()
@@ -975,12 +1095,12 @@ def fingerprint_compose(relay_cpu_pin: float = 2.0) -> dict[str, Any]:
             return None
 
     docker = run(
-        [
-            "docker",
+        docker_cmd(
+            endpoint,
             "info",
             "--format",
             "{{.NCPU}} {{.MemTotal}} {{.ServerVersion}} {{.Architecture}}",
-        ],
+        ),
         check=False,
     )
     ncpu, mem, ver, arch = None, None, None, None
@@ -1001,6 +1121,7 @@ def fingerprint_compose(relay_cpu_pin: float = 2.0) -> dict[str, Any]:
         "docker_mem_bytes": mem,
         "docker_version": ver,
         "docker_arch": arch,
+        "docker_endpoint": str(endpoint),
         "emulated": emulated_services(arch),
         "relay_cpu_pin": relay_cpu_pin,
         "os": os_ver,
@@ -1049,31 +1170,6 @@ def fetch_metrics(url: CheckedUrl) -> dict[str, Any] | None:
         return parse_prometheus(text)
     except (urllib.error.URLError, TimeoutError, OSError):
         return None
-
-
-def docker_stats_rss(project: str) -> dict[str, int]:
-    proc = run(
-        [
-            "docker",
-            "stats",
-            "--no-stream",
-            "--format",
-            "{{.Name}} {{.MemUsage}}",
-        ],
-        check=False,
-    )
-    out: dict[str, int] = {}
-    if proc.returncode != 0:
-        return out
-    for line in proc.stdout.splitlines():
-        if not line.startswith(project):
-            continue
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        name, mem = parts[0], parts[1]
-        out[name] = parse_docker_mem(mem)
-    return out
 
 
 def parse_docker_mem(s: str) -> int:
@@ -1554,9 +1650,9 @@ def git_head() -> str:
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
 
 
-def inspect_docker_image(image: str) -> dict[str, Any]:
+def inspect_docker_image(image: str, endpoint: DockerEndpoint) -> dict[str, Any]:
     proc = run(
-        ["docker", "image", "inspect", image, "--format", "{{json .}}"],
+        docker_cmd(endpoint, "image", "inspect", image, "--format", "{{json .}}"),
         check=False,
     )
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -1568,14 +1664,16 @@ def inspect_docker_image(image: str) -> dict[str, Any]:
 
 
 def resolve_buzz_identity(
-    image: str, inspect: dict[str, Any] | None = None
+    image: str,
+    inspect: dict[str, Any] | None = None,
+    endpoint: DockerEndpoint | None = None,
 ) -> tuple[str, str]:
     """Return (buzz_commit, buzz_image) that can distinguish two Monday runs.
 
     Never records the moving tag `main`. Prefer the image's immutable digest
     plus `org.opencontainers.image.revision` / `sha-<hex>` source commit.
     """
-    info = inspect if inspect is not None else inspect_docker_image(image)
+    info = inspect if inspect is not None else inspect_docker_image(image, endpoint)  # type: ignore[arg-type]
     repo_digests = info.get("RepoDigests") or []
     digest_ref = repo_digests[0] if repo_digests else None
     labels = (info.get("Config") or {}).get("Labels") or {}
@@ -1615,7 +1713,8 @@ K3S_UNGUARDED = (
 def cmd_fingerprint(args: argparse.Namespace) -> int:
     if args.substrate != "compose":
         raise Refused(K3S_UNGUARDED.format(cmd="fingerprint"))
-    print(json.dumps(fingerprint_compose(), indent=2))
+    endpoint = resolve_docker_endpoint()
+    print(json.dumps(fingerprint_compose(endpoint), indent=2))
     return 0
 
 
@@ -1625,9 +1724,10 @@ def cmd_sample(args: argparse.Namespace) -> int:
     if not args.compose_project:
         raise Refused("sample --substrate compose needs --compose-project buzz-harness-<run>")
     check_compose_project(args.compose_project)
+    endpoint = resolve_docker_endpoint()
     guard = TargetGuard.from_args(args.allow_cidr, args.deny_list)
     metrics = guard.check_url(args.metrics_url, ("http",))
-    execs = ExecAdapter(kind="compose", project=args.compose_project)
+    execs = ExecAdapter(kind="compose", project=args.compose_project, endpoint=endpoint)
     services = {"relay": "relay", "postgres": "postgres", "redis": "redis", "minio": "minio"}
     sampler = Sampler(execs, metrics, services)
     row = sampler.sample("debug", True)
@@ -1680,7 +1780,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.substrate != "compose":
         print(K3S_RUN_DISABLED, file=sys.stderr)
         return 2
-    # Before the lock, docker or tenant_sim: a refused target changes nothing.
+    # Before the lock, docker or tenant_sim: a refused endpoint or target
+    # changes nothing.
+    endpoint = resolve_docker_endpoint()
     targets = check_targets(args)
     if args.compose_project:
         check_compose_project(args.compose_project)
@@ -1704,8 +1806,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     tenant_sim = args.tenant_sim
 
     notes: list[str] = []
-    adapter: Any = ComposeAdapter(project, tuple(args.compose_files.split(",")), env, lock=lock)
-    fp = fingerprint_compose()
+    adapter: Any = ComposeAdapter(
+        project, tuple(args.compose_files.split(",")), env, lock=lock, endpoint=endpoint
+    )
+    fp = fingerprint_compose(endpoint)
     note = emulation_note(fp)
     if note:
         notes.append(note)
@@ -1715,7 +1819,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "redis": "redis",
         "minio": "minio",
     }
-    execs = ExecAdapter(kind="compose", project=project)
+    execs = ExecAdapter(kind="compose", project=project, endpoint=endpoint)
     substrate_label = args.substrate_label or "workstation-orbstack"
 
     with RunSession(adapter, keep=args.keep) as session:
@@ -1813,7 +1917,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if "community" in msg.lower():
                 notes.append(f"community bootstrap: {msg} x{n}")
 
-        buzz_commit, buzz_image = resolve_buzz_identity(image)
+        buzz_commit, buzz_image = resolve_buzz_identity(image, endpoint=endpoint)
         line = write_results_line(
             Path(args.results),
             run_id=run_id,
@@ -1914,6 +2018,7 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
             "seed-bench always measures a fresh stack under its own project name; "
             "--skip-reset has nothing to skip. Nothing was changed."
         )
+    endpoint = resolve_docker_endpoint()
     targets = check_targets(args)
     if args.compose_project:
         check_compose_project(args.compose_project)
@@ -1925,8 +2030,10 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     env, image = sim_env(args, profile_path)
     limit = DEFAULT_SETUP_RATE_LIMIT if args.limits == "raised" else 0
-    adapter = ComposeAdapter(project, tuple(args.compose_files.split(",")), env, lock=lock)
-    execs = ExecAdapter(kind="compose", project=project)
+    adapter = ComposeAdapter(
+        project, tuple(args.compose_files.split(",")), env, lock=lock, endpoint=endpoint
+    )
+    execs = ExecAdapter(kind="compose", project=project, endpoint=endpoint)
     sampler = Sampler(
         execs,
         targets.metrics,
@@ -1970,7 +2077,7 @@ def cmd_seed_bench(args: argparse.Namespace) -> int:
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("tenant_sim did not exit after setup") from exc
         result = seed_bench_result(args.limits, done.get("seed") or {}, before, after)
-        result["buzz_image"] = resolve_buzz_identity(image)[1]
+        result["buzz_image"] = resolve_buzz_identity(image, endpoint=endpoint)[1]
         result["relay_rate_limit_env"] = overrides
         result["provision"] = setup_line.get("provision")
         result["tenant_sim_exit"] = code
@@ -2075,6 +2182,11 @@ def cmd_blink(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_docker_endpoint(args: argparse.Namespace) -> int:
+    print(resolve_docker_endpoint())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tenant_cogs.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2153,6 +2265,10 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--limits", choices=("default", "raised"), required=True)
     bench.add_argument("--seed-events", type=int, default=20000)
     bench.add_argument("--seed-max-seconds", type=int, default=300)
+    sub.add_parser(
+        "docker-endpoint",
+        help="print the checked local Docker endpoint, or refuse (exit 2); used by build-linux.sh",
+    )
     return p
 
 
@@ -2164,6 +2280,7 @@ def main(argv: list[str] | None = None) -> int:
         "blink": cmd_blink,
         "run": cmd_run,
         "seed-bench": cmd_seed_bench,
+        "docker-endpoint": cmd_docker_endpoint,
     }
     try:
         return commands[args.cmd](args)
