@@ -583,6 +583,25 @@ class Voids(unittest.TestCase):
                 v = m.gen_tick(t, gen_sample(t, 0, 0), live_counters(lt), None)
                 self.assertEqual((v.reason, v.box, v.t_unix, v.gen_event_t), (want, "generator", t, t))
 
+    def test_a_run_that_ended_on_a_stop_never_goes_stale(self) -> None:
+        m = rs.Monitor(expected={}, live_required=True)
+        self.assertIsNone(m.gen_tick(1000, gen_sample(1000, 0, 0), live_counters(1000), None))
+        done = {**live_counters(1002), "ended": "stop"}
+        for t in (1005, 1100, 5000):
+            self.assertIsNone(m.gen_tick(t, gen_sample(t, 0, 0), done, None), t)
+
+    def test_a_run_that_lost_its_driver_voids(self) -> None:
+        rows = [
+            ("lease", "the generator's run ended: its band lease ran out with no newer signal: the driver is gone"),
+            ("eof", "the generator's run ended: its band input ended without a stop: the driver is gone"),
+        ]
+        for ended, want in rows:
+            with self.subTest(ended):
+                m = rs.Monitor(expected={}, live_required=True)
+                self.assertIsNone(m.gen_tick(1000, gen_sample(1000, 0, 0), live_counters(1000), None))
+                v = m.gen_tick(1002, gen_sample(1002, 0, 0), {**live_counters(1002), "ended": ended}, None)
+                self.assertEqual((v.reason, v.box), (want, "generator"))
+
     def test_live_counters_within_the_limit_pass(self) -> None:
         m = rs.Monitor(expected={}, live_required=True)
         for t, lt in ((1000, 990), (1005, 995), (1010, 1000), (1010, 1000), (1015, 1025)):
@@ -676,6 +695,10 @@ class Voids(unittest.TestCase):
                     p.write_text(json.dumps(live_counters(7)).replace('"t_unix": 7,', '"t_unix": %s,' % bad, 1))
                     self.assertEqual(rs.read_live(str(p)), (None, f"{p}: t_unix {bad} is not a whole number of seconds"))
             whole = live_counters(7)
+            p.write_text(json.dumps({**whole, "ended": "done"}))
+            self.assertEqual(rs.read_live(str(p)), (None, f"{p}: ended \"done\" is not one of ['eof', 'lease', 'stop']"))
+            p.write_text(json.dumps({**whole, "ended": "stop"}))
+            self.assertEqual(rs.read_live(str(p))[1], None)
             p.write_text(json.dumps({**whole, "client_errors": {"send_failed": "2"}}))
             self.assertEqual(rs.read_live(str(p)), (None, f"{p} has a counter that is not a whole number"))
             p.write_text(json.dumps(whole))
@@ -782,6 +805,17 @@ class Loop(unittest.TestCase):
             self.assertEqual((void["reason"], void["box"], void["t_unix"]),
                              ("the generator's live counters are stale: t_unix 1000 is 15.0 s old, over the 10 s limit", "generator", 1015.0))
             self.assertEqual(self.stderr, f"void: {void['reason']}\n")
+
+    def test_live_counters_that_ended_on_a_stop_never_void_as_stale(self) -> None:
+        """A tenant_sim that a driver stopped wrote its last file: it ages,
+        and the loop goes on to its duration."""
+        with tempfile.TemporaryDirectory() as d:
+            live = Path(d) / "live.json"
+            live.write_text(json.dumps({**live_counters(1000), "ended": "stop"}))
+            code, _ = self.drive(self.settings(Path(d), live_file=str(live), duration=60.0),
+                                 lambda t, tier: (0, json.dumps(relay_sample(t, tier=tier)), ""))
+            self.assertEqual(code, 0, self.stderr)
+            self.assertFalse((Path(d) / "samples" / "void.json").exists())
 
     def test_live_counters_rewritten_each_tick_never_void(self) -> None:
         """The age is taken when the file is read, not when the tick began:

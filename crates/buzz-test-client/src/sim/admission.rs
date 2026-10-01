@@ -86,6 +86,52 @@ pub async fn publish(
 /// A fake relay for the rows that need a socket.
 #[cfg(test)]
 pub(crate) mod testrelay {
+    /// A relay that takes every connection and accepts everything: an AUTH
+    /// challenge on connect, OK for every AUTH and EVENT, EOSE for every
+    /// REQ. For a whole run without a real relay.
+    pub(crate) async fn accepting_relay() -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    let challenge = serde_json::json!(["AUTH", "test-challenge"]).to_string();
+                    if ws.send(Message::Text(challenge.into())).await.is_err() {
+                        return;
+                    }
+                    while let Some(Ok(msg)) = ws.next().await {
+                        let Ok(text) = msg.into_text() else { continue };
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        let reply = match v[0].as_str() {
+                            Some("AUTH") | Some("EVENT") => {
+                                serde_json::json!(["OK", v[1]["id"], true, ""])
+                            }
+                            Some("REQ") => serde_json::json!(["EOSE", v[1]]),
+                            _ => continue,
+                        };
+                        if ws
+                            .send(Message::Text(reply.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
     /// A one-connection relay that answers the first EVENT with `replies`,
     /// each a JSON frame; `{id}` is the event's id.
     pub(crate) async fn fake_relay(replies: Vec<String>) -> String {

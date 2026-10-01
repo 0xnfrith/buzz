@@ -218,6 +218,10 @@ pub struct Live {
     pub read_refused: u64,
     pub read_unanswered: u64,
     pub read_rate_limited: u64,
+    /// On the last write only: why the run ended (`stop`, `lease` or
+    /// `eof`). A file that has it is final, never stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
 }
 
 /// Writes `live` to `path` whole: a temp file beside it, then a rename, so a
@@ -443,6 +447,7 @@ impl Stats {
                 read_refused: count(&s.read_failed_by, ReadFailure::Refused),
                 read_unanswered: count(&s.read_failed_by, ReadFailure::Unanswered),
                 read_rate_limited: s.reads_rate_limited,
+                ended: None,
             }
         })
     }

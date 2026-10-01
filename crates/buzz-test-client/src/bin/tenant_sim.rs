@@ -4,7 +4,6 @@
 mod sim;
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,11 +21,13 @@ use sim::identity::{
     IdentityRecord, Population, RepoRef, World,
 };
 use sim::kinds;
+use sim::phase::emit;
 use sim::profile::{load_profile, Profile};
-use sim::roles::{Band, Role};
+use sim::roles::Role;
 use sim::seed;
+use sim::signal::{self, Ended};
 use sim::stats::{spawn_live_writer, write_live, Stats};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::warn;
 
@@ -69,9 +70,15 @@ struct Args {
     #[arg(long)]
     out_dir: Option<PathBuf>,
 
-    /// Band signal source: stdin (default) or fifo.
+    /// Band signal source: stdin (default) or fifo (`<out-dir>/band.fifo`).
+    /// See `sim::signal` for the lines and their leases.
     #[arg(long, default_value = "stdin")]
     band_signal: String,
+
+    /// With --pause-after-setup, how long to wait for `continue` before
+    /// giving up (exit 3): a driver that died during setup.
+    #[arg(long, default_value_t = 3600)]
+    continue_within_s: u64,
 
     /// Send kind 9030 for every identity (closed-relay posture).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -135,80 +142,11 @@ struct SetupStats {
     rate_limited: u64,
 }
 
-/// One JSON phase line on stdout, flushed so the orchestrator sees it now.
-fn emit(line: &serde_json::Value) {
-    println!("{line}");
-    let _ = std::io::stdout().flush();
-}
-
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Read band signals (and the one-shot `continue` after setup) from stdin or
-/// a fifo. Started before provisioning so `continue` is never missed.
-fn spawn_band_reader(
-    kind: &str,
-    out_dir: &std::path::Path,
-    tx: watch::Sender<Band>,
-    go: oneshot::Sender<()>,
-) -> Result<()> {
-    let fifo = if kind == "fifo" {
-        let path = out_dir.join("band.fifo");
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        let status = std::process::Command::new("mkfifo").arg(&path).status()?;
-        if !status.success() {
-            bail!("mkfifo {} failed", path.display());
-        }
-        Some(path)
-    } else {
-        None
-    };
-    std::thread::spawn(move || {
-        // Opening a fifo blocks until a writer appears; do it off the main task.
-        let source: Box<dyn BufRead + Send> = match fifo {
-            Some(path) => match std::fs::File::open(&path) {
-                Ok(file) => Box::new(std::io::BufReader::new(file)),
-                Err(e) => {
-                    eprintln!("tenant_sim: open {}: {e}", path.display());
-                    return;
-                }
-            },
-            None => Box::new(std::io::BufReader::new(std::io::stdin())),
-        };
-        let mut go = Some(go);
-        for line in source.lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if line == "continue" {
-                if let Some(go) = go.take() {
-                    let _ = go.send(());
-                }
-                continue;
-            }
-            let token = line.strip_prefix("band ").unwrap_or(line);
-            if let Some(band) = Band::parse(token) {
-                let _ = tx.send(band);
-                if band == Band::Stop {
-                    break;
-                }
-            } else {
-                eprintln!("tenant_sim: unknown band signal {line:?}");
-            }
-        }
-        // End of input with no `stop` (the orchestrator went away) stops the
-        // run too. Identities read the last value of the closed channel.
-        let _ = tx.send(Band::Stop);
-    });
-    Ok(())
 }
 
 /// The human who attests for an agent (NIP-OA), if any.
@@ -507,9 +445,9 @@ async fn run(args: Args) -> Result<i32> {
     };
     save_population(&out_dir.join("identities.json"), &pop)?;
 
-    let (band_tx, band_rx) = watch::channel(Band::Warmup);
-    let (go_tx, go_rx) = oneshot::channel();
-    spawn_band_reader(&args.band_signal, &out_dir, band_tx, go_tx)?;
+    sim::phase::set_file(out_dir.join("phases.jsonl"))?;
+    let mut control = signal::spawn(&args.band_signal, &out_dir, usize::MAX)?;
+    let band_rx = control.band.clone();
 
     let stats = Arc::new(Stats::new());
     // The live counters (<out-dir>/live.json), rewritten every LIVE_EVERY,
@@ -568,9 +506,26 @@ async fn run(args: Args) -> Result<i32> {
     if args.setup_only {
         return Ok(if seed_failed { 1 } else { 0 });
     }
-    if args.pause_after_setup && go_rx.await.is_err() {
-        eprintln!("band signal closed before continue");
-        return Ok(3);
+    if args.pause_after_setup {
+        let within = Duration::from_secs(args.continue_within_s);
+        let go = control
+            .go
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("continue taken twice"))?;
+        match timeout(within, go).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                eprintln!("band signal closed before continue");
+                return Ok(3);
+            }
+            Err(_) => {
+                eprintln!(
+                    "no continue within {} s after setup; the driver is gone",
+                    within.as_secs()
+                );
+                return Ok(3);
+            }
+        }
     }
 
     let world = Arc::new(World {
@@ -706,7 +661,12 @@ async fn run(args: Args) -> Result<i32> {
     }
 
     live_task.abort();
-    write_live(&live_path, &stats.live(unix_now()))?;
+    // The last write says why the run ended, so a sampler never reads it
+    // as stale.
+    let ended = control.ended().unwrap_or(Ended::Eof);
+    let mut last = stats.live(unix_now());
+    last.ended = Some(ended.as_str().to_string());
+    write_live(&live_path, &last)?;
     let mut ends = HashMap::new();
     ends.insert("floor".into(), unix_now());
     ends.insert("steady".into(), unix_now());
@@ -724,7 +684,9 @@ async fn run(args: Args) -> Result<i32> {
     println!("{json}");
 
     let rejected: u64 = summary.bands.values().map(|b| b.rejected).sum();
-    if summary.lost_after_backfill > 0 {
+    if ended == Ended::Lease {
+        Ok(5)
+    } else if summary.lost_after_backfill > 0 {
         Ok(2)
     } else if join_err || rejected > 0 || summary.media.rejected > 0 || summary.git.failed > 0 {
         Ok(1)
@@ -759,6 +721,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn shipped_profile() -> Profile {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1016,6 +979,103 @@ mod tests {
             "5",
         ]);
         assert!(both.is_err(), "--seed-days with --seed-events");
+    }
+
+    /// A whole run on a fifo, against a relay that accepts everything. Its
+    /// phases go to phases.jsonl. A band whose lease runs out with no newer
+    /// signal ends the run on its own, exit 5, and the last live.json says
+    /// "lease"; a `stop` ends it with "stop". One test, so two runs never
+    /// share the phases file at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_on_a_fifo_ends_on_stop_or_when_its_lease_runs_out() {
+        use sim::admission::testrelay::accepting_relay;
+        let relay = accepting_relay().await;
+        let dir = sim::guard::testsrv::tempdir();
+        let solo =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../perf/profiles/1h-5a.toml");
+        let text = std::fs::read_to_string(&solo)
+            .expect("solo")
+            .replace("repos            = 1", "repos            = 0");
+        assert!(text.contains("repos            = 0"), "no repos: no clone");
+        let profile = dir.join("solo-no-repos.toml");
+        std::fs::write(&profile, text).expect("profile");
+        let deny = dir.join("deny");
+        std::fs::write(&deny, "").expect("deny");
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+        for (name, lines, want_code, want_ended) in [
+            ("lease", vec!["band floor 2"], 5, "lease"),
+            ("stop", vec!["band floor 60", "stop"], 0, "stop"),
+        ] {
+            let out = dir.join(name);
+            let args = Args::try_parse_from([
+                "tenant_sim".to_string(),
+                "--profile".into(),
+                profile.to_string_lossy().into_owned(),
+                "--relay-url".into(),
+                relay.clone(),
+                "--http-url".into(),
+                "http://127.0.0.1:1".into(),
+                "--allow-cidr".into(),
+                "127.0.0.0/8".into(),
+                "--deny-list".into(),
+                deny.to_string_lossy().into_owned(),
+                "--out-dir".into(),
+                out.to_string_lossy().into_owned(),
+                "--band-signal".into(),
+                "fifo".into(),
+                "--git-credential-helper".into(),
+                "/usr/bin/true".into(),
+            ])
+            .expect("args");
+            let task = tokio::spawn(run(args));
+            let phases = out.join("phases.jsonl");
+            let started = Instant::now();
+            while !read(&phases).contains("\"phase\":\"ready\"") {
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "{name}: never ready: {}",
+                    read(&phases)
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let fifo = out.join("band.fifo");
+            for l in lines {
+                let (fifo, l) = (fifo.clone(), l.to_string());
+                tokio::task::spawn_blocking(move || {
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fifo)
+                        .expect("open fifo");
+                    writeln!(f, "{l}").expect("write");
+                })
+                .await
+                .expect("writer");
+            }
+            let code = timeout(Duration::from_secs(60), task)
+                .await
+                .expect("the run ended")
+                .expect("join")
+                .expect("run");
+            assert_eq!(code, want_code, "{name}");
+            let live: serde_json::Value =
+                serde_json::from_str(&read(&out.join("live.json"))).expect("live.json");
+            assert_eq!(live["ended"], want_ended, "{name}");
+            let names: Vec<String> = read(&phases)
+                .lines()
+                .map(|l| {
+                    serde_json::from_str::<serde_json::Value>(l).expect("phase line")["phase"]
+                        .as_str()
+                        .expect("phase")
+                        .to_string()
+                })
+                .collect();
+            let want: &[&str] = if name == "lease" {
+                &["setup-done", "ready", "lease-ran-out"]
+            } else {
+                &["setup-done", "ready"]
+            };
+            assert_eq!(names, want, "{name}");
+        }
     }
 
     #[test]

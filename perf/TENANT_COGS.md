@@ -185,6 +185,38 @@ Pin the image by digest (`ghcr.io/block/buzz@sha256:…`) for a result you
 will compare later; a tag can move. The results line records the digest and
 the image's source revision either way.
 
+### The band signal
+
+`tenant_sim --band-signal stdin` (the default, as `run` uses it) or `fifo`
+(`<out-dir>/band.fifo`) takes one line at a time:
+
+| Line | Means |
+|---|---|
+| `continue [lease]` | after `setup-done`, with `--pause-after-setup`: connect the population |
+| `band <name> [lease]` | move to that band: `warmup`, `floor`, `steady`, `peak`, `cooldown`, or `pause` (connected, nothing sent, not sampled: for a driver's checks at a band boundary). `<name>` alone is the same |
+| `ramp <k> <lease>` | switch on the first k identities of a ramp |
+| `stop` | end the run |
+
+- **A lease** is whole seconds, 1 to 86400. **When the last lease runs out
+  with no newer signal, the run stops on its own**: phase `lease-ran-out`,
+  `"ended": "lease"` in the last `live.json`, exit 5. A driver that died
+  can't leave the load running.
+- **On a fifo, every `band` and `ramp` line needs a lease,** and the fifo is
+  opened again after each writer closes it: a driver may send each line
+  with its own short-lived writer (bound its open: opening a fifo blocks
+  while nobody reads it).
+- **On stdin,** its end without a `stop` ends the run (`"ended": "eof"`), as
+  before.
+- **A line that can't be read** (an unknown band, a bad lease, a band line
+  on a fifo without one) is refused with phase `signal-refused`, the line
+  and why, and changes nothing.
+- **`--continue-within-s`** (default 3600) bounds the wait for `continue`:
+  past it, exit 3 with its own line.
+- **Phase lines** (`setup-done`, `seed-start`, `seed-done`, `ready`,
+  `lease-ran-out`, `signal-refused`) go to stdout and to
+  `<out-dir>/phases.jsonl`, so a driver can read them where stdout goes to a
+  journal.
+
 ### Rate limits: raised for setup, relay defaults for every band
 
 The relay limits events per key (for example 60 a minute for a human key).
@@ -490,8 +522,10 @@ python3 perf/tenant_cogs.py remote-sample \
     `read_rate_limited`: a total missing is never read as 0.
   - `tenant_sim`'s live counters stop being live: `t_unix` missing or not
     a whole number of seconds, more than 10 s old or 10 s ahead of the
-    clock when the loop reads it, or lower than the last one read. The
-    writer and the loop share the generator box's clock.
+    clock when the loop reads it, or lower than the last one read; or its
+    last write says the run lost its driver (`"ended": "lease"` or
+    `"eof"`). A last write that ended on a stop is final: it is never
+    stale. The writer and the loop share the generator box's clock.
   - "The relay breaks" is the first of: relay rejects (not rate limits)
     or dropped connections rising in the live counters; media uploads the relay
     refused (`media_refused`, an answer that isn't 2xx) or didn't answer
@@ -523,8 +557,14 @@ sent, accepted, rejected, rate-limited and received, its own errors by kind
 (`send_failed`, `recv_error`, `reconnect_failed`, `backfill_failed`,
 `connection_dropped`), and media and git failures by where they failed,
 stamped `t_unix`. If a rewrite fails, `tenant_sim` logs it and carries on;
-the file then goes stale and the loop voids 10 s later, so stop the loop
-before `tenant_sim` ends.
+the file then goes stale and the loop voids 10 s later.
+
+**The last write says why the run ended:** `"ended": "stop"` (a `stop`
+signal), `"lease"` (its band lease ran out) or `"eof"` (stdin ended without
+a `stop`). A file that ended on a stop is final: it ages, and the loop
+never calls it stale, so the loop may outlive `tenant_sim`. One that ended
+on a lease or an eof lost its driver, and the loop voids on it. A crash
+writes neither, goes stale, and voids as before.
 
 | Failure | live.json total | Counts as |
 |---|---|---|

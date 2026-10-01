@@ -21,7 +21,9 @@ the conditions that void a run:
   live counters: a client error kind, a media upload or an agent's read that
   failed before it went out, or a git add, commit or branch that failed;
 - tenant_sim's live counters are missing, unreadable, stale, ahead of the
-  clock, or go backwards.
+  clock, or go backwards; or its last write says its run lost its driver
+  (a lease that ran out, or stdin ended without a stop). A last write that
+  ended on a stop is final and never stale.
 
 Every limit a tick crosses is decided at the tick's end, after all of
 that tick's break signals: a limit and a break on the same tick count as
@@ -93,6 +95,14 @@ RELAY_FAILURE_TOTALS = {
 # tenant_sim rewrites live.json every 2 s. Older than this (five writes
 # missed), or this far ahead of the clock, the file is no longer live.
 LIVE_MAX_AGE_S = 10.0
+# tenant_sim's last write says why its run ended. A run a driver stopped is
+# final, never stale; one whose band lease ran out, or whose input ended
+# without a stop, lost its driver.
+LIVE_ENDED = {
+    "stop": None,
+    "lease": "its band lease ran out with no newer signal: the driver is gone",
+    "eof": "its band input ended without a stop: the driver is gone",
+}
 
 # What a relay box's slow sample must hold, as numbers: the whole box's
 # filesystem, and on a box with Docker the stack's Postgres data, WAL, MinIO,
@@ -482,13 +492,17 @@ class Monitor:
         if self.live_required:
             if live is None:
                 return self._settle([Limit(f"the generator's live counters: {live_err}", "generator", t)], defer)
+            ended = live.get("ended")
+            if ended is not None and LIVE_ENDED[ended] is not None:
+                return self._settle([Limit(f"the generator's run ended: {LIVE_ENDED[ended]}", "generator", t)], defer)
             # tenant_sim logs a failed rewrite and carries on, so an old
-            # file with no errors in it must not pass as a live one.
+            # file with no errors in it must not pass as a live one. A run
+            # that ended on a stop wrote its last file, which ages.
             lt, now = live["t_unix"], t if live_t is None else live_t
             stale = None
             if self._live0 is not None and lt < self._live0["t_unix"]:
                 stale = f"went backwards: t_unix {lt}, after {self._live0['t_unix']}"
-            elif now - lt > self.live_max_age_s:
+            elif now - lt > self.live_max_age_s and ended is None:
                 stale = f"are stale: t_unix {lt} is {now - lt:.1f} s old, over the {self.live_max_age_s:g} s limit"
             elif lt - now > self.live_max_age_s:
                 stale = f"are ahead of this box's clock: t_unix {lt} is {lt - now:.1f} s ahead, over the {self.live_max_age_s:g} s limit"
@@ -534,6 +548,8 @@ def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
     for k in LIVE_TOTALS:
         if k not in v:
             return None, f"{path} has no {k}"
+    if "ended" in v and v["ended"] not in LIVE_ENDED:
+        return None, f"{path}: ended {json.dumps(v['ended'])} is not one of {sorted(LIVE_ENDED)}"
     counts = list(v["client_errors"].values()) + [v[k] for k in LIVE_TOTALS]
     if not all(type(c) is int and c >= 0 for c in counts):
         return None, f"{path} has a counter that is not a whole number"
