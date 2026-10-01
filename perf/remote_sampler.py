@@ -13,7 +13,8 @@ the conditions that void a run:
 - the generator overloads before the relay breaks: CPU averaging over 70% on
   two 60 s windows in a row, MemAvailable under 10% of MemTotal for 3 ticks,
   an out-of-memory kill on its box, or its own errors rising in tenant_sim's
-  live counters (or those counters missing or unreadable);
+  live counters, media and git failures included;
+- tenant_sim's live counters are missing or unreadable;
 
 On a void it writes `<out>/samples/void.json` and exits 3; whoever drives
 the bands acts on that. It never stops anything itself.
@@ -55,6 +56,12 @@ EXIT_OK, EXIT_REFUSED, EXIT_VOID = 0, 2, 3
 # What counts as the generator's own errors in tenant_sim's live counters,
 # and what counts as the relay breaking.
 GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_failed")
+# The live counters' totals the loop reads besides client_errors. tenant_sim
+# writes every one, so a missing one is an error, never 0. client_errors
+# holds only the kinds that happened, so a kind missing there is 0.
+LIVE_TOTALS = ("rejected", "media_failed", "git_failed")
+# Media uploads and git pushes that failed: the generator's own errors too.
+GEN_FAILURE_TOTALS = ("media_failed", "git_failed")
 
 
 class Refused(Exception):
@@ -324,10 +331,11 @@ class Monitor:
             if self._live0 is not None:
                 c0 = self._live0.get("client_errors") or {}
                 rose = {k: ce.get(k, 0) - c0.get(k, 0) for k in GEN_ERROR_KINDS if ce.get(k, 0) > c0.get(k, 0)}
+                rose.update({k: live[k] - self._live0[k] for k in GEN_FAILURE_TOTALS if live[k] > self._live0[k]})
                 if rose:
                     events.append("the generator reported its own errors: " + ", ".join(f"{k} +{v}" for k, v in sorted(rose.items())))
-                if live.get("rejected", 0) > self._live0.get("rejected", 0):
-                    self.relay_break(t, f"the relay rejected {live['rejected'] - self._live0.get('rejected', 0)} events")
+                if live["rejected"] > self._live0["rejected"]:
+                    self.relay_break(t, f"the relay rejected {live['rejected'] - self._live0['rejected']} events")
                 if ce.get("connection_dropped", 0) > c0.get("connection_dropped", 0):
                     self.relay_break(t, "the relay dropped connections")
             self._live0 = live
@@ -352,8 +360,11 @@ def read_live(path: str) -> tuple[dict[str, Any] | None, str | None]:
         return None, f"{path} is not JSON: {e}"
     if not isinstance(v, dict) or not isinstance(v.get("client_errors"), dict):
         return None, f"{path} has no client_errors"
-    counts = list(v["client_errors"].values()) + [v.get("rejected", 0)]
-    if not all(type(c) is int for c in counts):
+    for k in LIVE_TOTALS:
+        if k not in v:
+            return None, f"{path} has no {k}"
+    counts = list(v["client_errors"].values()) + [v[k] for k in LIVE_TOTALS]
+    if not all(type(c) is int and c >= 0 for c in counts):
         return None, f"{path} has a counter that is not a whole number"
     return v, None
 
