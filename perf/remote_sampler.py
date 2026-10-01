@@ -272,7 +272,10 @@ class Monitor:
         if got != want:
             return Void(f"the rule-set hash on {key} is {got}, not {want}, recorded at the lockdown", box.role, t)
         relay = (sample.get("containers") or {}).get("relay")
-        if relay is None and sample.get("containers") is not None and "containers_absent" not in sample:
+        # A container list from a failed `docker ps` is empty, not a sign the
+        # relay is gone: only a listing that worked can show a relay break.
+        listed = not any(str(e).startswith("docker ps:") for e in sample.get("errors") or [])
+        if relay is None and sample.get("containers") is not None and "containers_absent" not in sample and listed:
             self.relay_break(t, f"{key}: no relay container")
         elif relay is not None and relay.get("oom_kill") is not None:
             base = self._relay_oom0.setdefault(box.ip, relay["oom_kill"])

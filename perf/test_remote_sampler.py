@@ -303,6 +303,24 @@ class Voids(unittest.TestCase):
         v = m.box_tick(self.BOX, 3, s, None)
         self.assertEqual(v.reason, "box unreachable: relay1 (10.77.0.3): 3 calls in a row failed; the last: the sample has no rule-set hash")
 
+    def test_a_failed_docker_ps_is_not_a_relay_break(self) -> None:
+        m = rs.Monitor(expected={"10.77.0.3": H1})
+        s = relay_sample(1)
+        s["containers"], s["errors"] = {}, ["docker ps: exit 124: timed out after 10s"]
+        self.assertIsNone(m.box_tick(self.BOX, 1, s, None))
+        self.assertIsNone(m.relay_break_t)
+        self.assertIsNone(m.gen_tick(0, gen_sample(0, 0, 0), None, None))
+        self.assertIsNone(m.gen_tick(60, gen_sample(60, 80, 20), None, None))
+        v = m.gen_tick(120, gen_sample(120, 155, 45), None, None)
+        self.assertEqual(v.reason, "the generator's CPU averaged 80.0% and 75.0% on two 60 s windows in a row, over 70%, before the relay broke")
+
+    def test_a_listing_without_the_relay_is_a_relay_break(self) -> None:
+        m = rs.Monitor(expected={"10.77.0.3": H1})
+        s = relay_sample(5)
+        s["containers"] = {"postgres": {"working_set": 10, "oom_kill": 0}}
+        self.assertIsNone(m.box_tick(self.BOX, 5, s, None))
+        self.assertEqual((m.relay_break_t, m.notes), (5, [{"t_unix": 5, "relay_break": "relay1 (10.77.0.3): no relay container"}]))
+
     def test_rising_drop_counters_are_reported_not_fatal(self) -> None:
         m = self.mon()
         for t in range(1, 20):

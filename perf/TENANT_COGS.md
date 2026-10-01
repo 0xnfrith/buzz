@@ -431,7 +431,8 @@ python3 perf/tenant_cogs.py remote-sample \
     a void too, never "no errors".
   - "The relay breaks" is the first of: relay rejects or dropped
     connections rising in the live counters, a relay OOM kill, or no relay
-    container. A generator event after it is a note, not a void, written
+    container in a `docker ps` that worked (a failed listing is not a
+    break). A generator event after it is a note, not a void, written
     once.
 - **INT and TERM** write the band summaries, then exit 130 and 143. A
   second signal while the summaries or `void.json` are written is ignored.
