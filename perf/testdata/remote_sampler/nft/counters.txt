@@ -1,0 +1,12 @@
+table inet capture_egress {
+	chain output {
+		type filter hook output priority filter; policy drop;
+		oif "lo" accept
+		counter packets 4 bytes 143 drop
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		counter packets 0 bytes 0 drop
+	}
+}
