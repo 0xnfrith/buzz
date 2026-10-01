@@ -2230,6 +2230,16 @@ def acceptance_errors(
         errs.append(f"media.rejected={media.get('rejected')}")
     if int(media.get("uploads") or 0) <= 0:
         errs.append("media.uploads == 0")
+    # Agent reads: none may fail, and agents that took turns must have read.
+    reads = summary.get("reads")
+    turns = int((summary.get("sent_by_kind") or {}).get("44200") or 0)
+    if not isinstance(reads, dict):
+        errs.append("reads missing from the summary")
+    else:
+        if int(reads.get("failed") or 0):
+            errs.append(f"reads.failed={reads.get('failed')}")
+        if turns and int(reads.get("reads") or 0) <= 0:
+            errs.append(f"agents took {turns} turns but no read was answered")
     git = summary.get("git") or {}
     if int(git.get("failed") or 0):
         errs.append(f"git.failed={git.get('failed')}")

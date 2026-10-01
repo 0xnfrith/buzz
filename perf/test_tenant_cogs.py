@@ -434,6 +434,7 @@ class SchemaTests(unittest.TestCase):
             "identities": {"humans": 10, "agents": 20},
             "lost_after_backfill": 0,
             "media": {"uploads": 3, "rejected": 0},
+            "reads": {"reads": 0, "failed": 0},
             "git": {"pushes": 1, "failed": 0},
         }
         self.assertEqual(tenant_cogs.acceptance_errors(line, summary, 0), [])
@@ -480,10 +481,32 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(tenant_cogs.seed_errors(seed),
                          ["seed: 150000 of 207335 events acknowledged (rejected 0, errors 3)"])
 
+    def test_reads_gate_acceptance(self) -> None:
+        """A local run fails acceptance on any failed read, and when agents
+        took turns but no read was answered; a summary without reads is
+        refused."""
+        line = self.fixture()
+        rows = [
+            ({"reads": 40, "failed": 0}, {"44200": 12}, []),
+            ({"reads": 39, "failed": 1}, {"44200": 12}, ["reads.failed=1"]),
+            ({"reads": 0, "failed": 0}, {"44200": 12}, ["agents took 12 turns but no read was answered"]),
+            ({"reads": 0, "failed": 0}, {}, []),
+            (None, {}, ["reads missing from the summary"]),
+        ]
+        for reads, kinds, want in rows:
+            with self.subTest(reads=reads, kinds=kinds):
+                summary = {**self.summary_ok(), "sent_by_kind": kinds}
+                if reads is None:
+                    summary.pop("reads")
+                else:
+                    summary["reads"] = reads
+                self.assertEqual(tenant_cogs.acceptance_errors(line, summary, 0), want)
+
     def summary_ok(self) -> dict:
         return {
             "identities": {"humans": 10, "agents": 20},
             "media": {"uploads": 3, "rejected": 0},
+            "reads": {"reads": 0, "failed": 0},
             "git": {"pushes": 2, "failed": 0},
         }
 
@@ -522,6 +545,7 @@ class SchemaTests(unittest.TestCase):
         summary = {
             "identities": {"humans": 10, "agents": 20},
             "media": {"uploads": 3, "rejected": 0},
+            "reads": {"reads": 0, "failed": 0},
             "git": {"pushes": 1, "failed": 0},
         }
         line = self.fixture()
@@ -553,6 +577,7 @@ class SchemaTests(unittest.TestCase):
         summary = {
             "identities": {"humans": 10, "agents": 20},
             "media": {"uploads": 3, "rejected": 0},
+            "reads": {"reads": 0, "failed": 0},
             "git": {"pushes": 1, "failed": 0},
         }
         line = self.fixture()
