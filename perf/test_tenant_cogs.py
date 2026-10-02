@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cogs_report
 import tenant_cogs
+from planted_env import assert_names, parent_env
 
 _LOCK_TMP: tempfile.TemporaryDirectory | None = None
 _REAL_LOCK_DIR = tenant_cogs.LOCK_DIR
@@ -1690,17 +1691,10 @@ VARS = tenant_cogs.RATE_LIMIT_VARS
 
 class SetupRateLimitTests(unittest.TestCase):
     def test_tenant_sim_env_drops_caller_credentials(self) -> None:
-        env = {
-            "PATH": "/usr/bin",
-            "BUZZ_AUTH_TAG": '["auth","o","","s"]',
-            "BUZZ_PRIVATE_KEY": "k",
-            "NOSTR_PRIVATE_KEY": "n",
-            "BUZZ_IMAGE": "img",
-        }
-        out = tenant_cogs.child_env(env)
-        self.assertEqual(out, {"PATH": "/usr/bin"})
-        with mock.patch.dict(os.environ, {"BUZZ_AUTH_TAG": "x"}):
-            self.assertNotIn("BUZZ_AUTH_TAG", tenant_cogs.child_env())
+        # A fixed fake parent with the planted dummies; names compared, never
+        # values (planted_env.assert_names).
+        with mock.patch.dict(os.environ, parent_env(BUZZ_IMAGE="img"), clear=True):
+            assert_names(self, tenant_cogs.child_env(), ["HOME", "LC_ALL", "PATH"])
 
     def test_raised_env_covers_every_var(self) -> None:
         env = tenant_cogs.raised_limit_env(500)

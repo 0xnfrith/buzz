@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import remote_sampler
+import tenant_cogs
 
 PERF = Path(__file__).resolve().parent
 REPO = PERF.parent
@@ -65,8 +66,12 @@ CLOCK_FLAGS = ["--cadence", "2", "--lease-slack", "15", "--pause-lease", "120", 
 
 
 class Proof:
-    def __init__(self, out: Path, prefix: str, python: str, docker: str, tenant_sim: str) -> None:
+    def __init__(self, out: Path, prefix: str, python: str, docker: str, tenant_sim: str,
+                 docker_host: str) -> None:
         self.out, self.prefix, self.python, self.docker, self.tenant_sim = out, prefix, python, docker, tenant_sim
+        # The checked local socket (tenant_cogs.resolve_docker_endpoint):
+        # every docker call of the proof and its hook goes there.
+        self.docker_host = docker_host
         self.results: list[tuple[str, str, bool, str]] = []
 
     # ---- checks ----
@@ -82,7 +87,11 @@ class Proof:
     # ---- the machine ----
 
     def run(self, *argv: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout)
+        """A docker call (argv[0] is the docker CLI) gets docker's fixed
+        environment; anything else (the hook) a Python child's."""
+        return subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout,
+                              env=tenant_cogs.docker_env(self.docker_host) if argv[:1] == (self.docker,)
+                              else tenant_cogs.python_env())
 
     def leftovers(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -130,6 +139,7 @@ class Proof:
         cfg = {"root": str(root), "prefix": self.prefix, "compose": str(PROOF / "compose.yml"),
                "tenant_sim": self.tenant_sim, "helper": str(REPO / "target/release/git-credential-nostr"),
                "tenant_cogs": str(PERF / "tenant_cogs.py"), "python": self.python, "docker": self.docker,
+               "docker_host": self.docker_host,
                "deny_list": str(root / "deny"), "gens": {g: GENS[g] for g in gens},
                "profiles": {k: str(v) for k, v in profiles.items()},
                "sampler": {"step_settle": 10, "fast_every": 2}, **kw}
@@ -148,7 +158,10 @@ class Proof:
 
     def start_clock(self, root: Path, argv: list[str]) -> subprocess.Popen[bytes]:
         so = (root / "clock.out").open("wb")
-        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=so, stderr=subprocess.STDOUT)
+        # The clock's fixed environment is the hook's too: the clock
+        # (band_clock.py) runs the hook with its own.
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=so, stderr=subprocess.STDOUT,
+                                env=tenant_cogs.python_env())
 
     def run_clock(self, root: Path, argv: list[str], timeout_s: float) -> int:
         t0 = time.time()
@@ -529,9 +542,15 @@ def main(argv: list[str]) -> int:
     if not docker:
         print("refused: no docker on PATH", file=sys.stderr)
         return 2
+    try:
+        docker_host = str(tenant_cogs.resolve_docker_endpoint())
+    except tenant_cogs.Refused as e:
+        # Only a local Unix socket: the proof never drives a remote daemon.
+        print(f"refused: {e}", file=sys.stderr)
+        return 2
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    proof = Proof(out, args.prefix, sys.executable, docker, str(Path(args.tenant_sim).resolve()))
+    proof = Proof(out, args.prefix, sys.executable, docker, str(Path(args.tenant_sim).resolve()), docker_host)
     if not proof.preflight():
         return 1
     fns: dict[str, Callable[[], None]] = {
@@ -550,7 +569,8 @@ def main(argv: list[str]) -> int:
                 # Whatever happened in the row, nothing of it stays up.
                 cfg = out / r / "config.json"
                 if cfg.exists():
-                    subprocess.run([*proof.hook(cfg), "end"], capture_output=True, timeout=600)
+                    subprocess.run([*proof.hook(cfg), "end"], capture_output=True, timeout=600,
+                                   env=tenant_cogs.python_env())
     except Stopped as e:
         left = proof.leftovers()
         print(f"\nstopped by a signal: exit {e.code}; left: {left or 'nothing'}", flush=True)
