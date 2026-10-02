@@ -11,7 +11,7 @@ and the proof exits 1 if any failed.
 | Row | What it forces | What must happen |
 |---|---|---|
 | `reads` | nothing: two generators through every band of a short profile | exit 0; both driven in lockstep; agents' reads and humans' home-feed polls all answered, none refused (the hard row) |
-| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and breaks it after at least one step held, by a named relay-break class (the ack test, rejects, unanswered or shed), printed; a held to the max |
+| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and breaks it after at least one step held, by a named relay-break class (the ack test, rejects or any of the loop's relay failure totals, read from `remote_sampler.py`), printed; a held to the max |
 | `ramp-freeze` | relay b frozen (`docker pause`) at the ramp's second step | exit 0; b broke at step 2 because its sends went unanswered, a break and never a void; a held to the max |
 | `ramp-starved` | relay b cut to 0.01 CPU at the ramp's second step | exit 0; b broke at step 2 because it shed sends (`rate-limited: too many concurrent requests` or `shared admission unavailable`), a break and never counted apart; a held to the max; the texts b got, counted |
 | `boundary` | the floor's boundary check fails | exit 4 on that line; `end` still ran and removed both stacks |
@@ -36,11 +36,14 @@ import platform
 import re
 import shutil
 import signal
+import string
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+import remote_sampler
 
 PERF = Path(__file__).resolve().parent
 REPO = PERF.parent
@@ -241,8 +244,8 @@ class Proof:
     def row_ramp(self) -> None:
         """Relay b runs at 0.03 CPU from fleet on: the ramp's rising load
         reaches its limit and breaks it after at least one held step, by one
-        of the loop's named relay-break classes (the ack test, rejects, an
-        unanswered send or a shed), whichever comes first."""
+        of the loop's named relay-break classes (the ack test, rejects or a
+        relay failure total: BREAK_CLASSES), whichever comes first."""
         row = "ramp"
         root, cfg = self.config(row, ["a", "b"], ramp={"max": 30, "start": 6}, fleet_cpus={"b": "0.03"})
         argv = self.clock_argv(root, cfg, ["a", "b"], ["--ramp", str(PROOF / "profiles/proof-ramp.toml"), "--ramp-start", "6",
@@ -422,13 +425,37 @@ def hook_log(root: Path) -> list[dict[str, Any]]:
         return []
 
 
-# The loop's named relay-break classes a ramp row accepts (remote_sampler.py
-# writes the reasons): anything else, a void or an unknown reason, fails it.
+# What each field of a loop's break reason may be. A reason with any other
+# field stops the proof at import, until it has its pattern here.
+BREAK_FIELDS = {
+    "n": r"\d+",
+    "within": r"\d+",
+    "acks": r"\d+",
+    "pct": r"\d+\.\d",
+    "band": "(?:" + "|".join(remote_sampler.MEASURED_BANDS) + "|" + remote_sampler.RAMP_STEP.pattern + ")",
+    "ms": re.escape(remote_sampler.SLO_ACK_MS),
+    "share": re.escape(f"{remote_sampler.SLO_ACK_SHARE:g}"),
+}
+
+
+def reason_pattern(fmt: str) -> re.Pattern[str]:
+    """A loop break reason's format string as a pattern: its text exactly,
+    each field only what the loop fills it with."""
+    parts = []
+    for text, name, _spec, _conv in string.Formatter().parse(fmt):
+        parts.append(re.escape(text))
+        if name is not None:
+            parts.append(BREAK_FIELDS[name])
+    return re.compile("".join(parts))
+
+
+# The loop's named relay-break classes a ramp row accepts, read from the loop
+# itself (remote_sampler.py writes the reasons): every relay failure total,
+# rejects and the ack test. Anything else, a void or an unknown reason, fails.
 BREAK_CLASSES = (
-    ("rejects", re.compile(r"the relay rejected \d+ events")),
-    ("unanswered", re.compile(r"the relay didn't answer \d+ sends")),
-    ("shed", re.compile(r"the relay shed \d+ sends: full, or unable to reach its admission store")),
-    ("ack test", re.compile(r"ramp-\d{3}: \d+ of \d+ acks within 500 ms \(\d+\.\d%\), under 95%")),
+    *((k, reason_pattern(why)) for k, why in remote_sampler.RELAY_FAILURE_TOTALS.items()),
+    ("rejects", reason_pattern(remote_sampler.REJECTS_BREAK)),
+    ("ack test", reason_pattern(remote_sampler.ACK_TEST_BREAK)),
 )
 
 

@@ -130,6 +130,11 @@ RELAY_FAILURE_TOTALS = {
     # not a quota. The per-key quota is apart, in rate_limited.
     "relay_shed": "the relay shed {n} sends: full, or unable to reach its admission store",
 }
+# The relay rejecting events, and a band or ramp step failing the service
+# level's ack test: relay breaks too. clock_proof.py builds the breaks its
+# ramp row accepts from these two and RELAY_FAILURE_TOTALS.
+REJECTS_BREAK = "the relay rejected {n} events"
+ACK_TEST_BREAK = "{band}: {within} of {acks} acks within {ms} ms ({pct:.1f}%), under {share:g}%"
 # tenant_sim rewrites live.json every 2 s. Older than this (five writes
 # missed), or this far ahead of the clock, the file is no longer live.
 LIVE_MAX_AGE_S = 10.0
@@ -633,7 +638,7 @@ class Monitor:
                 out.append(Limit(f"{who} reported its own errors: " + ", ".join(f"{k} +{v}" for k, v in sorted(rose.items())),
                                  "generator", t, waits, after_break=True))
             if live["rejected"] > last["rejected"]:
-                self.relay_break(t, f"the relay rejected {live['rejected'] - last['rejected']} events", role)
+                self.relay_break(t, REJECTS_BREAK.format(n=live["rejected"] - last["rejected"]), role)
             for k, why in RELAY_FAILURE_TOTALS.items():
                 if live[k] > last[k]:
                     self.relay_break(t, why.format(n=live[k] - last[k]), role)
@@ -674,8 +679,8 @@ class Monitor:
             out[f"share_within_{SLO_ACK_MS}ms_pct"] = round(100.0 * within / acks, 3)
         out.update(poll_band(live0["poll_ms_le"], live1["poll_ms_le"]))
         if acks >= SLO_MIN_ACKS and within * 100.0 < SLO_ACK_SHARE * acks:
-            self.relay_break(t, f"{band}: {within} of {acks} acks within {SLO_ACK_MS} ms "
-                                f"({100.0 * within / acks:.1f}%), under {SLO_ACK_SHARE:g}%", role, band=band)
+            self.relay_break(t, ACK_TEST_BREAK.format(band=band, within=within, acks=acks, ms=SLO_ACK_MS,
+                                                      pct=100.0 * within / acks, share=SLO_ACK_SHARE), role, band=band)
         elif acks < SLO_MIN_ACKS:
             out["ack_test"] = f"not judged: {acks} acks, fewer than {SLO_MIN_ACKS}"
         return out
