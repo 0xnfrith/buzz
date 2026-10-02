@@ -3,8 +3,8 @@
 clock-proof.sh, build-linux.sh and testdata/remote_sampler/capture.sh run
 themselves again once under `env -i` with PATH, HOME, TMPDIR, LC_ALL=C, a
 marker that says it has, and the optional names each keeps when the caller
-set them (the Docker selectors, the Cargo ones, PYTHON for the proof). They
-unset the marker first, so no child sees it.
+set them (the Docker selectors, the Cargo ones, PYTHON and XDG_CACHE_HOME for
+the proof). They unset the marker first, so no child sees it.
 
 Planted-variable rows: the parent holds G613_PLANTED, the caller's
 credentials, a proxy, a Cargo target folder and an agent socket, all dummies
@@ -14,7 +14,8 @@ started with (a `match` or `other` beside a name whose value is checked,
 never a value) and fail, so the script stops early, with an exit code each
 row asserts. The names must equal the script's set exactly, plus exactly
 what bash adds to a child (BASH_ADDS, which a row of its own pins). Each
-optional name runs set and unset. Perl adds no variable of its own; these
+optional name runs set and unset; build-linux.sh and capture.sh, which take
+no lock, also run with XDG_CACHE_HOME planted and must not carry it. Perl adds no variable of its own; these
 rows fail, never skip, without /usr/bin/perl.
 """
 
@@ -60,9 +61,11 @@ class Rows(unittest.TestCase):
         for d in (self.bin, self.home, self.tmp):
             d.mkdir()
         self.path = f"{self.bin}:/usr/bin:/bin"
-        # A dummy for each optional name, made now. PYTHON is a stub's path.
+        # A dummy for each optional name, made now. PYTHON is a stub's path,
+        # XDG_CACHE_HOME an absolute folder.
         self.chosen_values = {n: secrets.token_hex(8) for n in (*DOCKER, *CARGO)}
         self.chosen_values["PYTHON"] = str(self.bin / "python-stub")
+        self.chosen_values["XDG_CACHE_HOME"] = str(self.dir / "cache")
 
     def named(self, chosen: tuple[str, ...]) -> dict[str, str]:
         """The parent's named values: a stub folder first on PATH, a home, a
@@ -91,8 +94,11 @@ class Rows(unittest.TestCase):
         return {f"{k}={'other' if k in other else 'match'}" for k in fixed} | plain
 
     def run_script(self, script: Path, args: tuple[str, ...], chosen: tuple[str, ...], *,
-                   unset_tmp: bool = False) -> subprocess.CompletedProcess:
-        env = test_env(**self.named(chosen))
+                   unset_tmp: bool = False, plant: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
+        """Run `script`; the parent holds the planted names, the optional
+        names in `chosen` (which the script keeps) and those in `plant`
+        (which it must not)."""
+        env = test_env(**{**self.named(chosen), **{n: self.chosen_values[n] for n in plant}})
         if unset_tmp:
             env.pop("TMPDIR")
         return subprocess.run([str(script), *args], env=env, cwd=self.dir, capture_output=True, text=True,
@@ -130,9 +136,9 @@ class BashAdds(Rows):
 class ClockProofRows(Rows):
     def test_cargo_and_python(self) -> None:
         """Both cargo builds and then the interpreter (python3, or PYTHON when
-        set) get the script's set; the script execs the interpreter, so its
-        exit is the stub's, 7."""
-        for chosen in self.variants(("PYTHON", *DOCKER, *CARGO)):
+        set) get the script's set (XDG_CACHE_HOME among its optional names);
+        the script execs the interpreter, so its exit is the stub's, 7."""
+        for chosen in self.variants(("PYTHON", "XDG_CACHE_HOME", *DOCKER, *CARGO)):
             for unset_tmp in (False, True):
                 if unset_tmp and chosen:
                     continue
@@ -175,7 +181,7 @@ class BuildLinuxRows(Rows):
                 fixed = self.fixed(chosen)
                 self.stub("python3", fixed, code=1)
                 self.stub("docker", {})
-                p = self.run_script(BUILD, (), chosen)
+                p = self.run_script(BUILD, (), chosen, plant=("XDG_CACHE_HOME",))
                 self.assertEqual(p.returncode, 2, p.stderr[-300:])
                 self.assertEqual(self.lines("python3"), [self.line(fixed, plain=BASH_ADDS)])
                 self.assertEqual(self.lines("docker"), [])
@@ -195,7 +201,7 @@ class BuildLinuxRows(Rows):
                 docker = {**{k: v for k, v in fixed.items() if k != "DOCKER_CONTEXT"},
                           "DOCKER_HOST": self.chosen_values["DOCKER_HOST"]}
                 self.stub("docker", docker, code=1)
-                p = self.run_script(BUILD, (), chosen)
+                p = self.run_script(BUILD, (), chosen, plant=("XDG_CACHE_HOME",))
                 self.assertEqual(p.returncode, 1, p.stderr[-300:])
                 self.assertEqual(self.lines("python3"), [self.line(fixed, plain=BASH_ADDS)])
                 want = self.line(docker, plain=BASH_ADDS, other={"DOCKER_HOST"})
@@ -212,7 +218,7 @@ class CaptureRows(Rows):
                 (self.dir / "docker.names").unlink(missing_ok=True)
                 fixed = self.fixed(chosen)
                 self.stub("docker", fixed, code=1)
-                p = self.run_script(CAPTURE, ("image-one", "image-two"), chosen)
+                p = self.run_script(CAPTURE, ("image-one", "image-two"), chosen, plant=("XDG_CACHE_HOME",))
                 self.assertEqual(p.returncode, 1, p.stderr[-300:])
                 self.assertEqual(self.lines("docker"), [self.line(fixed, plain=BASH_ADDS)] * 6)
 

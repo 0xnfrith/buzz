@@ -15,10 +15,13 @@ set -euo pipefail
 # anything they start. PYTHON picks the interpreter below. The DOCKER_* names
 # select the daemon the proof checks and drives; CARGO_HOME, RUSTUP_HOME and
 # RUSTUP_TOOLCHAIN select the registry and the toolchain. Dropping one would
-# silently switch to another.
+# silently switch to another. XDG_CACHE_HOME picks the folder of the lock a
+# Compose project is held under: the proof's clock and hook are Python
+# children that start tenant_cogs.py, and a different folder from a shell
+# start's would let two starts of one project both run.
 if [[ -z "${HARNESS_ENV_FIXED:-}" ]]; then
   fixed=(LC_ALL=C HARNESS_ENV_FIXED=1)
-  for name in PATH HOME TMPDIR PYTHON DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN; do
+  for name in PATH HOME TMPDIR PYTHON XDG_CACHE_HOME DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN; do
     [[ -z "${!name+x}" ]] || fixed+=("$name=${!name}")
   done
   exec /usr/bin/env -i "${fixed[@]}" /bin/bash "$0" "$@"

@@ -141,13 +141,21 @@ own children and the three scripts get fixed sets too (below).
 | `git` (and the credential helper it runs) | `tenant_sim` | `PATH`, `HOME=/nonexistent`, `LC_ALL=C`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, the identity's own `NOSTR_PRIVATE_KEY`, and for an agent its own `BUZZ_AUTH_TAG`. `HOME` points at nothing, so no `.gitconfig`, `.netrc` or git config folder can reach git or its curl |
 | `kill`, `mkfifo` | `tenant_sim` | `PATH` |
 | `docker`, `docker compose` | `run`, `seed-bench`, `sample`, `fingerprint`, the proof and its hook | `PATH`, `HOME` (the CLI finds its plugins there), `DOCKER_HOST` set to the checked endpoint, and the stack's named values (`BUZZ_IMAGE`, `SIM_*`, `PROOF_*`). The three rate limits only when raised for setup |
-| a Python child: the proof's clock, the hook's `end`, the hook's supervisor, the sampler loop | the proof, the hook | `PATH`, `HOME`, `LC_ALL=C`, `PYTHONDONTWRITEBYTECODE=1` |
+| a Python child: the proof's clock, the hook's `end`, the hook's supervisor, the sampler loop | the proof, the hook | `PATH`, `HOME`, `XDG_CACHE_HOME` (only when set, as it is), `LC_ALL=C`, `PYTHONDONTWRITEBYTECODE=1` |
 | `sysctl`, `sw_vers`, `git rev-parse`, `openssl` | `run()` | `PATH`, `HOME`, `LC_ALL=C` and the command's own named values |
 | `ssh` | the sampler loop | `PATH=/usr/bin:/bin`, `HOME`, `LC_ALL=C` (`remote_sampler.ssh_env`) |
 | a child a Python test starts | `perf/test_*.py` | `planted_env.test_env`: `PATH`, `HOME`, `TMPDIR` (each only when the test process has it), `LC_ALL=C`, then the values the test names (a proxy variable, a hostile `DOCKER_HOST`) |
 | a child a Rust test starts | `crates/buzz-test-client/src` tests | `testsrv::test_command`: `env_clear`, then the same four; a row adds the values it names with `.env` after it (the child marker, a planted dummy, its own `PATH`) |
 | what a script starts: `cargo`, `python3`, `docker`, and what they start | `perf/clock-proof.sh`, `perf/build-linux.sh`, `perf/testdata/remote_sampler/capture.sh` | the script's set, below |
 
+- **`XDG_CACHE_HOME` in a Python child.** `tenant_cogs.py` picks the folder of
+  its Compose-project lock from `XDG_CACHE_HOME` (when absolute) or `~/.cache`.
+  The hook, and what it starts, are Python children that start `tenant_cogs.py`,
+  so a Python child keeps the name: a different folder from a shell start's
+  would let two starts of one project both run. `tenant_sim`, docker and the
+  other children do not take a lock and do not carry it. A row starts
+  `tenant_cogs.py` once with `python_env()` and once as a shell would, with
+  the name set, unset and relative: both must print the same lock folder.
 - **The clock's hook.** The clock (`band_clock.py`) runs the hook with its
   own environment, so the clock gets its fixed set where it starts, and the
   hook gets the same. On macOS, Python adds `__CF_USER_TEXT_ENCODING`
@@ -167,10 +175,15 @@ own children and the three scripts get fixed sets too (below).
     the one that runs cargo on the host; `build-linux.sh` runs cargo inside
     the container, with the values its `docker run` names): the registry and
     the toolchain that build the binaries;
-  - `PYTHON` (`clock-proof.sh` only): the interpreter that runs the proof.
+  - `PYTHON` (`clock-proof.sh` only): the interpreter that runs the proof;
+  - `XDG_CACHE_HOME` (`clock-proof.sh` only): the folder of the lock a Compose
+    project is held under. The proof's clock and hook are Python children that
+    start `tenant_cogs.py` (see above); if the script dropped the name,
+    `python_env` would never see it. `build-linux.sh` and `capture.sh` take no
+    lock and do not keep it.
 
-  Everything else of the caller's is dropped, a proxy, `CARGO_TARGET_DIR`,
-  `RUSTFLAGS` or `XDG_CACHE_HOME` included. The script then runs under
+  Everything else of the caller's is dropped, a proxy, `CARGO_TARGET_DIR` or
+  `RUSTFLAGS` included. The script then runs under
   `/bin/bash` (3.2 on macOS), not the first `bash` on `PATH`. A marker
   already in the caller's environment skips the re-run, so it is not a guard
   against a caller who sets it. Bash adds `PWD`, `SHLVL` and `_` to each

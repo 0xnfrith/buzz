@@ -39,7 +39,7 @@ import clock_proof  # noqa: E402
 import clock_proof_hook as hook  # noqa: E402
 import tenant_cogs  # noqa: E402
 import planted_env  # noqa: E402
-from planted_env import PLANTED, parent_env, write_stub  # noqa: E402
+from planted_env import PLANTED, parent_env, test_env, write_stub  # noqa: E402
 
 LIMITS = tenant_cogs.RATE_LIMIT_VARS
 CHECKED = "unix:///checked/docker.sock"
@@ -52,7 +52,11 @@ DOCKER = {"DOCKER_HOST=match", "HOME", "PATH"}
 
 class Planted(unittest.TestCase):
     """A temporary folder with a stub folder, a home and the names file, and
-    os.environ patched to the planted parent for the whole test."""
+    os.environ patched to the planted parent for the whole test. A subclass
+    that sets XDG also plants XDG_CACHE_HOME (an absolute dummy folder): a
+    Python child must carry it, with the right value, and no other child."""
+
+    XDG = False
 
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="child-env-"))
@@ -63,6 +67,8 @@ class Planted(unittest.TestCase):
         self.planted = {k: secrets.token_hex(16) for k in
                         (PLANTED, "BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "NOSTR_PRIVATE_KEY",
                          "DOCKER_HOST", "DOCKER_CONTEXT", *LIMITS)}
+        if self.XDG:
+            self.planted["XDG_CACHE_HOME"] = str(self.dir / "cache")
         parent = {"PATH": f"{self.bin}:{os.environ.get('PATH', '')}", "HOME": str(self.home), **self.planted}
         patch = mock.patch.dict(os.environ, parent, clear=True)
         patch.start()
@@ -70,6 +76,16 @@ class Planted(unittest.TestCase):
 
     def stub(self, name: str, checks: dict[str, str] | None = None, **kw) -> Path:
         return write_stub(self.bin / name, self.out, checks, **kw)
+
+    def python_stub(self, name: str, **kw) -> Path:
+        """A stub for a Python child: when XDG_CACHE_HOME is planted it must
+        be there, with the planted value."""
+        return self.stub(name, {"XDG_CACHE_HOME": self.planted["XDG_CACHE_HOME"]} if self.XDG else None, **kw)
+
+    @property
+    def python(self) -> set[str]:
+        """A Python child's names, as its stub records them."""
+        return PYTHON | ({"XDG_CACHE_HOME=match"} if self.XDG else set())
 
     def lines(self) -> list[set[str]]:
         if not self.out.exists():
@@ -135,18 +151,18 @@ class HookRows(Planted):
     def test_supervisor_and_tenant_sim(self) -> None:
         """The supervisor a Python child's set; tenant_sim under it its own."""
         cfg = self.cfg()
-        cfg["python"] = str(self.stub("python", exec_=sys.executable))
+        cfg["python"] = str(self.python_stub("python", exec_=sys.executable))
         self.stub("tenant_sim")
         out = self.dir / "gen"
         hook.spawn(cfg, out, "tenant_sim", [cfg["tenant_sim"]])
-        self.assertEqual(self.wait_lines(2), [PYTHON, TENANT_SIM])
+        self.assertEqual(self.wait_lines(2), [self.python, TENANT_SIM])
 
     def test_supervisor_and_sampler(self) -> None:
         """The sampler loop under the supervisor: a Python child's set."""
         cfg = self.cfg()
-        sampler = self.stub("sampler")
+        sampler = self.python_stub("sampler")
         hook.spawn(cfg, self.dir / "sampler", "python", [str(sampler)])
-        self.assertEqual(self.wait_lines(1), [PYTHON])
+        self.assertEqual(self.wait_lines(1), [self.python])
 
     def test_compose(self) -> None:
         """The hook's compose: PATH, HOME, the proof's checked socket and the
@@ -182,17 +198,17 @@ class ProofRows(Planted):
     def test_hook_end(self) -> None:
         """The hook's `end`, from the proof: a Python child's set."""
         proof = self.proof()
-        proof.python = str(self.stub("python"))
+        proof.python = str(self.python_stub("python"))
         proof.run(*proof.hook(self.dir / "config.json"), "end")
-        self.assertEqual(self.lines(), [PYTHON])
+        self.assertEqual(self.lines(), [self.python])
 
     def test_clock(self) -> None:
         """The clock the proof starts: a Python child's set."""
         root = self.dir / "row"
         root.mkdir()
-        p = self.proof().start_clock(root, [str(self.stub("clock"))])
+        p = self.proof().start_clock(root, [str(self.python_stub("clock"))])
         self.assertEqual(p.wait(timeout=30), 0)
-        self.assertEqual(self.lines(), [PYTHON])
+        self.assertEqual(self.lines(), [self.python])
 
     def test_the_clock_hands_its_set_to_the_hook(self) -> None:
         """The chain: the real start_clock runs the real `tenant_cogs.py
@@ -207,10 +223,10 @@ class ProofRows(Planted):
         proof = self.proof()
         argv = proof.clock_argv(root, self.dir / "config.json", ["a"],
                                 ["--profile", str(clock_proof.PROOF / "profiles/proof-solo.toml")])
-        argv = [*argv[:argv.index("--") + 1], str(self.stub("hook", code=1))]
+        argv = [*argv[:argv.index("--") + 1], str(self.python_stub("hook", code=1))]
         p = proof.start_clock(root, argv)
         self.assertEqual(p.wait(timeout=60), clock_proof_exit_hook(), (root / "clock.out").read_text()[-400:])
-        want = PYTHON | ({"__CF_USER_TEXT_ENCODING"} if platform.system() == "Darwin" else set())
+        want = self.python | ({"__CF_USER_TEXT_ENCODING"} if platform.system() == "Darwin" else set())
         self.assertEqual(self.lines()[0], want)
 
     def test_refuses_a_remote_docker(self) -> None:
@@ -233,6 +249,58 @@ class ProofRows(Planted):
                          "only a local Unix socket is allowed. Nothing was changed.\n")
         preflight.assert_not_called()
         self.assertEqual(self.lines(), [])
+
+
+class HookRowsXdg(HookRows):
+    """The same rows with XDG_CACHE_HOME planted in the parent: a Python
+    child carries it (the supervisor, the sampler loop), tenant_sim and
+    docker do not. Without it planted, the rows above show it absent."""
+
+    XDG = True
+
+
+class ProofRowsXdg(ProofRows):
+    """The same rows with XDG_CACHE_HOME planted: the proof's clock, the
+    hook's `end` and the hook the clock starts carry it; docker does not."""
+
+    XDG = True
+
+
+class OneLockFolder(unittest.TestCase):
+    """The lock is per Compose project, in a folder `default_lock_dir` picks
+    from XDG_CACHE_HOME (when absolute) and HOME. A tenant_cogs.py the hook
+    starts (its parent's `python_env`) and one started from a shell must pick
+    the same folder, or two starts of one project would both run."""
+
+    SHOW = "import tenant_cogs; print(tenant_cogs.LOCK_DIR)"
+
+    def folder(self, **named: str) -> str:
+        """The lock folder a fresh tenant_cogs.py picks, started with `named`."""
+        p = subprocess.run([sys.executable, "-c", self.SHOW], env=test_env(**named), cwd=PERF,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        return p.stdout.strip()
+
+    def test_a_hook_start_and_a_shell_start_pick_the_same_folder(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lock-folder-") as td:
+            home, cache = Path(td) / "home", Path(td) / "cache"
+            home.mkdir()
+            cache.mkdir()
+            by_home = str(home / ".cache" / "buzz-harness" / "locks")
+            cases = {
+                "an absolute XDG_CACHE_HOME": (str(cache), str(cache / "buzz-harness" / "locks")),
+                "XDG_CACHE_HOME unset": (None, by_home),
+                "a relative XDG_CACHE_HOME, which both ignore": ("relative/cache", by_home),
+            }
+            for what, (xdg, want) in cases.items():
+                with self.subTest(what=what):
+                    named = {"HOME": str(home), **({"XDG_CACHE_HOME": xdg} if xdg is not None else {})}
+                    with mock.patch.dict(os.environ, parent_env(**named), clear=True):
+                        # The hook start: what python_env gives a Python child
+                        # of this parent, whatever else the parent holds.
+                        hook_start = tenant_cogs.python_env()
+                    got = (self.folder(**hook_start), self.folder(**named))
+                    self.assertEqual(got, (want, want))
 
 
 def clock_proof_exit_hook() -> int:
