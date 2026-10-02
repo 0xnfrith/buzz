@@ -764,6 +764,13 @@ impl Session {
                         })
                         .await?;
                     }
+                    Err(e) if e.at == crate::sim::stats::MediaFailure::LocalExhausted => {
+                        warn!(
+                            "{} media failed on the generator's side: {e}",
+                            self.rec.name
+                        );
+                        self.stats.record_local_exhausted();
+                    }
                     Err(e) => {
                         warn!("{} media ({:?}): {e}", self.rec.name, e.at);
                         self.stats.record_media_failed(e.at);
@@ -832,6 +839,13 @@ impl Session {
                     .stats
                     .record_read(band.sampled().then(|| band.as_str()), r.what, ms),
                 Err(reads::ReadError::RateLimited) => self.stats.record_read_rate_limited(),
+                Err(reads::ReadError::LocalExhausted(why)) => {
+                    warn!(
+                        "{} read {} failed on the generator's side: {why}",
+                        self.rec.name, r.what
+                    );
+                    self.stats.record_local_exhausted();
+                }
                 Err(reads::ReadError::UnknownLimit(text)) => {
                     warn!(
                         "{} read {} got an unknown limit: {text}",

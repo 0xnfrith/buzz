@@ -206,6 +206,8 @@ class Proof:
                             f"reads {reads.get('reads')}, failed {reads.get('failed')}")
             ok &= self.eq(row, f"HARD: {g}'s relay refused or dropped no read", fails,
                           {"read_refused": 0, "read_unanswered": 0, "read_client_failed": 0})
+            self.eq(row, f"{g}'s tenant_sim ran under the units' open-file limit",
+                    read_text(out / g / "nofile"), "16384")
             # The humans' home-feed polls go through the same read counters:
             # those were none refused, none unanswered, and they ran.
             ok &= self.check(row, f"HARD: {g}'s humans polled their home feed", (live.get("polls") or 0) > 0,

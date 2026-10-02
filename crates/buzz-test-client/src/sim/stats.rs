@@ -187,6 +187,8 @@ struct Inner {
     limit_unknown: BTreeMap<String, u64>,
     /// Identities whose task ended on its own, by name: why.
     identities_ended: BTreeMap<String, String>,
+    /// Connects that failed on the generator's side: out of files or ports.
+    local_exhausted: u64,
     /// Home-feed polls, in any band, by time: one count per bound in
     /// POLL_MS_BOUNDS and one past the last.
     polls: u64,
@@ -224,6 +226,9 @@ pub enum MediaFailure {
     Refused,
     /// No answer: a transport error or a timeout.
     Unanswered,
+    /// The generator ran out of its own files or ports on connect: its own
+    /// fault, counted in `local_exhausted`, not here.
+    LocalExhausted,
 }
 
 /// Where an agent's read failed. Only `Client` is the generator's own
@@ -296,6 +301,10 @@ pub struct Live {
     /// Identities whose task ended on its own, not on a stop or a lease,
     /// by name: why. Any voids the run: a lost identity under-loads it.
     pub identities_ended: BTreeMap<String, String>,
+    /// Connects that failed on the generator's own side (out of open files,
+    /// local ports or socket buffers: EMFILE and its kin): never the relay's.
+    /// Any voids the run.
+    pub local_exhausted: u64,
     /// Humans' home-feed polls, in any band, and their times, cumulative
     /// like `ack_ms_le`: `"1000": n` is every poll done within 1 s. A
     /// poll's failed queries are in the read failures.
@@ -569,6 +578,11 @@ impl Stats {
         self.with(|s| *s.read_failed_by.entry(why).or_default() += 1);
     }
 
+    /// A connect that failed on the generator's own side.
+    pub fn record_local_exhausted(&self) {
+        self.with(|s| s.local_exhausted += 1);
+    }
+
     pub fn record_read_rate_limited(&self) {
         self.with(|s| s.reads_rate_limited += 1);
     }
@@ -664,6 +678,7 @@ impl Stats {
                 relay_shed: s.relay_shed,
                 limit_unknown: s.limit_unknown.clone(),
                 identities_ended: s.identities_ended.clone(),
+                local_exhausted: s.local_exhausted,
                 polls: s.polls,
                 poll_ms_le: cumulative(&s.poll_ms_buckets, &POLL_MS_BOUNDS),
                 ack_ms_le: {
@@ -817,6 +832,7 @@ mod tests {
             "relay_shed",
             "limit_unknown",
             "identities_ended",
+            "local_exhausted",
             "polls",
             "poll_ms_le",
             "ack_ms_le",

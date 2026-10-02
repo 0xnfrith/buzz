@@ -426,6 +426,42 @@ pub fn http_client(timeout: Duration) -> Result<HttpClient> {
     })
 }
 
+/// The OS errors that mean the generator itself ran out of something: its
+/// open files (EMFILE, ENFILE), its local ports (EADDRNOTAVAIL), its socket
+/// buffers (ENOBUFS). A connect that fails on one of these never reached
+/// the relay: it is the generator's own fault, never the relay's.
+#[cfg(target_os = "linux")]
+const LOCAL_EXHAUSTION: [i32; 4] = [24, 23, 99, 105];
+#[cfg(not(target_os = "linux"))]
+const LOCAL_EXHAUSTION: [i32; 4] = [24, 23, 49, 55];
+
+/// Whether `err`, or anything it was caused by, is the generator running
+/// out of files, ports or buffers ([`LOCAL_EXHAUSTION`]).
+pub fn is_local_exhaustion(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut at: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = at {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::AddrNotAvailable
+                || io
+                    .raw_os_error()
+                    .is_some_and(|c| LOCAL_EXHAUSTION.contains(&c))
+            {
+                return true;
+            }
+        }
+        at = e.source();
+    }
+    false
+}
+
+/// [`is_local_exhaustion`] on an error already written out as text (a
+/// connect error that was formatted on its way up): its `(os error N)`.
+pub fn text_is_local_exhaustion(text: &str) -> bool {
+    LOCAL_EXHAUSTION
+        .iter()
+        .any(|c| text.contains(&format!("(os error {c})")))
+}
+
 /// Loopback servers and a child-process runner shared by the guard tests
 /// here and in `git.rs` / `media.rs`.
 #[cfg(test)]
@@ -536,6 +572,33 @@ pub(crate) mod testsrv {
             cmd.env(k, v);
         }
         let out = cmd.output().expect("run child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(&format!("CHILD_OK {test}")),
+            "child {test} failed: {}\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// [`run_child`] with the child's open-file soft limit at `nofile`
+    /// (`ulimit -n` in a shell that then execs it): a child can run out of
+    /// files without starving this process or its other tests.
+    pub fn run_child_with_nofile(test: &str, nofile: u32) {
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("ulimit -n {nofile} && exec \"$0\" \"$@\""),
+                &exe.to_string_lossy(),
+                test,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_VAR, test)
+            .output()
+            .expect("run child test");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains(&format!("CHILD_OK {test}")),
@@ -782,5 +845,45 @@ mod tests {
         let proxy = Server::start("127.0.0.1:0", testsrv::status(502, "{}"));
         testsrv::run_child(PROXY_CHILD, &testsrv::proxy_env(&proxy.http()));
         assert_eq!(proxy.accepts(), 0, "the proxy was used");
+    }
+
+    /// A connect error caused by the generator running out of files, ports
+    /// or buffers is its own; any other connect error is not. Found through
+    /// the error's causes, as reqwest wraps it, and in an error's text.
+    #[test]
+    fn local_exhaustion_is_told_apart() {
+        #[derive(Debug)]
+        struct Wrapped(std::io::Error);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "tcp connect error")
+            }
+        }
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let emfile = std::io::Error::from_raw_os_error(24);
+        let enfile = std::io::Error::from_raw_os_error(23);
+        let ports = std::io::Error::from(std::io::ErrorKind::AddrNotAvailable);
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        for (name, e, want) in [
+            ("EMFILE", Wrapped(emfile), true),
+            ("ENFILE", Wrapped(enfile), true),
+            ("no local port", Wrapped(ports), true),
+            ("refused", Wrapped(refused), false),
+        ] {
+            assert_eq!(is_local_exhaustion(&e), want, "{name}");
+        }
+        assert!(text_is_local_exhaustion(
+            "h7 connect: IO error: Too many open files (os error 24)"
+        ));
+        assert!(!text_is_local_exhaustion(
+            "h7 connect: IO error: Connection refused (os error 61)"
+        ));
+        assert!(!text_is_local_exhaustion(
+            "h7 connect: IO error: Connection refused (os error 111)"
+        ));
     }
 }

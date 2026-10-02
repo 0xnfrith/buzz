@@ -123,6 +123,9 @@ pub enum ReadError {
     RateLimited,
     /// A `rate-limited:` text the pinned relay doesn't send: the run voids.
     UnknownLimit(String),
+    /// The generator ran out of its own files, ports or buffers on connect
+    /// ([`super::guard::is_local_exhaustion`]): its own fault, the run voids.
+    LocalExhausted(String),
 }
 
 /// `Authorization: Nostr <base64 event>`, NIP-98 for `POST url` with
@@ -197,6 +200,9 @@ pub async fn query(
     let resp = match req.body(body).send().await {
         Ok(resp) => resp,
         Err(e) if e.is_builder() => return Err(client(anyhow!("{} request: {e}", r.what))),
+        Err(e) if super::guard::is_local_exhaustion(&e) => {
+            return Err(ReadError::LocalExhausted(format!("{}: {e:?}", r.what)))
+        }
         Err(e) => {
             return Err(ReadError::Failed {
                 at: ReadFailure::Unanswered,
@@ -385,6 +391,54 @@ mod tests {
             Err(ReadError::UnknownLimit(text)) => assert_eq!(text, "rate-limited: slow down"),
             other => panic!("{other:?}"),
         }
+    }
+
+    const OUT_OF_FILES_CHILD: &str =
+        "sim::reads::tests::a_read_or_upload_out_of_files_is_the_generators_own";
+
+    /// The generator out of open files: a read (a poll's query is one) and
+    /// a media upload each fail on its own side, never reaching the relay,
+    /// and come back as its own fault, not as the relay not answering. Run
+    /// in a child test process whose file limit is low, so nothing else
+    /// here runs out.
+    #[test]
+    fn a_read_or_upload_out_of_files_is_the_generators_own() {
+        if testsrv::is_child(OUT_OF_FILES_CHILD) {
+            let server = Server::start("127.0.0.1:0", testsrv::status(200, "[]"));
+            let base = target(&server.http());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            let http = http_client(Duration::from_secs(5)).expect("client");
+            let keys = Keys::generate();
+            // Take every file this process may still open.
+            let mut held = Vec::new();
+            while let Ok(f) = std::fs::File::open("/dev/null") {
+                held.push(f);
+            }
+            let read = rt.block_on(read(&http, &base, &keys, None, &history()));
+            let upload = rt.block_on(crate::sim::media::upload(
+                &http,
+                &base,
+                &keys,
+                vec![1, 2, 3],
+                None,
+            ));
+            drop(held);
+            assert!(
+                matches!(read, Err(ReadError::LocalExhausted(_))),
+                "{read:?}"
+            );
+            assert_eq!(
+                upload.map(|_| ()).expect_err("no upload").at,
+                crate::sim::stats::MediaFailure::LocalExhausted
+            );
+            assert_eq!(server.accepts(), 0, "a connection reached the server");
+            println!("CHILD_OK {OUT_OF_FILES_CHILD}");
+            return;
+        }
+        testsrv::run_child_with_nofile(OUT_OF_FILES_CHILD, 128);
     }
 
     /// The header verifies with the relay's own NIP-98 check, for the URL

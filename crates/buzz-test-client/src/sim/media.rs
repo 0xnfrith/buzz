@@ -267,6 +267,13 @@ pub async fn upload(
                 }
                 break;
             }
+            Err(e) if super::guard::is_local_exhaustion(&e) => {
+                last = UploadError {
+                    at: MediaFailure::LocalExhausted,
+                    err: anyhow!("media upload: {e:?}"),
+                };
+                break;
+            }
             Err(e) => {
                 last = UploadError {
                     at: MediaFailure::Unanswered,

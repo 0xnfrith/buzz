@@ -20,6 +20,7 @@
  "identities_ended": {},
  "joined": 18,
  "limit_unknown": {},
+ "local_exhausted": 0,
  "lost": 0,
  "media_client_failed": 0,
  "media_refused": 0,
@@ -48,5 +49,5 @@
  "relay_shed": 0,
  "send_unanswered": 0,
  "sent": 21,
- "t_unix": 1790898924
+ "t_unix": 1790904447
 }

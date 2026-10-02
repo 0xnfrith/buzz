@@ -84,7 +84,7 @@ GEN_ERROR_KINDS = ("send_failed", "recv_error", "reconnect_failed", "backfill_fa
 LIVE_TOTALS = ("sent", "accepted", "rejected", "rate_limited", "media_client_failed", "media_refused",
                "media_unanswered", "git_local_failed", "git_push_failed",
                "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-               "relay_shed", "polls", "lost", "joined")
+               "relay_shed", "polls", "local_exhausted", "lost", "joined")
 # Two maps the loop reads besides: `rate-limited:` texts the pinned relay
 # doesn't send, by text, and identities whose task ended on its own, by
 # name. Either one voids the run.
@@ -610,6 +610,13 @@ class Monitor:
             out.append(Limit(f"{who} got a limit the pinned relay doesn't send: "
                              + ", ".join(f"{k!r} x{n - unknown0.get(k, 0)}" for k, n in new_texts.items())
                              + "; the relay's pin moved", "generator", t))
+        # A connect that failed on the generator's own side (out of files,
+        # ports or buffers) never reached the relay: the generator's fault,
+        # with its own line.
+        ex0 = (last or {}).get("local_exhausted", 0)
+        if live["local_exhausted"] > ex0:
+            out.append(Limit(f"{who} ran out of its own files or ports: {live['local_exhausted'] - ex0} connects "
+                             "failed on its side (EMFILE and its kin)", "generator", t, waits, after_break=True))
         ended0 = (last or {}).get("identities_ended") or {}
         new_ended = {k: why for k, why in sorted(live["identities_ended"].items()) if k not in ended0}
         if new_ended:

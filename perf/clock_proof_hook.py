@@ -34,6 +34,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import resource
 import secrets
 import signal
 import subprocess
@@ -50,6 +51,10 @@ RATE_LIMIT_VARS = (
 )
 SETUP_RATE_LIMIT = "1000000"
 FIFO_WAIT_S = 5.0
+# tenant_sim's soft open-file limit, as the generator units set it
+# (LimitNOFILE=16384): the proof runs under the box's headroom, not this
+# shell's.
+GEN_NOFILE = 16384
 READY_TIMEOUT_S = 300.0
 
 
@@ -102,8 +107,15 @@ def write_private(path: Path, text: str) -> None:
 def supervise(out: Path, argv: list[str]) -> int:
     """Runs argv, its pid in <out>/pid, its exit in <out>/exit (a signal as
     its negative number). Started detached by `spawn`."""
+    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft = GEN_NOFILE if hard == resource.RLIM_INFINITY else min(GEN_NOFILE, hard)
+
+    def nofile() -> None:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    (out / "nofile").write_text(f"{soft}\n")
     with (out / "stdout.log").open("ab") as so, (out / "stderr.log").open("ab") as se:
-        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=so, stderr=se, env=child_env())
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=so, stderr=se, env=child_env(),
+                             preexec_fn=nofile)
         (out / "pid").write_text(f"{p.pid}\n")
         code = p.wait()
     tmp = out / "exit.tmp"

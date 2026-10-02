@@ -636,7 +636,8 @@ python3 perf/tenant_cogs.py remote-sample \
     failed before it went out (`read_client_failed`). A missing or unreadable
     `--live-file` is a void too, never "no errors", and so is a file
     without `rejected`, `rate_limited`, `send_unanswered`, `relay_shed`,
-    `limit_unknown`, `identities_ended`, `media_client_failed`, `media_refused`,
+    `limit_unknown`, `identities_ended`, `local_exhausted`, `polls`,
+    `poll_ms_le`, `media_client_failed`, `media_refused`,
     `media_unanswered`, `git_local_failed`, `git_push_failed`,
     `read_client_failed`, `read_refused`, `read_unanswered` or
     `read_rate_limited`: a total missing is never read as 0.
@@ -647,6 +648,9 @@ python3 perf/tenant_cogs.py remote-sample \
     silently lost identity under-loads the run and over-states the
     relay's ceiling. One that never joined is a failed warm-up, or a ramp
     joiner the relay didn't take (`join_failed`, a break).
+  - **The generator out of its own files or ports:** `local_exhausted`
+    rose (a connect that failed on its side: EMFILE and its kin), a void
+    with its own line (a note after the break).
   - **A limit the pinned relay doesn't send:** a `rate-limited:` text
     other than the relay's three (below), in `limit_unknown` by text,
     voids the run at any time, naming the text: the relay's pin moved.
@@ -819,6 +823,10 @@ reaches a human's `#p` subscription from someone else, beside any poll in
 flight: the desktop's command already sent keeps running, so the relay sees
 no coalescing.
 
+**C is not bounded,** because the desktop doesn't bound it: a burst of
+mentions to one human is that many polls in flight at once. What keeps the
+generator from running out of files is its open-file headroom, below.
+
 **Poll times by mentions:** `summary.json`'s `polls` splits every poll into
 never-mentioned humans and the rest (counts, p50, p95, p99, max). A
 never-mentioned human's mentions query walks every event; a mentioned one's
@@ -829,6 +837,43 @@ of its *inactive* communities (`desktop/src/features/communities/useCommunityUnr
 `communityUnreadObserver.ts:264-270`). The population is one community per
 relay, so a human here has no inactive community and the observer sends
 nothing. A person in several communities on one box would add it.
+
+## The generator's open files
+
+A connect that fails on the generator's own side (out of open files,
+local ports or socket buffers: EMFILE, ENFILE, EADDRNOTAVAIL, ENOBUFS)
+never reached the relay. `tenant_sim` counts it in `local_exhausted`, apart
+from the relay's failures, for reads, polls, media uploads and ramp joins,
+and the loop voids the run on it with its own line. That is the safety
+net; the headroom keeps a run from reaching it.
+
+**The peak, a ramp at 660 on the team profile** (`profiles/10h-20a.toml`:
+a human and 2 agents a team, so 220 humans and 440 agents), at peak rates
+(humans x3, agents x4) for the worst case, with the mention model above:
+
+| Holder | Open at once | From |
+|---|---|---|
+| Websockets | 660 | one per identity |
+| Periodic polls | 220 | one per human, never two |
+| C polls, rank 1 (22.9% of tags) | 119 to 478 | tagged messages 17.4/s (below) x 22.9% = 3.98/s, held 30 s (one query) to 120 s (four queries that each wait 30 s) |
+| C polls, rank 4, a human (10.5%) | 55 to 219 | 1.83/s, the same |
+| C polls, the middle's 188 humans (7.9% over 565 identities) | 14 to 55 | 0.46/s, the same |
+| Agents' reads | 440 | one at a time per agent |
+| Media uploads | 35 | 2,090 an hour at peak, up to 30 s each, two paths |
+| Git pushes | 264 | 1,760 an hour at peak, up to 90 s each: about 44 `git` processes, about 6 files each |
+| The process itself | 64 | stdio, logs, the live writer, the fifo, the runtime |
+| **Total** | **1,871 to 2,435** | |
+
+Tagged messages at peak: humans (12 messages + 0.5 media) x 3 x 220 =
+8,250 an hour x 85% = 7,013; agents (40 + 1) x 4 x 440 = 72,160 an hour x
+77% = 55,563; together 62,576 an hour, 17.4 a second. Idle pooled HTTP
+connections are the same connections between requests, so they add
+nothing past the in-flight peak.
+
+- **`tenant_sim` refuses to start** below 8 per identity plus 256 (5,536 at
+  660): over twice the worst case (`check_open_files`, Linux).
+- **The generator units** set `LimitNOFILE=16384`: three times that need,
+  and the local proof's `tenant_sim` runs under the same soft limit.
 
 ## Mentions in messages
 
@@ -1027,7 +1072,7 @@ proof checks nothing is left by label.
 | Row | What it forces | What must happen |
 |---|---|---|
 | `reads` | nothing: two generators through every band | exit 0; both sent every band in order, paused after each measured one; the rules every minute and at each boundary; fleet read back no raised limit; **every agent read and every human's home-feed poll answered, none refused or dropped; the humans polled** |
-| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and the ack test breaks it on a step after at least one held; a holds to the max |
+| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and breaks it after at least one held step, by one of the loop's named relay-break classes (the ack test, rejects, unanswered or shed; a void, a generator fault or anything else fails the row), printed; a holds to the max. The ack test alone is held by the loop's own rows (`test_remote_sampler.py`) |
 | `ramp-freeze` | relay b frozen (`docker pause`) at the second step | exit 0; b broke at step 2 because its sends went unanswered (`send_unanswered`, none `send_failed`): a break, never a void; a holds to the max |
 | `ramp-starved` | relay b cut to 0.01 CPU (`docker update --cpus`) at the second step | exit 0; b broke at step 2 because it shed sends (`relay_shed`, none `limit_unknown`): a break, never counted apart; a holds to the max; the texts b got, counted |
 | `boundary` | the floor's boundary check fails | exit 4 on that line; no band after it; `end` ran |

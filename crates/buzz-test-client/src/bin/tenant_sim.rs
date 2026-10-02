@@ -377,9 +377,13 @@ fn ramp_index(role: Role, i: usize, agents_per_human: usize) -> usize {
 }
 
 /// Linux: the open-file limit must hold a ramp's sockets (a websocket, the
-/// HTTP pool, git) or joiners fail on the generator's side and look like
-/// the relay refusing them. Elsewhere there is no /proc to read; the local
-/// proofs ramp small.
+/// HTTP pool, git) or joiners fail on the generator's side. Such a failure
+/// is counted as the generator's own (`local_exhausted`) and voids the run;
+/// this check keeps a run from getting there. Elsewhere there is no /proc
+/// to read; the local proofs ramp small.
+///
+/// The need is 8 per identity plus 256: twice the worst case worked out in
+/// TENANT_COGS.md ("The generator's open files"), about 2,420 at 660.
 fn check_open_files(ramp: &Ramp) -> Result<()> {
     check_open_files_in(
         std::fs::read_to_string("/proc/self/limits").ok().as_deref(),
@@ -392,7 +396,7 @@ fn check_open_files_in(limits: Option<&str>, ramp: &Ramp) -> Result<()> {
     let Some(limits) = limits else {
         return Ok(());
     };
-    let need = ramp.max as u64 * 4 + 256;
+    let need = ramp.max as u64 * 8 + 256;
     for line in limits.lines() {
         if let Some(rest) = line.strip_prefix("Max open files") {
             let soft = rest.split_whitespace().next().unwrap_or("");
@@ -883,6 +887,13 @@ async fn run(args: Args) -> Result<i32> {
             while let Some(r) = ready_rx.recv().await {
                 match r {
                     Ok(()) => stats.record_joined(),
+                    // A joiner that couldn't connect because the generator ran
+                    // out of files or ports is the generator's fault, never
+                    // the relay refusing it.
+                    Err(e) if sim::guard::text_is_local_exhaustion(&e) => {
+                        warn!("ramp join failed on the generator's side: {e}");
+                        stats.record_local_exhausted();
+                    }
                     Err(e) => {
                         warn!("ramp join: {e}");
                         stats.record_client_error("join_failed");
@@ -1880,9 +1891,17 @@ mod tests {
         };
         assert_eq!(
             check_open_files_in(Some(&limits("1024")), &ramp).map(|_| ()).expect_err("low").to_string(),
-            "the open-file limit is 1024; a ramp to 660 identities needs at least 2896 (raise LimitNOFILE)"
+            "the open-file limit is 1024; a ramp to 660 identities needs at least 5536 (raise LimitNOFILE)"
         );
         assert!(check_open_files_in(Some(&limits("65536")), &ramp).is_ok());
+        assert!(
+            check_open_files_in(Some(&limits("4096")), &ramp).is_err(),
+            "4096 is under the need"
+        );
+        assert!(
+            check_open_files_in(Some(&limits("16384")), &ramp).is_ok(),
+            "the unit's limit"
+        );
         assert!(check_open_files_in(Some(&limits("unlimited")), &ramp).is_ok());
         assert!(
             check_open_files_in(None, &ramp).is_ok(),

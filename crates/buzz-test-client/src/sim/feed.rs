@@ -166,6 +166,11 @@ async fn one(
             stats.record_read_limit_unknown(&text);
             None
         }
+        Err(ReadError::LocalExhausted(why)) => {
+            tracing::warn!("{} failed on the generator's side: {why}", r.what);
+            stats.record_local_exhausted();
+            None
+        }
         Err(ReadError::Failed { at, err }) => {
             tracing::warn!("{} ({at:?}): {err:#}", r.what);
             stats.record_read_failed(at);

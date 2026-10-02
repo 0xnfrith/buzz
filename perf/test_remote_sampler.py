@@ -47,7 +47,7 @@ def relay_sample(t: float, h: str = H1, ws: int = 100, busy: int = 0, oom: int =
 
 TOTALS = ("sent", "accepted", "rate_limited", "media_client_failed", "media_refused", "media_unanswered", "git_local_failed",
           "git_push_failed", "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-          "relay_shed", "polls", "lost", "joined")
+          "relay_shed", "polls", "local_exhausted", "lost", "joined")
 MAPS = ("limit_unknown", "identities_ended")
 
 
@@ -780,8 +780,8 @@ class Voids(unittest.TestCase):
     LIVE_FIELDS = {"t_unix", "sent", "accepted", "rejected", "rate_limited", "received", "client_errors",
                    "media_client_failed", "media_refused", "media_unanswered", "git_local_failed", "git_push_failed",
                    "read_client_failed", "read_refused", "read_unanswered", "read_rate_limited", "send_unanswered",
-                   "relay_shed", "limit_unknown", "identities_ended", "polls", "poll_ms_le", "ack_ms_le", "lost",
-                   "joined"}
+                   "relay_shed", "limit_unknown", "identities_ended", "polls", "poll_ms_le", "local_exhausted",
+                   "ack_ms_le", "lost", "joined"}
 
     def test_the_loop_reads_what_tenant_sim_writes(self) -> None:
         """A live.json from a real tenant_sim run (testdata/live), read with
@@ -1359,6 +1359,21 @@ class Loop(unittest.TestCase):
             self.assertEqual(void["reason"], "the generator for a: an identity's task ended on its own: a7: kind 9 sign: no key, "
                                              "before the relay broke")
             self.assertEqual(void["t_unix"], 1050.0, "at the tick it was read")
+
+    def test_a_generator_out_of_files_voids_the_run(self) -> None:
+        """Connects that failed on the generator's own side (EMFILE and its
+        kin) void the run at once, with their own line: never the relay's
+        break, even when they come as reads or polls the relay "didn't
+        answer"."""
+        def write(t: int, r: str) -> dict:
+            return live_counters(t, local_exhausted=3 if r == "b" and t >= 1050 else 0)
+        with tempfile.TemporaryDirectory() as d:
+            code, _, _, seen = self.run_lives(Path(d), write, {0: "steady"}, 100.0)
+            self.assertEqual(code, 3)
+            void = json.loads((Path(d) / "samples" / "void.json").read_text())
+            self.assertEqual(void["reason"], "the generator for b ran out of its own files or ports: 3 connects failed "
+                                             "on its side (EMFILE and its kin), before the relay broke")
+            self.assertEqual(seen[-1].get("relays") or {}, {}, "a break was recorded")
 
     def test_bands_and_the_end_of_a_run(self) -> None:
         with tempfile.TemporaryDirectory() as d:
