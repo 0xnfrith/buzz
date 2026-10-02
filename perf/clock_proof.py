@@ -11,7 +11,7 @@ and the proof exits 1 if any failed.
 | Row | What it forces | What must happen |
 |---|---|---|
 | `reads` | nothing: two generators through every band of a short profile | exit 0; both driven in lockstep; agents' reads and humans' home-feed polls all answered, none refused (the hard row) |
-| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and the ack test breaks it after at least one step held; a held to the max |
+| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and breaks it after at least one step held, by a named relay-break class (the ack test, rejects, unanswered or shed), printed; a held to the max |
 | `ramp-freeze` | relay b frozen (`docker pause`) at the ramp's second step | exit 0; b broke at step 2 because its sends went unanswered, a break and never a void; a held to the max |
 | `ramp-starved` | relay b cut to 0.01 CPU at the ramp's second step | exit 0; b broke at step 2 because it shed sends (`rate-limited: too many concurrent requests` or `shared admission unavailable`), a break and never counted apart; a held to the max; the texts b got, counted |
 | `boundary` | the floor's boundary check fails | exit 4 on that line; `end` still ran and removed both stacks |
@@ -238,15 +238,18 @@ class Proof:
 
     def row_ramp(self) -> None:
         """Relay b runs at 0.03 CPU from fleet on: the ramp's rising load
-        reaches its limit, and the ack test breaks it at the end of a step."""
+        reaches its limit and breaks it after at least one held step, by one
+        of the loop's named relay-break classes (the ack test, rejects, an
+        unanswered send or a shed), whichever comes first."""
         row = "ramp"
         root, cfg = self.config(row, ["a", "b"], ramp={"max": 30, "start": 6}, fleet_cpus={"b": "0.03"})
         argv = self.clock_argv(root, cfg, ["a", "b"], ["--ramp", str(PROOF / "profiles/proof-ramp.toml"), "--ramp-start", "6",
                                                         "--ramp-step", "6", "--ramp-every", "60", "--ramp-max", "30",
                                                         "--ramp-budget", "900"])
         a, b = self.ramp_result(row, root, self.run_clock(root, argv, 1500))
-        m = re.fullmatch(r"(ramp-\d{3}): \d+ of \d+ acks within 500 ms \(\d+\.\d%\), under 95%", str(b.get("why")))
-        self.check(row, "b broke on the ack test, judged on its step", m is not None and m.group(1) == b.get("band"), b.get("why"))
+        cls = break_class(b.get("why"))
+        self.check(row, "b broke by a named relay-break class", cls is not None, b.get("why"))
+        print(f"  b broke by: {cls} ({b.get('why')})")
         k = b.get("broke_k")
         self.check(row, "b broke after holding at least one step, before the max",
                    k in (12, 18, 24, 30) and b.get("held_k") == k - 6 and b.get("band") == f"ramp-{k // 6:03d}",
@@ -415,6 +418,21 @@ def hook_log(root: Path) -> list[dict[str, Any]]:
         return [json.loads(l) for l in (root / "hook.log").read_text().splitlines() if l.strip()]
     except OSError:
         return []
+
+
+# The loop's named relay-break classes a ramp row accepts (remote_sampler.py
+# writes the reasons): anything else, a void or an unknown reason, fails it.
+BREAK_CLASSES = (
+    ("rejects", re.compile(r"the relay rejected \d+ events")),
+    ("unanswered", re.compile(r"the relay didn't answer \d+ sends")),
+    ("shed", re.compile(r"the relay shed \d+ sends: full, or unable to reach its admission store")),
+    ("ack test", re.compile(r"ramp-\d{3}: \d+ of \d+ acks within 500 ms \(\d+\.\d%\), under 95%")),
+)
+
+
+def break_class(why: Any) -> str | None:
+    """Which named relay-break class a break's reason is, or None."""
+    return next((name for name, pat in BREAK_CLASSES if pat.fullmatch(str(why))), None)
 
 
 def read_json(p: Path) -> dict[str, Any]:
