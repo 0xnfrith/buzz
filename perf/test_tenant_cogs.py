@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cogs_report
 import tenant_cogs
-from planted_env import assert_names, parent_env
+from planted_env import assert_names, parent_env, test_env
 
 _LOCK_TMP: tempfile.TemporaryDirectory | None = None
 _REAL_LOCK_DIR = tenant_cogs.LOCK_DIR
@@ -488,7 +488,7 @@ class SchemaTests(unittest.TestCase):
             {"phase": "setup-done", "provision": {"events": 300}},
         ]
         script = "".join(f"echo '{json.dumps(l)}'\n" for l in lines)
-        proc = subprocess.Popen(["/bin/sh", "-c", script], stdout=subprocess.PIPE)
+        proc = subprocess.Popen(["/bin/sh", "-c", script], stdout=subprocess.PIPE, env=test_env())
         try:
             setup, seed = tenant_cogs.wait_setup(proc, True, 10, 10)
         finally:
@@ -670,6 +670,7 @@ class TimeoutTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=test_env(),
         )
 
     def test_wait_ready_honors_short_timeout(self) -> None:
@@ -715,6 +716,7 @@ class TimeoutTests(unittest.TestCase):
             ],
             stdout=subprocess.PIPE,
             bufsize=0,
+            env=test_env(),
         )
         try:
             tenant_cogs.wait_ready_line(proc, timeout_s=1.0)
@@ -1039,6 +1041,7 @@ class ProjectLockTests(unittest.TestCase):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
+            env=test_env(),
         )
         try:
             self.assertEqual(holder.stdout.readline().strip(), "held")
@@ -1337,11 +1340,11 @@ class GuardedHttpTests(unittest.TestCase):
     def test_proxy_variables_are_ignored(self) -> None:
         """A fresh sampler process, started with every proxy variable set,
         still reads the target directly. (A process, not a patched
-        environment: an opener reads proxies when it is built.)"""
+        environment: an opener reads proxies when it is built.) The proxy
+        variables are its named values; no NO_PROXY comes through."""
         target = self.serve("127.0.0.1", http_response(200, "buzz_ws_connections_active 3\n"))
         proxy = self.serve("127.0.0.1", http_response(502))
-        env = {k: v for k, v in os.environ.items() if k.upper() != "NO_PROXY"}
-        env.update({name: proxy.url for name in PROXY_VARS})
+        env = test_env(**{name: proxy.url for name in PROXY_VARS})
         code = (
             "import sys; sys.path.insert(0, sys.argv[1]); import tenant_cogs as t; "
             "g = t.TargetGuard([t.parse_cidr('127.0.0.0/8')], []); "
@@ -1636,8 +1639,10 @@ class LinuxBuildEndpointTests(unittest.TestCase):
                 "exit 0\n"
             )
             (fakebin / "docker").chmod(0o755)
-            env = {k: v for k, v in os.environ.items() if k not in drop}
-            env.update(env_changes)
+            # Only named values: the local endpoint setUpModule selects (unless
+            # the row drops it), then the row's own hostile DOCKER_* values.
+            named = {} if "DOCKER_HOST" in drop else {"DOCKER_HOST": str(TEST_EP)}
+            env = test_env(**{**named, **env_changes})
             env["PATH"] = f"{fakebin}:{env['PATH']}"
             proc = subprocess.run(
                 ["bash", str(self.SCRIPT)], env=env, capture_output=True, text=True, timeout=60
@@ -1822,6 +1827,7 @@ class PhaseLineTests(unittest.TestCase):
             [sys.executable, "-u", "-c", f"import json, sys, time; {body}; {then}"],
             stdout=subprocess.PIPE,
             bufsize=0,
+            env=test_env(),
         )
 
     def _close(self, proc: subprocess.Popen) -> None:

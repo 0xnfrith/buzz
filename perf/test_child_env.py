@@ -10,6 +10,10 @@ child's set exactly. Where a name is both planted and in a set (DOCKER_HOST,
 the raised limits), the stub records whether the value is the right one
 (`match`) or not (`other`). Perl adds no variable of its own; these rows fail,
 never skip, without /usr/bin/perl.
+
+The tests' own children get a fixed environment too (planted_env.test_env):
+a planted-variable row for the helper, and a syntax-tree row that holds every
+subprocess call in perf/test_*.py to it.
 """
 
 from __future__ import annotations
@@ -34,7 +38,8 @@ sys.path.insert(0, str(PERF))
 import clock_proof  # noqa: E402
 import clock_proof_hook as hook  # noqa: E402
 import tenant_cogs  # noqa: E402
-from planted_env import PLANTED, write_stub  # noqa: E402
+import planted_env  # noqa: E402
+from planted_env import PLANTED, parent_env, write_stub  # noqa: E402
 
 LIMITS = tenant_cogs.RATE_LIMIT_VARS
 CHECKED = "unix:///checked/docker.sock"
@@ -229,6 +234,27 @@ def clock_proof_exit_hook() -> int:
     return band_clock.EXIT_HOOK
 
 
+class TestEnvRows(Planted):
+    def test_test_env_is_exactly_its_set(self) -> None:
+        """`test_env`: PATH, HOME and TMPDIR from the parent (each only when
+        set), LC_ALL=C and the named values, whatever else the parent holds.
+        Each value is the right one (`match`), never printed."""
+        tmp = str(self.dir / "tmp")
+        for unset in ((), ("TMPDIR",), ("HOME", "TMPDIR"), ("PATH", "HOME", "TMPDIR")):
+            with self.subTest(unset=unset):
+                self.out.unlink(missing_ok=True)
+                parent = parent_env(TMPDIR=tmp)
+                with mock.patch.dict(os.environ, parent, clear=True):
+                    for name in unset:
+                        del os.environ[name]
+                    env = planted_env.test_env(ONE_NAMED="v")
+                want = {k: v for k, v in parent.items() if k in ("PATH", "HOME", "TMPDIR") and k not in unset}
+                want.update({"LC_ALL": "C", "ONE_NAMED": "v"})
+                stub = self.stub("probe", want)
+                subprocess.run([str(stub)], env=env, check=True)
+                self.assertEqual(self.lines(), [{f"{k}=match" for k in want}])
+
+
 class EverySpawnHasAFixedEnv(unittest.TestCase):
     """No drift: every subprocess call in the harness files passes `env=`
     built by one of tenant_cogs's fixed-set functions (or, inside run(), the
@@ -277,6 +303,147 @@ class EverySpawnHasAFixedEnv(unittest.TestCase):
                         self.assertIn("env = command_env(", src, where)
         # 3 in tenant_cogs.py, 3 in clock_proof.py, 4 in the hook.
         self.assertGreaterEqual(seen, 10, "the walk found too few calls to mean anything")
+
+
+SPAWNS = ("run", "Popen", "call", "check_call", "check_output")
+
+
+def environ_mentions(node: ast.AST) -> bool:
+    """`node` reads the parent's environment: os.environ, os.environb, getenv."""
+    return any(
+        (isinstance(n, ast.Attribute) and n.attr in ("environ", "environb", "getenv"))
+        or (isinstance(n, ast.Name) and n.id in ("environ", "environb", "getenv"))
+        for n in ast.walk(node))
+
+
+def is_test_env_call(node: ast.AST | None) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    return (f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)) == "test_env"
+
+
+def spawn_problems(name: str, source: str) -> tuple[int, list[str]]:
+    """(spawn calls in `source`, one 'name:line: call reason' per call that
+    could hand its child the parent's environment). A spawn is a call of
+    subprocess.run/Popen/call/check_call/check_output, through the module, an
+    alias of it (`import subprocess as sp`), a `.subprocess` attribute, or a
+    name imported from it. Its `env=` must be a test_env call, or a name every
+    assignment to which, in the same function, is one; nothing that writes to
+    that name may read os.environ. Names only: no value is ever printed."""
+    tree = ast.parse(source)
+    parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+    modules, funcs = {"subprocess"}, set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules |= {a.asname for a in node.names if a.name == "subprocess" and a.asname}
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            funcs |= {a.asname or a.name for a in node.names if a.name in SPAWNS}
+    found, bad = 0, []
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call):
+            continue
+        f = call.func
+        if isinstance(f, ast.Attribute) and f.attr in SPAWNS and (
+                (isinstance(f.value, ast.Name) and f.value.id in modules)
+                or (isinstance(f.value, ast.Attribute) and f.value.attr == "subprocess")):
+            what = f"subprocess.{f.attr}"
+        elif isinstance(f, ast.Name) and f.id in funcs:
+            what = f.id
+        else:
+            continue
+        found += 1
+        where = f"{name}:{call.lineno}: {what}"
+        env = next((k.value for k in call.keywords if k.arg == "env"), None)
+        if env is None:
+            bad.append(f"{where} passes no env")
+        elif environ_mentions(env):
+            bad.append(f"{where} builds its env from the parent's")
+        elif is_test_env_call(env):
+            continue
+        elif not isinstance(env, ast.Name):
+            bad.append(f"{where} passes an env test_env did not build")
+        else:
+            scope = call
+            while scope in parent and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scope = parent[scope]
+            assigns = [n for n in ast.walk(scope) if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == env.id for t in n.targets)]
+            writes = [n for n in ast.walk(scope) if environ_mentions(n) and (
+                (isinstance(n, (ast.Assign, ast.AugAssign)) and any(
+                    env.id in {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target])))
+                or (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id == env.id))]
+            if not assigns or not all(is_test_env_call(a.value) for a in assigns):
+                bad.append(f"{where} passes an env test_env did not build")
+            elif writes:
+                bad.append(f"{where} builds its env from the parent's")
+    return found, bad
+
+
+class EveryTestSpawnHasAFixedEnv(unittest.TestCase):
+    """No drift, for the tests' own children: every subprocess call in
+    perf/test_*.py passes `env=` built by planted_env.test_env, and nothing
+    reads os.environ into it. A heuristic over the syntax tree, not a proof:
+    it does not see os.system, os.popen, os.spawn*, asyncio's
+    create_subprocess_*, multiprocessing, a call through a name it can't
+    follow (a function that returns subprocess.run, a getattr), or a spawn
+    in a file that is not perf/test_*.py (the harness's own spawns are held by
+    EverySpawnHasAFixedEnv above). `**kwargs` that may carry `env` count as no
+    env, so they fail."""
+
+    def test_every_spawn(self) -> None:
+        seen, bad = 0, []
+        for path in sorted(PERF.glob("test_*.py")):
+            n, problems = spawn_problems(path.name, path.read_text())
+            seen += n
+            bad += problems
+        self.assertEqual(bad, [])
+        # 4 in test_band_clock.py, 2 in test_remote_sampler.py, 7 in test_tenant_cogs.py.
+        self.assertGreaterEqual(seen, 13, "the walk found too few calls to mean anything")
+
+    def test_the_row_can_fail(self) -> None:
+        """The scan, on snippets: the right spawns pass, each way of
+        inheriting is named."""
+        head = "import os, subprocess\nfrom planted_env import test_env\n"
+        good = [
+            "subprocess.run(['x'], env=test_env())",
+            "subprocess.Popen(['x'], env=test_env(A='1'))",
+            "def f():\n    env = test_env(A='1')\n    env['PATH'] = 'p'\n    subprocess.run(['x'], env=env)",
+            "def f():\n    env = planted_env.test_env()\n    subprocess.check_output(['x'], env=env)",
+            "with mock.patch.dict(os.environ, {'A': '1'}):\n    pass",
+            "raise subprocess.CalledProcessError(1, 'x')",
+            "docker.run(['x'])",
+        ]
+        for code in good:
+            with self.subTest(code=code):
+                self.assertEqual(spawn_problems("s.py", head + code)[1], [], code)
+        bad = {
+            "subprocess.run(['x'])": "passes no env",
+            "subprocess.run(['x'], env=None)": "passes an env test_env did not build",
+            "subprocess.call(['x'], env={'A': '1'})": "passes an env test_env did not build",
+            "subprocess.run(['x'], env=dict(os.environ))": "builds its env from the parent's",
+            "subprocess.run(['x'], env={**os.environ, 'A': '1'})": "builds its env from the parent's",
+            "subprocess.run(['x'], env=test_env(**os.environ))": "builds its env from the parent's",
+            "subprocess.run(['x'], env=test_env(A=os.getenv('A')))": "builds its env from the parent's",
+            "def f():\n    env = dict(os.environ)\n    subprocess.run(['x'], env=env)": "passes an env test_env did not build",
+            "def f():\n    env = test_env()\n    env = {}\n    subprocess.run(['x'], env=env)": "passes an env test_env did not build",
+            "def f():\n    env = test_env()\n    env.update(os.environ)\n    subprocess.run(['x'], env=env)": "builds its env from the parent's",
+            "def f():\n    env = test_env()\n    env['A'] = os.environ['A']\n    subprocess.run(['x'], env=env)": "builds its env from the parent's",
+            "def f(env):\n    subprocess.run(['x'], env=env)": "passes an env test_env did not build",
+            "subprocess.run(['x'], **{'env': test_env()})": "passes no env",
+            "import subprocess as sp\nsp.Popen(['x'])": "passes no env",
+            "from subprocess import run\nrun(['x'])": "passes no env",
+            "from subprocess import check_output as co\nco(['x'])": "passes no env",
+            "tenant_cogs.subprocess.run(['x'])": "passes no env",
+        }
+        for code, why in bad.items():
+            with self.subTest(code=code):
+                found, problems = spawn_problems("s.py", head + code)
+                self.assertEqual(found, 1, code)
+                self.assertEqual(len(problems), 1, code)
+                self.assertTrue(problems[0].startswith("s.py:") and problems[0].endswith(why), problems)
 
 
 if __name__ == "__main__":
