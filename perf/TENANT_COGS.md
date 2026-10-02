@@ -354,6 +354,13 @@ provisioned while a band is measured.
   for each (`SeqBoard`). So nothing sent before it subscribed is a gap, and
   everything after is. Without it, a joiner counted each author's earlier
   messages as lost.
+- **A line per identity that lost events.** When a recheck still finds
+  events missing, the identity writes one line to `stderr.log`: its name,
+  whether a ramp step switched it on (`joined mid-ramp: yes`), each missing
+  author-seq (at most 100, the rest counted), and each of those authors'
+  baselines, the last `seq` it took for them when it subscribed (`none`:
+  expected from 1). A break on lost events can then be told apart from a
+  baseline fault after the run, from the generator's own log.
 - **A sizing ramp, as planned:** the team profile on a fresh stack
   seeded with the team's 90 days (`--seed-days 90`), from its 30 identities,
   15 more (5 teams) every 300 s, at steady-band rates with no storm, up to

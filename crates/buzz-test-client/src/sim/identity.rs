@@ -100,6 +100,53 @@ impl SeqBoard {
     }
 }
 
+/// At most this many missing author-seqs are named in a lost-events line;
+/// the rest are counted.
+const LOST_LINE_MAX_SEQS: usize = 100;
+
+/// The line an identity that lost events writes to stderr.log, after a
+/// recheck: who it is, whether it joined mid-ramp, each missing author-seq
+/// (by author, then number; at most [`LOST_LINE_MAX_SEQS`]), and each of
+/// those authors' baselines: the last accepted `seq` this identity took when
+/// it subscribed, `none` when it expected the author from 1. A rented run
+/// that breaks on lost events can then be told apart from a baseline fault.
+fn lost_line(
+    name: &str,
+    joined_mid_ramp: bool,
+    missing: &HashSet<String>,
+    baseline: &HashMap<String, u64>,
+) -> String {
+    let mut seqs: Vec<(&str, u64, &str)> = missing
+        .iter()
+        .map(|s| match s.rsplit_once('-') {
+            Some((author, n)) => (author, n.parse().unwrap_or(u64::MAX), s.as_str()),
+            None => (s.as_str(), u64::MAX, s.as_str()),
+        })
+        .collect();
+    seqs.sort();
+    let mut named: Vec<&str> = seqs.iter().take(LOST_LINE_MAX_SEQS).map(|t| t.2).collect();
+    let more = format!("(+{} more)", seqs.len().saturating_sub(LOST_LINE_MAX_SEQS));
+    if seqs.len() > LOST_LINE_MAX_SEQS {
+        named.push(&more);
+    }
+    let mut authors: Vec<&str> = seqs.iter().map(|t| t.0).collect();
+    authors.dedup();
+    let baselines: Vec<String> = authors
+        .iter()
+        .map(|a| match baseline.get(*a) {
+            Some(n) => format!("{a}={n}"),
+            None => format!("{a}=none"),
+        })
+        .collect();
+    format!(
+        "{name} lost {} events (joined mid-ramp: {}): missing {}; baselines {}",
+        missing.len(),
+        if joined_mid_ramp { "yes" } else { "no" },
+        named.join(" "),
+        baselines.join(" ")
+    )
+}
+
 #[derive(Clone)]
 pub struct RepoRef {
     pub name: String,
@@ -441,6 +488,11 @@ struct Session {
     ok_timeout: Duration,
     expected: HashMap<String, u64>,
     missing: HashSet<String>,
+    /// Each author's last accepted `seq` when this identity subscribed
+    /// ([`Session::take_baseline`]), kept for the lost-events line.
+    baseline: HashMap<String, u64>,
+    /// Switched on by a ramp step after the run started, not on at start.
+    joined_mid_ramp: bool,
     last_seen_created_at: u64,
     /// When the `#p` subscription first started, and the newest event seen
     /// on it: a reconnect resubscribes from these, as the desktop does.
@@ -883,8 +935,24 @@ impl Session {
                 }
             }
         }
+        self.settle_lost();
+    }
+
+    /// After a recheck, what is still missing is lost: counted, and one
+    /// line in stderr.log ([`lost_line`]), so a lost-events break can be
+    /// told apart from a baseline fault after the run.
+    fn settle_lost(&mut self) {
         let lost = self.missing.len() as u64;
         if lost > 0 {
+            warn!(
+                "{}",
+                lost_line(
+                    &self.rec.name,
+                    self.joined_mid_ramp,
+                    &self.missing,
+                    &self.baseline
+                )
+            );
             self.stats.record_lost(lost);
             self.missing.clear();
         }
@@ -906,8 +974,9 @@ impl Session {
     /// subscribed, and every one after. An identity on from the start sees
     /// an empty board: it expects every author from 1.
     fn take_baseline(&mut self) {
-        for (author, last) in self.world.seqs.snapshot() {
-            self.expected.insert(author, last + 1);
+        self.baseline = self.world.seqs.snapshot();
+        for (author, last) in &self.baseline {
+            self.expected.insert(author.clone(), last + 1);
         }
     }
 
@@ -1088,6 +1157,11 @@ async fn identity_task(
     mut ramp: Option<RampSlot>,
     joined: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
+    // On at the start, the ramp's count already covers this identity: a
+    // later step switches on a joiner.
+    let joined_mid_ramp = ramp
+        .as_ref()
+        .is_some_and(|slot| *slot.on.borrow() <= slot.index);
     if let Some(slot) = ramp.as_mut() {
         if !wait_switched_on(slot, &mut band_rx).await {
             return Ok(());
@@ -1121,6 +1195,8 @@ async fn identity_task(
         ok_timeout: OK_TIMEOUT,
         expected: HashMap::new(),
         missing: HashSet::new(),
+        baseline: HashMap::new(),
+        joined_mid_ramp,
         last_seen_created_at: unix_now(),
         p_since: unix_now(),
         p_last_seen: None,
@@ -1421,6 +1497,8 @@ mod tests {
             ok_timeout: OK_TIMEOUT,
             expected: HashMap::new(),
             missing: HashSet::new(),
+            baseline: HashMap::new(),
+            joined_mid_ramp: false,
             last_seen_created_at: unix_now(),
             p_since: unix_now(),
             p_last_seen: None,
@@ -1677,6 +1755,83 @@ mod tests {
         first.take_baseline();
         first.handle_msg(Band::Steady, msg(3)).await;
         assert_eq!(first.missing.len(), 2, "1 and 2 are gaps");
+    }
+
+    /// The lost-events line: each missing author-seq by author, then by
+    /// number (9 before 10), each of their authors' baselines (`none` for
+    /// one expected from 1), and at most 100 seqs named.
+    #[test]
+    fn the_lost_line_names_each_missing_seq_and_its_baseline() {
+        let missing: HashSet<String> = ["agent-1-10", "agent-1-9", "human-2-5"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let baseline = HashMap::from([("agent-1".to_string(), 8u64)]);
+        assert_eq!(
+            lost_line("human-3", true, &missing, &baseline),
+            "human-3 lost 3 events (joined mid-ramp: yes): missing agent-1-9 agent-1-10 human-2-5; \
+             baselines agent-1=8 human-2=none"
+        );
+        let many: HashSet<String> = (1..=150).map(|n| format!("agent-1-{n}")).collect();
+        let line = lost_line("human-3", false, &many, &HashMap::new());
+        assert!(line.starts_with(
+            "human-3 lost 150 events (joined mid-ramp: no): missing agent-1-1 agent-1-2 "
+        ));
+        assert!(
+            line.ends_with(" agent-1-100 (+50 more); baselines agent-1=none"),
+            "{line}"
+        );
+    }
+
+    /// A tracing writer into a shared buffer, for the rows that read
+    /// stderr.log's lines.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    /// The recheck's end (`settle_lost`, which `gap_recheck` calls): a
+    /// joiner that took 37 as an author's baseline and never saw 38 and 39
+    /// writes one line naming both and the baseline, then counts them and
+    /// starts over.
+    #[tokio::test]
+    async fn a_lost_recheck_writes_one_line() {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut joiner = test_session(Arc::new(Stats::new()));
+        joiner.joined_mid_ramp = true;
+        joiner.world.seqs.set("someone", 37);
+        joiner.take_baseline();
+        joiner
+            .missing
+            .extend(["someone-38".to_string(), "someone-39".to_string()]);
+        joiner.settle_lost();
+        let log = String::from_utf8(buf.0.lock().expect("log").clone()).expect("utf8");
+        let want = format!(
+            "{} lost 2 events (joined mid-ramp: yes): missing someone-38 someone-39; baselines someone=37",
+            joiner.rec.name
+        );
+        assert_eq!(log.matches(&want).count(), 1, "{log}");
+        assert!(joiner.missing.is_empty(), "the next recheck starts over");
     }
 
     /// A channel message the relay accepted sets its author's last `seq`
