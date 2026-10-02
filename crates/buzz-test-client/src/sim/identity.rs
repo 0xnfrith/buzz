@@ -269,6 +269,14 @@ pub struct RampSlot {
     pub index: usize,
 }
 
+/// Whether this identity joins mid-ramp: it is in a ramp, and at its start
+/// the ramp's count doesn't yet cover its index, so a later step switches it
+/// on. On at the start (the count already covers it), or in no ramp, it
+/// doesn't.
+fn is_ramp_joiner(ramp: Option<&RampSlot>) -> bool {
+    ramp.is_some_and(|slot| *slot.on.borrow() <= slot.index)
+}
+
 /// Waits until the ramp has switched this identity on: true, or false if
 /// the run stopped first.
 async fn wait_switched_on(slot: &mut RampSlot, band: &mut watch::Receiver<Band>) -> bool {
@@ -1157,11 +1165,7 @@ async fn identity_task(
     mut ramp: Option<RampSlot>,
     joined: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    // On at the start, the ramp's count already covers this identity: a
-    // later step switches on a joiner.
-    let joined_mid_ramp = ramp
-        .as_ref()
-        .is_some_and(|slot| *slot.on.borrow() <= slot.index);
+    let joined_mid_ramp = is_ramp_joiner(ramp.as_ref());
     if let Some(slot) = ramp.as_mut() {
         if !wait_switched_on(slot, &mut band_rx).await {
             return Ok(());
@@ -1780,6 +1784,26 @@ mod tests {
         assert!(
             line.ends_with(" agent-1-100 (+50 more); baselines agent-1=none"),
             "{line}"
+        );
+    }
+
+    /// Mid-ramp is a ramp whose count hasn't reached the identity's index at
+    /// its start: the count equal to the index is the next to be switched on
+    /// (a joiner), one more and it is already on; no ramp is never a joiner.
+    #[test]
+    fn a_ramp_identity_joins_mid_ramp_until_the_count_covers_its_index() {
+        let slot = |on: usize, index: usize| RampSlot {
+            on: watch::channel(on).1,
+            index,
+        };
+        assert!(!is_ramp_joiner(None), "no ramp");
+        assert!(!is_ramp_joiner(Some(&slot(6, 5))), "covered: 6 on, index 5");
+        assert!(!is_ramp_joiner(Some(&slot(1, 0))), "covered: 1 on, index 0");
+        assert!(is_ramp_joiner(Some(&slot(6, 6))), "next up: 6 on, index 6");
+        assert!(is_ramp_joiner(Some(&slot(0, 0))), "none on yet, index 0");
+        assert!(
+            is_ramp_joiner(Some(&slot(6, 9))),
+            "later step: 6 on, index 9"
         );
     }
 
