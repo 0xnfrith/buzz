@@ -735,6 +735,7 @@ async fn run(args: Args) -> Result<i32> {
         out_dir: out_dir.clone(),
         blink: args.blink,
         mentions: mentions.clone(),
+        seqs: Default::default(),
     });
 
     let profile = Arc::new(profile);

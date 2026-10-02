@@ -346,6 +346,14 @@ provisioned while a band is measured.
 - **A step is not a band.** The band's clock (and its duty cycles) runs on;
   at each step every identity rechecks for lost events since the step
   before, which costs nothing when none is missing.
+- **A joiner's baseline:** every channel message carries its author's
+  `seq`, and an identity counts a gap in it as a lost event. A joiner
+  switched on mid-stream expects, from each author, everything after the
+  author's last accepted `seq` at the moment it subscribes: all of a
+  relay's identities run in one generator process, which keeps that number
+  for each (`SeqBoard`). So nothing sent before it subscribed is a gap, and
+  everything after is. Without it, a joiner counted each author's earlier
+  messages as lost.
 - **A sizing ramp, as planned:** the team profile on a fresh stack
   seeded with the team's 90 days (`--seed-days 90`), from its 30 identities,
   15 more (5 teams) every 300 s, at steady-band rates with no storm, up to

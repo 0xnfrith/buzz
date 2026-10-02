@@ -72,6 +72,32 @@ pub struct World {
     pub blink: bool,
     /// Who mentions whom, and how often ([`mentions::Mentions`]).
     pub mentions: Arc<mentions::Mentions>,
+    /// Each identity's last accepted `seq`, as it sends: a joiner's
+    /// baseline for each author ([`SeqBoard`]).
+    pub seqs: Arc<SeqBoard>,
+}
+
+/// Every identity's last accepted channel-message `seq`, in this generator
+/// process. All of a relay's identities are in one process, so a joiner
+/// knows exactly what each author had sent before it subscribed: anything
+/// after that it doesn't see is a gap, and anything before is not.
+#[derive(Debug, Default)]
+pub struct SeqBoard {
+    last: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl SeqBoard {
+    /// `identity` had its `seq` accepted.
+    pub fn set(&self, identity: &str, seq: u64) {
+        let mut m = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let e = m.entry(identity.to_string()).or_insert(0);
+        *e = (*e).max(seq);
+    }
+
+    /// Each identity's last accepted `seq` now.
+    pub fn snapshot(&self) -> HashMap<String, u64> {
+        self.last.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 #[derive(Clone)]
@@ -600,6 +626,7 @@ impl Session {
         let accepted = self.send(client, band, event).await;
         if accepted {
             self.seq = seq;
+            self.world.seqs.set(&self.rec.name, seq);
         }
         Ok(accepted)
     }
@@ -859,6 +886,17 @@ impl Session {
         }
     }
 
+    /// Before subscribing: each author's next expected `seq` is the one
+    /// after its last accepted one now ([`SeqBoard`]). A ramp joiner
+    /// switched on mid-stream counts no gap for what was sent before it
+    /// subscribed, and every one after. An identity on from the start sees
+    /// an empty board: it expects every author from 1.
+    fn take_baseline(&mut self) {
+        for (author, last) in self.world.seqs.snapshot() {
+            self.expected.insert(author, last + 1);
+        }
+    }
+
     /// Whom this message mentions, if anyone (see [`mentions`]).
     fn draw_mention(&mut self) -> Option<String> {
         self.world
@@ -1099,6 +1137,7 @@ async fn identity_task(
         }
     };
     let kinds = sess.sub_kinds();
+    sess.take_baseline();
     // The `#p` subscription starts now, as the desktop's does.
     sess.p_since = unix_now();
     let subscribed = tokio::select! {
@@ -1345,6 +1384,7 @@ mod tests {
             out_dir: std::env::temp_dir(),
             blink: false,
             mentions: Arc::new(mentions::Mentions::new(&pop)),
+            seqs: Default::default(),
         });
         let (_tx, band_rx) = watch::channel(Band::Steady);
         Session {
@@ -1456,6 +1496,7 @@ mod tests {
             out_dir: w.out_dir.clone(),
             blink: false,
             mentions: w.mentions.clone(),
+            seqs: Default::default(),
         });
         sess
     }
@@ -1584,6 +1625,70 @@ mod tests {
                 serde_json::json!([{"#p": [pk.clone()], "since": want}]),
                 "row {i}"
             );
+        }
+    }
+
+    /// A joiner takes each author's last accepted `seq` at its subscribe as
+    /// its baseline: the author then sends 38 and 39, both lost, and the
+    /// joiner first sees 40: it counts both. An identity on from the start
+    /// (an empty board) counts from 1.
+    #[tokio::test]
+    async fn a_joiner_counts_what_was_lost_after_it_subscribed() {
+        let author = "someone";
+        let msg = |n: u64| {
+            let ev = nostr::EventBuilder::new(nostr::Kind::Custom(9), "hi")
+                .tags([
+                    Tag::parse(["h", "chan-a"]).expect("tag"),
+                    Tag::parse(["seq", &format!("{author}-{n}")]).expect("tag"),
+                ])
+                .sign_with_keys(&Keys::generate())
+                .expect("sign");
+            RelayMessage::Event {
+                subscription_id: "x-ch0".into(),
+                event: Box::new(ev),
+            }
+        };
+        let stats = Arc::new(Stats::new());
+        let mut joiner = test_session(stats.clone());
+        joiner.world.seqs.set(author, 37);
+        joiner.take_baseline();
+        // The author's 38 and 39 are accepted, and never reach the joiner.
+        joiner.world.seqs.set(author, 39);
+        joiner.handle_msg(Band::Steady, msg(40)).await;
+        let mut missing: Vec<String> = joiner.missing.iter().cloned().collect();
+        missing.sort();
+        assert_eq!(missing, [format!("{author}-38"), format!("{author}-39")]);
+        // From the start: an empty board, every author from 1.
+        let mut first = test_session(stats);
+        first.take_baseline();
+        first.handle_msg(Band::Steady, msg(3)).await;
+        assert_eq!(first.missing.len(), 2, "1 and 2 are gaps");
+    }
+
+    /// A channel message the relay accepted sets its author's last `seq`
+    /// on the board; one it rejected doesn't.
+    #[tokio::test]
+    async fn an_accepted_message_moves_the_seq_board() {
+        use crate::sim::admission::testrelay::{relay_with, Answer};
+        fn accept(_: u64) -> Answer {
+            Answer::Accept
+        }
+        fn reject(_: u64) -> Answer {
+            Answer::Reject("blocked: test")
+        }
+        for (answer, want) in [(accept as fn(u64) -> Answer, Some(1u64)), (reject, None)] {
+            let relay = relay_with(answer).await;
+            let mut sess = test_session(Arc::new(Stats::new()));
+            let mut client = BuzzTestClient::connect_unauthenticated(&relay.url)
+                .await
+                .expect("connect");
+            let (keys, k, name) = (sess.keys.clone(), sess.profile.kinds, sess.rec.name.clone());
+            sess.send_channel(&mut client, Band::Steady, |seq| {
+                kinds::stream_message(&keys, &k, "chan-a", &name, seq, "hi", None)
+            })
+            .await
+            .expect("send");
+            assert_eq!(sess.world.seqs.snapshot().get(&name).copied(), want);
         }
     }
 
