@@ -615,6 +615,12 @@ async fn run(args: Args) -> Result<i32> {
         generate_population(&profile)
     };
     save_population(&out_dir.join("identities.json"), &pop)?;
+    // Who mentions whom, in the run and in the seed (sim/mentions.rs).
+    let mentions = Arc::new(sim::mentions::Mentions::new(&pop));
+    std::fs::write(
+        out_dir.join("mentions.json"),
+        serde_json::to_vec_pretty(&mentions.to_json())?,
+    )?;
 
     sim::phase::set_file(out_dir.join("phases.jsonl"))?;
     let mut control = signal::spawn(
@@ -661,6 +667,7 @@ async fn run(args: Args) -> Result<i32> {
         let report = seed::seed(
             &targets.relay,
             &pop,
+            &mentions,
             &profile.kinds,
             &channels,
             seed_events,
@@ -727,6 +734,7 @@ async fn run(args: Args) -> Result<i32> {
         git_helper: args.git_credential_helper.clone(),
         out_dir: out_dir.clone(),
         blink: args.blink,
+        mentions: mentions.clone(),
     });
 
     let profile = Arc::new(profile);

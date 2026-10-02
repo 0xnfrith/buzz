@@ -87,13 +87,37 @@ pub fn profiles(authors: &[String]) -> Read {
     }
 }
 
-/// Where a poll sends its queries, and as whom.
+/// Where a poll sends its queries, and as whom; `tail`: a human who is
+/// never mentioned (`mentions.rs`), whose polls are recorded apart.
 #[derive(Clone)]
 pub struct PollTarget {
     pub http: HttpClient,
     pub url: Target,
     pub keys: Keys,
+    pub tail: bool,
 }
+
+/// C, the desktop's refetch on a mention: each live mention starts a whole
+/// poll at once (`desktop/src/app/AppShell.tsx:231-233`, wired at `:380`,
+/// `homeFeedQuery.refetch()`). It doesn't wait for one in flight: the
+/// desktop's command already sent keeps running, so the relay sees no
+/// coalescing. Its time is recorded against `band` like the schedule's.
+pub fn poll_on_mention(to: PollTarget, stats: Arc<Stats>, band: Band) {
+    tokio::spawn(async move {
+        let started = Instant::now();
+        poll(&to, &stats).await;
+        stats.record_poll(
+            band.sampled().then(|| band.as_str()),
+            started.elapsed().as_secs_f64() * 1e3,
+            to.tail,
+        );
+    });
+}
+
+/// The kinds whose live mention starts a poll: the desktop's
+/// `HOME_MENTION_EVENT_KINDS` (`desktop/src/shared/constants/kinds.ts:81-89`:
+/// stream message, its v2, forum post and comment).
+pub const LIVE_MENTION_KINDS: [u16; 4] = [9, 40002, 45001, 45003];
 
 /// One poll: the four queries, in the desktop's order, each counted as it
 /// ends. Returns the queries sent, by `what`.
@@ -191,10 +215,12 @@ impl Link {
 /// when the connection does). Ends when the run stops. `run` makes one poll
 /// and says which band it began in; each poll's time is recorded against
 /// it.
+#[allow(clippy::too_many_arguments)]
 pub async fn schedule<F, Fut>(
     link: Arc<Link>,
     mut band_rx: watch::Receiver<Band>,
     stats: Arc<Stats>,
+    tail: bool,
     every: Duration,
     heal_min: Duration,
     mut run: F,
@@ -245,6 +271,7 @@ pub async fn schedule<F, Fut>(
         stats.record_poll(
             band.sampled().then(|| band.as_str()),
             started.elapsed().as_secs_f64() * 1e3,
+            tail,
         );
         // The next tick on the 30 s grid from the last start; ticks that
         // passed while this poll was in flight are skipped.
@@ -263,7 +290,6 @@ mod tests {
     use crate::sim::guard::testsrv::{self, Server};
     use crate::sim::guard::{http_client, Cidr, TargetGuard};
     use std::sync::Mutex;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn target(base: &str) -> Target {
         TargetGuard::new(vec![Cidr::parse("127.0.0.0/8").expect("allow")], vec![])
@@ -277,67 +303,8 @@ mod tests {
             http: http_client(timeout).expect("client"),
             url: target(base),
             keys: Keys::generate(),
+            tail: false,
         }
-    }
-
-    /// An HTTP server that logs each request's JSON body and answers it
-    /// with `answer(body)`: a status and a JSON body.
-    async fn logging_server(
-        answer: fn(&Value) -> (u16, String),
-    ) -> (String, Arc<Mutex<Vec<Value>>>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let log: Arc<Mutex<Vec<Value>>> = Default::default();
-        let seen = log.clone();
-        tokio::spawn(async move {
-            while let Ok((mut tcp, _)) = listener.accept().await {
-                let seen = seen.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    loop {
-                        // One request: headers, then Content-Length bytes.
-                        let head_end = loop {
-                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                break i + 4;
-                            }
-                            let mut chunk = [0u8; 4096];
-                            match tcp.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            }
-                        };
-                        let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
-                        let len = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        while buf.len() < head_end + len {
-                            let mut chunk = [0u8; 4096];
-                            match tcp.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            }
-                        }
-                        let body: Value = serde_json::from_slice(&buf[head_end..head_end + len])
-                            .unwrap_or(Value::Null);
-                        buf.drain(..head_end + len);
-                        let (code, reply) = answer(&body);
-                        seen.lock().expect("log").push(body);
-                        let resp = format!(
-                            "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{reply}",
-                            reply.len()
-                        );
-                        if tcp.write_all(resp.as_bytes()).await.is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-        });
-        (format!("http://{addr}"), log)
     }
 
     /// Each query's filter is the desktop's own, exactly.
@@ -393,7 +360,7 @@ mod tests {
     /// came back.
     #[tokio::test]
     async fn a_poll_sends_the_desktops_queries_in_its_order() {
-        let (url, log) = logging_server(two_mentions).await;
+        let (url, log) = testhttp::logging_server(two_mentions, Duration::ZERO).await;
         let t = to(&url, Duration::from_secs(5));
         let me = t.keys.public_key().to_hex();
         let stats = Stats::new();
@@ -418,7 +385,7 @@ mod tests {
                 profiles(&authors).filters
             ]
         );
-        let (url, log) = logging_server(none).await;
+        let (url, log) = testhttp::logging_server(none, Duration::ZERO).await;
         let t = to(&url, Duration::from_secs(5));
         let me = t.keys.public_key().to_hex();
         assert_eq!(poll(&t, &stats).await, ["feed-mentions", "feed-approvals"]);
@@ -545,6 +512,7 @@ mod tests {
             link.clone(),
             band_rx,
             stats.clone(),
+            false,
             POLL_EVERY,
             HEAL_MIN,
             run,
@@ -581,6 +549,7 @@ mod tests {
             link.clone(),
             band_rx,
             Arc::new(Stats::new()),
+            false,
             POLL_EVERY,
             HEAL_MIN,
             run,
@@ -601,5 +570,77 @@ mod tests {
         // first poll ended (30, 60, 90); 100 on the reconnect; none at 105;
         // the ticks from 105: 135.
         assert_eq!(*rec.starts.lock().expect("starts"), [0, 100, 135]);
+    }
+}
+
+/// A test HTTP server for the poll's rows here and in `identity.rs`.
+#[cfg(test)]
+pub(crate) mod testhttp {
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An HTTP server that logs each request's JSON body as it arrives and
+    /// answers it, `delay` later, with `answer(body)`: a status and a JSON
+    /// body.
+    pub(crate) async fn logging_server(
+        answer: fn(&Value) -> (u16, String),
+        delay: Duration,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let log: Arc<Mutex<Vec<Value>>> = Default::default();
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        // One request: headers, then Content-Length bytes.
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            let mut chunk = [0u8; 4096];
+                            match tcp.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while buf.len() < head_end + len {
+                            let mut chunk = [0u8; 4096];
+                            match tcp.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let body: Value = serde_json::from_slice(&buf[head_end..head_end + len])
+                            .unwrap_or(Value::Null);
+                        buf.drain(..head_end + len);
+                        let (code, reply) = answer(&body);
+                        seen.lock().expect("log").push(body);
+                        tokio::time::sleep(delay).await;
+                        let resp = format!(
+                            "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{reply}",
+                            reply.len()
+                        );
+                        if tcp.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), log)
     }
 }

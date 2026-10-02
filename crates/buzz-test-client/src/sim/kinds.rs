@@ -42,6 +42,8 @@ fn seq_tags(identity: &str, seq: u64, extra: Vec<Tag>) -> Result<Vec<Tag>> {
     Ok(tags)
 }
 
+/// A channel message; `mention` tags one identity (`["p", <pubkey>]`), as
+/// an `@mention` or a reply does (see `mentions.rs`).
 pub fn stream_message(
     keys: &Keys,
     kinds: &KindTable,
@@ -49,8 +51,13 @@ pub fn stream_message(
     identity: &str,
     seq: u64,
     content: &str,
+    mention: Option<&str>,
 ) -> Result<Event> {
-    let tags = seq_tags(identity, seq, vec![tag(&["h", channel])?])?;
+    let mut base = vec![tag(&["h", channel])?];
+    if let Some(pk) = mention {
+        base.push(tag(&["p", pk])?);
+    }
+    let tags = seq_tags(identity, seq, base)?;
     Ok(EventBuilder::new(kind(kinds.msg), content)
         .tags(tags)
         .sign_with_keys(keys)?)
@@ -336,8 +343,29 @@ mod tests {
     fn channel_messages_still_carry_seq() {
         let keys = Keys::generate();
         let k = sample_kinds();
-        let ev = stream_message(&keys, &k, "chan", "h0", 3, "hello").expect("msg");
+        let ev = stream_message(&keys, &k, "chan", "h0", 3, "hello", None).expect("msg");
         assert!(tag_named(&ev, "seq"));
         assert!(tag_named(&ev, "h"));
+        assert!(
+            !tag_named(&ev, "p"),
+            "a message with no mention tags no one"
+        );
+    }
+
+    /// A mention is one `["p", <pubkey>]` tag, beside the channel's.
+    #[test]
+    fn a_mention_is_one_p_tag() {
+        let keys = Keys::generate();
+        let k = sample_kinds();
+        let who = "ab".repeat(32);
+        let ev = stream_message(&keys, &k, "chan", "h0", 3, "hello", Some(&who)).expect("msg");
+        let ps: Vec<Vec<String>> = ev
+            .tags
+            .iter()
+            .map(|t| t.as_slice().to_vec())
+            .filter(|t| t.first().map(String::as_str) == Some("p"))
+            .collect();
+        assert_eq!(ps, vec![vec!["p".to_string(), who]]);
+        assert!(tag_named(&ev, "h") && tag_named(&ev, "seq"));
     }
 }

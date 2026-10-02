@@ -21,6 +21,7 @@ use super::git::{self, GitRepo};
 use super::guard::{self, Target};
 use super::kinds;
 use super::media;
+use super::mentions;
 use super::profile::{Profile, Rates};
 use super::reads;
 use super::roles::{
@@ -69,6 +70,8 @@ pub struct World {
     pub git_helper: PathBuf,
     pub out_dir: PathBuf,
     pub blink: bool,
+    /// Who mentions whom, and how often ([`mentions::Mentions`]).
+    pub mentions: Arc<mentions::Mentions>,
 }
 
 #[derive(Clone)]
@@ -454,6 +457,14 @@ impl Session {
             if subscription_id == format!("{}-p", self.rec.name) {
                 let t = event.created_at.as_secs();
                 self.p_last_seen = Some(self.p_last_seen.map_or(t, |l| l.max(t)));
+                // A live mention: a human's desktop polls its home feed at
+                // once (C, `feed::poll_on_mention`).
+                if self.feed_link.is_some()
+                    && feed::LIVE_MENTION_KINDS.contains(&event.kind.as_u16())
+                    && event.pubkey.to_hex() != self.rec.pubkey
+                {
+                    feed::poll_on_mention(self.poll_target(), self.stats.clone(), band);
+                }
             }
             let channel = tag_value(&event, "h").unwrap_or_default();
             self.seen.push_back((event.id.to_hex(), channel.clone()));
@@ -616,9 +627,10 @@ impl Session {
                 }
                 let name = name.clone();
                 let ch = ch.clone();
+                let mention = self.draw_mention();
                 self.send_channel(client, band, |seq| {
                     let content = kinds::lorem(seq, 200);
-                    kinds::stream_message(&keys, &k, &ch, &name, seq, &content)
+                    kinds::stream_message(&keys, &k, &ch, &name, seq, &content, mention.as_deref())
                 })
                 .await?;
             }
@@ -711,8 +723,17 @@ impl Session {
                     Ok(up) => {
                         self.stats.record_media(up.bytes, up.put_ms);
                         let content = format!("media {}", up.url);
+                        let mention = self.draw_mention();
                         self.send_channel(client, band, |seq| {
-                            kinds::stream_message(&keys, &k, &ch, &name, seq, &content)
+                            kinds::stream_message(
+                                &keys,
+                                &k,
+                                &ch,
+                                &name,
+                                seq,
+                                &content,
+                                mention.as_deref(),
+                            )
                         })
                         .await?;
                     }
@@ -826,6 +847,23 @@ impl Session {
             self.stats.record_lost(lost);
             self.missing.clear();
         }
+    }
+
+    /// Where this identity's home-feed polls go, and as whom.
+    fn poll_target(&self) -> feed::PollTarget {
+        feed::PollTarget {
+            http: self.http.clone(),
+            url: self.world.http_url.clone(),
+            keys: self.keys.clone(),
+            tail: self.world.mentions.is_tail(&self.rec.pubkey),
+        }
+    }
+
+    /// Whom this message mentions, if anyone (see [`mentions`]).
+    fn draw_mention(&mut self) -> Option<String> {
+        self.world
+            .mentions
+            .draw_rng(self.role, &self.rec.pubkey, &mut self.rng)
     }
 
     /// The `#p` subscription's `since` on a reconnect: the desktop's replay
@@ -1092,16 +1130,13 @@ async fn identity_task(
     // run stops; it ends with this task.
     let _poller = sess.feed_link.clone().map(|link| {
         link.up();
-        let to = feed::PollTarget {
-            http: sess.http.clone(),
-            url: sess.world.http_url.clone(),
-            keys: sess.keys.clone(),
-        };
+        let to = sess.poll_target();
         let stats = sess.stats.clone();
         AbortOnDrop(tokio::spawn(feed::schedule(
             link,
             band_rx.clone(),
             sess.stats.clone(),
+            to.tail,
             feed::POLL_EVERY,
             feed::HEAL_MIN,
             move || {
@@ -1309,6 +1344,7 @@ mod tests {
             git_helper: PathBuf::from("/usr/bin/true"),
             out_dir: std::env::temp_dir(),
             blink: false,
+            mentions: Arc::new(mentions::Mentions::new(&pop)),
         });
         let (_tx, band_rx) = watch::channel(Band::Steady);
         Session {
@@ -1419,6 +1455,7 @@ mod tests {
             git_helper: w.git_helper.clone(),
             out_dir: w.out_dir.clone(),
             blink: false,
+            mentions: w.mentions.clone(),
         });
         sess
     }
@@ -1548,6 +1585,86 @@ mod tests {
                 "row {i}"
             );
         }
+    }
+
+    /// C: each live mention a human gets starts a whole home-feed poll at
+    /// once, beside any in flight (no coalescing). An event on `#p` that
+    /// isn't a message kind, one on a channel subscription, and an agent's
+    /// mention start none.
+    #[tokio::test]
+    async fn a_live_mention_starts_a_poll_at_once() {
+        fn none(_: &serde_json::Value) -> (u16, String) {
+            (200, "[]".into())
+        }
+        // Each answer comes 3 s late, so two polls overlap if both start.
+        let (http, log) = feed::testhttp::logging_server(none, Duration::from_secs(3)).await;
+        let stats = Arc::new(Stats::new());
+        let mut sess = test_session_at(stats.clone(), &http);
+        sess.feed_link = Some(feed::Link::new());
+        let name = sess.rec.name.clone();
+        let me = sess.rec.pubkey.clone();
+        let other = Keys::generate();
+        let ev = |kind: u16| {
+            Box::new(
+                nostr::EventBuilder::new(nostr::Kind::Custom(kind), "hi")
+                    .tags([Tag::parse(["p", &me]).expect("tag")])
+                    .sign_with_keys(&other)
+                    .expect("sign"),
+            )
+        };
+        for (sid, kind) in [
+            (format!("{name}-p"), 9u16),
+            (format!("{name}-p"), 40002),
+            (format!("{name}-p"), 1059),
+            (format!("{name}-ch0"), 9),
+        ] {
+            let event = ev(kind);
+            sess.handle_msg(
+                Band::Steady,
+                RelayMessage::Event {
+                    subscription_id: sid,
+                    event,
+                },
+            )
+            .await;
+        }
+        let mentions_queries = || {
+            log.lock()
+                .expect("log")
+                .iter()
+                .filter(|b| b[0]["limit"] == 50 && b[0]["#p"].is_array())
+                .count()
+        };
+        let started = Instant::now();
+        while mentions_queries() < 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "two polls didn't start at once"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            mentions_queries(),
+            2,
+            "a poll per message-kind mention, no more"
+        );
+        // An agent's desktop doesn't poll: no link, no poll.
+        let mut agent = test_session_at(stats.clone(), &http);
+        agent.feed_link = None;
+        let aname = agent.rec.name.clone();
+        let event = ev(9);
+        agent
+            .handle_msg(
+                Band::Steady,
+                RelayMessage::Event {
+                    subscription_id: format!("{aname}-p"),
+                    event,
+                },
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(mentions_queries(), 2);
     }
 
     /// An identity that joined, then failed or panicked while the run

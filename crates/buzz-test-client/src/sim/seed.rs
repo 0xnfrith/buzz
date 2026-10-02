@@ -19,8 +19,9 @@ use super::admission::{publish, Publish};
 use super::guard::Target;
 use super::identity::{connect_identity, IdentityRecord, Population};
 use super::kinds;
+use super::mentions::{self, Mentions};
 use super::profile::KindTable;
-use super::roles::Band;
+use super::roles::{Band, Role};
 use tokio::sync::watch;
 
 const OK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,19 +53,56 @@ struct Counters {
 }
 
 /// Build the `i`-th seed message: a plain channel message with no sequence
-/// tag, so it never opens a gap in the live run that follows.
-pub fn seed_event(keys: &Keys, kinds: &KindTable, channel: &str, i: u64) -> Result<nostr::Event> {
+/// tag, so it never opens a gap in the live run that follows. `mention`
+/// tags one identity, as the run's messages do (`mentions.rs`), so the
+/// history carries mentions at the same shares and with the same skew.
+pub fn seed_event(
+    keys: &Keys,
+    kinds: &KindTable,
+    channel: &str,
+    i: u64,
+    mention: Option<&str>,
+) -> Result<nostr::Event> {
+    let mut tags = vec![kinds::tag(&["h", channel])?];
+    if let Some(pk) = mention {
+        tags.push(kinds::tag(&["p", pk])?);
+    }
     Ok(
         EventBuilder::new(kinds::kind(kinds.msg), kinds::lorem(i, CONTENT_BYTES))
-            .tags([kinds::tag(&["h", channel])?])
+            .tags(tags)
             .sign_with_keys(keys)?,
     )
+}
+
+/// The `i`-th seed message, as a writer builds it: its channel by `i`, and
+/// its mention ([`seed_mention`]).
+pub fn seed_message(
+    keys: &Keys,
+    kinds: &KindTable,
+    channels: &[String],
+    i: u64,
+    role: Role,
+    author: &str,
+    m: &Mentions,
+) -> Result<nostr::Event> {
+    let ch = &channels[(i as usize) % channels.len()];
+    let mention = seed_mention(m, role, author, i);
+    seed_event(keys, kinds, ch, i, mention.as_deref())
+}
+
+/// Whom the `i`-th seed message, by `author` in `role`, mentions: drawn
+/// from `i`, so the same event always draws the same.
+pub fn seed_mention(m: &Mentions, role: Role, author: &str, i: u64) -> Option<String> {
+    let (u, v) = mentions::unit_pair(i);
+    m.draw(role, author, u, v).map(str::to_string)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn writer(
     relay_url: Target,
     rec: IdentityRecord,
+    role: Role,
+    mentions: Arc<Mentions>,
     keys: Keys,
     oa_owner: Option<Keys>,
     kinds: KindTable,
@@ -87,8 +125,7 @@ async fn writer(
                 if i >= target {
                     break;
                 }
-                let ch = &channels[(i as usize) % channels.len()];
-                match seed_event(&keys, &kinds, ch, i) {
+                match seed_message(&keys, &kinds, &channels, i, role, &rec.pubkey, &mentions) {
                     Ok(ev) => (i, ev),
                     Err(e) => {
                         warn!("seed {} build: {e:#}", rec.name);
@@ -157,9 +194,11 @@ async fn writer(
 /// Write `target` stored messages across the population, stopping early at
 /// `max`, or when the run stops. Agents authenticate with their owner's
 /// NIP-OA tag, as in the run.
+#[allow(clippy::too_many_arguments)]
 pub async fn seed(
     relay_url: &Target,
     pop: &Population,
+    mentions: &Arc<Mentions>,
     kinds: &KindTable,
     channels: &[String],
     target: u64,
@@ -179,9 +218,16 @@ pub async fn seed(
             .as_ref()
             .and_then(|n| pop.humans.iter().find(|h| h.name == *n))
             .and_then(|h| pop.keys_of(h).ok());
+        let role = if pop.humans.iter().any(|h| h.pubkey == rec.pubkey) {
+            Role::Human
+        } else {
+            Role::Agent
+        };
         tasks.push(tokio::spawn(writer(
             relay_url.clone(),
             rec.clone(),
+            role,
+            mentions.clone(),
             keys,
             oa_owner,
             *kinds,
@@ -230,7 +276,7 @@ mod tests {
     fn seed_event_is_an_unsequenced_channel_message() {
         let keys = Keys::generate();
         let k = kinds::sample_kinds();
-        let ev = seed_event(&keys, &k, "chan-a", 7).expect("build");
+        let ev = seed_event(&keys, &k, "chan-a", 7, None).expect("build");
         assert_eq!(ev.kind.as_u16(), k.msg);
         let names: Vec<&str> = ev
             .tags
@@ -239,5 +285,59 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["h"]);
         assert_eq!(ev.content.len(), CONTENT_BYTES);
+        let who = "cd".repeat(32);
+        let ev = seed_event(&keys, &k, "chan-a", 7, Some(&who)).expect("build");
+        let tags: Vec<Vec<String>> = ev.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+        assert_eq!(
+            tags,
+            vec![
+                vec!["h".to_string(), "chan-a".to_string()],
+                vec!["p".to_string(), who]
+            ]
+        );
+    }
+
+    /// The seed's mentions: the run's shares and skew, the tail never
+    /// tagged, no one tagging themselves, the same event always drawing the
+    /// same.
+    #[test]
+    fn the_seed_carries_mentions_with_the_runs_shares_and_tail() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../perf/clock-proof/profiles/proof-heavy.toml");
+        let profile = crate::sim::profile::load_profile(&path).expect("profile");
+        let pop = crate::sim::identity::generate_population(&profile);
+        let m = Mentions::new(&pop);
+        let k = kinds::sample_kinds();
+        let channels = vec!["chan-a".to_string(), "chan-b".to_string()];
+        for (rec, role, share) in [
+            (&pop.humans[0], Role::Human, mentions::HUMAN_SHARE),
+            (&pop.agents[0], Role::Agent, mentions::AGENT_SHARE),
+        ] {
+            let keys = pop.keys_of(rec).expect("keys");
+            let n = 4_000u64;
+            let mut tagged = 0;
+            for i in 0..n {
+                let ev =
+                    seed_message(&keys, &k, &channels, i, role, &rec.pubkey, &m).expect("build");
+                let ps: Vec<String> = ev
+                    .tags
+                    .iter()
+                    .filter(|t| t.as_slice().first().map(String::as_str) == Some("p"))
+                    .filter_map(|t| t.as_slice().get(1).cloned())
+                    .collect();
+                assert!(ps.len() <= 1, "more than one mention");
+                if let Some(who) = ps.first() {
+                    tagged += 1;
+                    assert!(!m.is_tail(who), "a tail identity was tagged in the seed");
+                    assert_ne!(who, &rec.pubkey, "a self-mention");
+                }
+            }
+            let got = tagged as f64 / n as f64;
+            assert!((got - share).abs() < 0.02, "{:?}: {got}", role);
+        }
+        assert_eq!(
+            seed_mention(&m, Role::Agent, &pop.agents[3].pubkey, 77),
+            seed_mention(&m, Role::Agent, &pop.agents[3].pubkey, 77)
+        );
     }
 }

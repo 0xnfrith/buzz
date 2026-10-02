@@ -803,11 +803,60 @@ as an empty feed.
 and `poll_ms_p50_le`, `poll_ms_p95_le` and `poll_ms_max_le`: the smallest of
 the histogram's bounds that holds half, 95% and all of them.
 
+**C, a poll on each live mention:** a human's desktop refetches its home
+feed on each live mention (`desktop/src/app/AppShell.tsx:231-233`, wired at
+`:380`). `tenant_sim` starts a whole poll at once for each message-kind event
+(9, 40002, 45001, 45003: the desktop's `HOME_MENTION_EVENT_KINDS`) that
+reaches a human's `#p` subscription from someone else, beside any poll in
+flight: the desktop's command already sent keeps running, so the relay sees
+no coalescing.
+
+**Poll times by mentions:** `summary.json`'s `polls` splits every poll into
+never-mentioned humans and the rest (counts, p50, p95, p99, max). A
+never-mentioned human's mentions query walks every event; a mentioned one's
+can stop at its 50th.
+
 **Not modelled: the unread observer.** The desktop also polls the channels
 of its *inactive* communities (`desktop/src/features/communities/useCommunityUnread.ts`,
 `communityUnreadObserver.ts:264-270`). The population is one community per
 relay, so a human here has no inactive community and the observer sends
 nothing. A person in several communities on one box would add it.
+
+## Mentions in messages
+
+A channel message (kind 9, a plain message or a media one) can tag one
+identity, `["p", <pubkey>]`, as an `@mention` or a reply does; so can the
+seed's messages, at the same shares and with the same skew, so the history
+carries them too. Both numbers come from one measurement, named in every
+use: **the operator's own relay: 24 channels, 30 days, an agent-heavy
+workspace** (1,540 kind-9 messages, 1,271 `p` tags, 15 authors, 14
+distinct recipients; counts only). About half of the
+agents' tags there are reply tags with no `@` in the text; for what a
+mention costs the relay, both count. `sim/mentions.rs` holds the model, and
+each run writes it to `<out-dir>/mentions.json`.
+
+- **How many messages carry a tag:** 85% of a human's, 77% of an agent's.
+- **Who gets them,** the measured rank curve mapped onto the population,
+  in team order (each human, then that human's agents):
+  - **the tail:** the last `ceil(2/15)` of the humans and of the agents are
+    never mentioned ("2 of the 15 authors were never tagged"): 4 of
+    `25h-75a`'s 25 humans and 10 of its 75 agents;
+  - **the head:** ranks 1 to 6 get 22.9, 22.7, 18.7, 10.5, 9.0 and 8.3%
+    of the tags; rank 1 is the first human, ranks 2 to 6 the next
+    identities in team order;
+  - **the middle:** everyone else shares the last 7.9% evenly;
+  - ranks the population is too small for are left out and the rest
+    renormalized; no one mentions themselves.
+
+**Why skewed, and why a tail:** a home-feed poll's mentions query reads
+newest-first and stops at its 50th match, so its cost depends on how often
+*that* person is mentioned. A person with fewer than 50 mentions in the
+history makes it walk every event (1.4 s at the heavy seed's volume, above),
+every 30 s. An even spread would give every human a cheap poll and size a
+box too small. On `25h-75a`'s seed the middle gets about 600 tags each in
+90 days, over 50: the never-mentioned humans are the whole tail. **The
+caveat:** the source is one agent-heavy workspace; a human-heavy customer
+may mention differently.
 
 ## Agent per-turn reads
 
@@ -977,7 +1026,7 @@ proof checks nothing is left by label.
 | `void` | generator a stopped (SIGSTOP) in the steady band | the loop voids on a's stale live file; exit 3 on that line |
 | `crash-gen` | generator b killed (SIGKILL) in the steady band | exit 3: "the generator for b stopped on its own: exited -9" |
 | `crash-clock` | the clock killed (SIGKILL) in the steady band | each generator's lease runs out (exit 5, `ended: lease`); the loop voids on a lost driver and exits 3; nothing ran `end` until the proof did |
-| `heavy-seed` | one generator, `25h-75a`'s 90-day seed (757,803 events) at raised limits | every event acknowledged, and the seed's time |
+| `heavy-seed` | one generator, `25h-75a`'s 90-day seed (757,803 events) at raised limits, with mentions | every event acknowledged, and the seed's time; the never-mentioned tail is 4 humans and 10 agents; its humans' poll times, apart from the mentioned humans' |
 
 **What only a rented run can show:** the relays on their own boxes and the
 generator on another, so the generator box's CPU and memory void is real

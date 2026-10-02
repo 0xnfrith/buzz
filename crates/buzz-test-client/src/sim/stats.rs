@@ -120,11 +120,24 @@ pub struct Summary {
     pub media: MediaStats,
     pub git: GitStats,
     pub reads: ReadStats,
+    /// Humans' home-feed polls in any band, never-mentioned humans apart
+    /// from the rest: a never-mentioned human's poll walks every event.
+    pub polls: PollStats,
     pub join_backfill_ms: Percentiles,
     pub gaps_detected: u64,
     pub lost_after_backfill: u64,
     pub rejects_by_message: BTreeMap<String, u64>,
     pub blink: Option<serde_json::Value>,
+}
+
+/// Home-feed polls and their whole times, by whether the human polling is
+/// ever mentioned (`mentions.rs`'s tail).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PollStats {
+    pub never_mentioned: u64,
+    pub never_mentioned_ms: Percentiles,
+    pub mentioned: u64,
+    pub mentioned_ms: Percentiles,
 }
 
 #[derive(Default)]
@@ -178,6 +191,9 @@ struct Inner {
     /// POLL_MS_BOUNDS and one past the last.
     polls: u64,
     poll_ms_buckets: [u64; POLL_MS_BOUNDS.len() + 1],
+    /// Every poll's time, by whether its human is never mentioned.
+    poll_ms_tail: Vec<f64>,
+    poll_ms_mentioned: Vec<f64>,
     /// Accepted sends by ack time, one count per bound in ACK_MS_BOUNDS
     /// and one past the last; cumulative in live.json.
     ack_ms_buckets: [u64; ACK_MS_BOUNDS.len() + 1],
@@ -558,10 +574,16 @@ impl Stats {
     }
 
     /// A home-feed poll that took `ms`, whole, begun in `band` (a sampled
-    /// band's name; others count in the totals only).
-    pub fn record_poll(&self, band: Option<&str>, ms: f64) {
+    /// band's name; others count in the totals only), by a human who is
+    /// never mentioned (`tail`) or not.
+    pub fn record_poll(&self, band: Option<&str>, ms: f64, tail: bool) {
         self.with(|s| {
             s.polls += 1;
+            if tail {
+                s.poll_ms_tail.push(ms);
+            } else {
+                s.poll_ms_mentioned.push(ms);
+            }
             let i = POLL_MS_BOUNDS
                 .iter()
                 .position(|&le| ms <= le as f64)
@@ -725,6 +747,12 @@ impl Stats {
                     push_ms: percentiles(s.git_push_ms.clone()),
                     failed: s.git_failed,
                 },
+                polls: PollStats {
+                    never_mentioned: s.poll_ms_tail.len() as u64,
+                    never_mentioned_ms: percentiles(s.poll_ms_tail.clone()),
+                    mentioned: s.poll_ms_mentioned.len() as u64,
+                    mentioned_ms: percentiles(s.poll_ms_mentioned.clone()),
+                },
                 reads: ReadStats {
                     reads: s.reads,
                     ms: percentiles(s.read_ms.clone()),
@@ -886,6 +914,30 @@ mod tests {
         let summary = st.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
         assert_eq!((summary.media.uploads, summary.media.rejected), (1, 6));
         assert_eq!((summary.git.pushes, summary.git.failed), (1, 3));
+    }
+
+    /// Poll times: never-mentioned humans' apart from the rest, over every
+    /// band; each band's own, and live.json's histogram, over both.
+    #[test]
+    fn poll_times_are_split_by_whether_the_human_is_mentioned() {
+        let st = Stats::new();
+        st.record_poll(Some("steady"), 1400.0, true);
+        st.record_poll(Some("steady"), 1500.0, true);
+        st.record_poll(Some("steady"), 90.0, false);
+        st.record_poll(None, 80.0, false);
+        let summary = st.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
+        assert_eq!(
+            (summary.polls.never_mentioned, summary.polls.mentioned),
+            (2, 2)
+        );
+        assert_eq!(summary.polls.never_mentioned_ms.max, 1500.0);
+        assert_eq!(summary.polls.mentioned_ms.max, 90.0);
+        assert_eq!(summary.bands["steady"].polls, 3);
+        let live = st.live(1);
+        assert_eq!(
+            (live.polls, live.poll_ms_le["100"], live.poll_ms_le["2500"]),
+            (4, 2, 4)
+        );
     }
 
     #[test]

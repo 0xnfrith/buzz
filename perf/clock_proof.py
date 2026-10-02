@@ -18,7 +18,7 @@ and the proof exits 1 if any failed.
 | `void` | generator a stopped (SIGSTOP) in the steady band | the loop voids on its stale live file; exit 3 on that line; `end` ran |
 | `crash-gen` | generator b killed (SIGKILL) in the steady band | exit 3: the generator for b stopped on its own; `end` ran |
 | `crash-clock` | the clock killed (SIGKILL) in the steady band | each generator's lease runs out (exit 5, `ended: lease`), the loop voids; nothing ran `end` until the proof did |
-| `heavy-seed` | one generator, the heavy profile's 90-day seed at raised limits | the seed's time, every event acknowledged |
+| `heavy-seed` | one generator, the heavy profile's 90-day seed at raised limits, with mentions | the seed's time, every event acknowledged; the never-mentioned tail (4 humans, 10 agents); its humans' poll times apart from the mentioned ones' |
 
 Every image must already be on this machine by its exact reference: the
 proof checks each first and stops if one is missing; Compose runs with
@@ -387,6 +387,18 @@ class Proof:
               + (f" ({HEAVY_SEED_EVENTS / secs:.0f} events/s)" if secs else "")
               + f". Rig: {platform.machine()} {platform.system()}, relay image {IMAGES[0]} capped at 2 CPUs and 2 GB,"
               " Docker Hub's MinIO (arm64), Postgres and Redis uncapped, the generator on the same machine.")
+        # Mentions: the never-mentioned tail, and its humans' polls apart.
+        m = read_json(out / "mentions.json")
+        tail = [r for r in m.get("recipients") or [] if r.get("tail")]
+        humans = {h.get("pubkey") for h in (read_json(out / "identities.json").get("humans") or [])}
+        tail_h = sum(1 for r in tail if r.get("pubkey") in humans)
+        self.eq(row, "the never-mentioned tail: humans and agents", (tail_h, len(tail) - tail_h), (4, 10))
+        polls = read_json(out / "summary.json").get("polls") or {}
+        self.check(row, "both the tail's humans and the mentioned ones polled",
+                   (polls.get("never_mentioned") or 0) > 0 and (polls.get("mentioned") or 0) > 0, json.dumps(polls))
+        print(f"  HEAVY POLLS ({m.get('source')}): never-mentioned humans {polls.get('never_mentioned')} polls, "
+              f"{json.dumps(polls.get('never_mentioned_ms'))} ms; mentioned {polls.get('mentioned')} polls, "
+              f"{json.dumps(polls.get('mentioned_ms'))} ms")
         self.end(row, cfg)
 
     def rules_cadence(self, row: str, log: list[dict[str, Any]]) -> None:
