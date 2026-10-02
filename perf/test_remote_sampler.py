@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import remote_sampler as rs
 import tenant_cogs
+from planted_env import assert_names, parent_env
 
 H1, H2 = "a" * 64, "b" * 64
 
@@ -186,8 +187,12 @@ class Guard(unittest.TestCase):
             "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
             "-o", "LogLevel=ERROR", "-l", "root", "-p", "22", "--", "10.77.0.3", "fast",
         ])
-        self.assertEqual(rs.ssh_env()["PATH"], "/usr/bin:/bin")
-        self.assertNotIn("SSH_AUTH_SOCK", rs.ssh_env())
+        # A fixed fake parent with an agent socket and the planted dummies;
+        # names compared, never values (planted_env.assert_names).
+        with mock.patch.dict(os.environ, parent_env(SSH_AUTH_SOCK="/tmp/agent.sock"), clear=True):
+            env = rs.ssh_env()
+        assert_names(self, env, ["HOME", "LC_ALL", "PATH"])
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
 
 
 class Replies(unittest.TestCase):
