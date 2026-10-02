@@ -87,8 +87,8 @@ provably inside the test range. The rules are the same in both, and
   variables and system proxy settings, follows no redirect and has a resolver
   that refuses every name. `git` runs with `http.followRedirects=false`,
   `http.proxy=` (empty: no proxy), only the http(s) transports allowed, and
-  the proxy variables (`HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY`, both cases),
-  `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` removed from its environment.
+  a fixed environment (see "Child environments"): no proxy variable,
+  `GIT_CONFIG_PARAMETERS` or `GIT_CONFIG_COUNT` of the caller's reaches it.
   Pushes name the checked URL, not `origin`. The sampler reads HTTP through an
   opener with no proxy handler and a redirect handler that refuses.
 - **The Docker endpoint must be a local Unix socket.** `run`, `seed-bench`,
@@ -124,6 +124,46 @@ Every connection and where it is checked:
 
 `git-credential-nostr` makes no network connection: it signs a NIP-98 event
 for the URL git hands it and runs `git config` locally.
+
+## Child environments
+
+Every child the harness starts gets a fixed environment: the names it needs,
+each taken from the harness's own environment or set one by one, and nothing
+else. No credential of the caller's reaches a child, whatever its name.
+`tenant_cogs.py` builds the Python side's sets (`child_env`, `docker_env`,
+`python_env`, `command_env`); the local proof and its hook take theirs from
+there. `sim/childenv.rs` and `sim/git.rs` build the generator's.
+
+| Child | Started by | Its environment |
+|---|---|---|
+| `tenant_sim` | `run`, `seed-bench`, the proof's hook | `PATH`, `HOME`, `LC_ALL=C`. It reads no variable of its own; `--log-level` replaces `RUST_LOG` |
+| `git` (and the credential helper it runs) | `tenant_sim` | `PATH`, `HOME=/nonexistent`, `LC_ALL=C`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, the identity's own `NOSTR_PRIVATE_KEY`, and for an agent its own `BUZZ_AUTH_TAG`. `HOME` points at nothing, so no `.gitconfig`, `.netrc` or git config folder can reach git or its curl |
+| `kill`, `mkfifo` | `tenant_sim` | `PATH` |
+| `docker`, `docker compose` | `run`, `seed-bench`, `sample`, `fingerprint`, the proof and its hook | `PATH`, `HOME` (the CLI finds its plugins there), `DOCKER_HOST` set to the checked endpoint, and the stack's named values (`BUZZ_IMAGE`, `SIM_*`, `PROOF_*`). The three rate limits only when raised for setup |
+| a Python child: the proof's clock, the hook's `end`, the hook's supervisor, the sampler loop | the proof, the hook | `PATH`, `HOME`, `LC_ALL=C`, `PYTHONDONTWRITEBYTECODE=1` |
+| `sysctl`, `sw_vers`, `git rev-parse`, `openssl` | `run()` | `PATH`, `HOME`, `LC_ALL=C` and the command's own named values |
+| `ssh` | the sampler loop | `PATH=/usr/bin:/bin`, `HOME`, `LC_ALL=C` (`remote_sampler.ssh_env`) |
+
+- **The clock's hook.** The clock (`band_clock.py`) runs the hook with its
+  own environment, so the clock gets its fixed set where it starts, and the
+  hook gets the same. On macOS, Python adds `__CF_USER_TEXT_ENCODING`
+  (CoreFoundation's text encoding, never a credential) to its own
+  environment, so that one name reaches the hook there too.
+- **k3s, a known limit.** The k3s paths (`kubectl`, and `ssh` in
+  `fingerprint_k3s`) get `run()`'s set, so they would lose `KUBECONFIG` and
+  `SSH_AUTH_SOCK`. k3s is disabled (below); turning it back on needs those
+  two settled first.
+- **The rows** (`test_child_env.py`, and `git.rs`'s and `signal.rs`'s own):
+  the parent holds `G613_PLANTED`, the caller's credentials and, for docker,
+  a hostile `DOCKER_HOST` and `DOCKER_CONTEXT`, all dummies made at run time.
+  The real path runs to a perl stub that records names only, and the names
+  must equal the set exactly. A name both planted and in a set (git's key and
+  tag, `DOCKER_HOST`, the raised limits) must hold the right value. A
+  syntax-tree row holds every `subprocess` call in `tenant_cogs.py`,
+  `clock_proof.py` and the hook to one of the four functions. The checks that
+  compare an environment compare names, never values, and a row runs each
+  with its code made to leak: it must fail without printing a planted value
+  (`test_env_checks.py`).
 
 ## Substrate: local compose (relative numbers)
 
@@ -278,8 +318,9 @@ not start the relay and cannot restart it.
 - Agents carry the same attestation on HTTP: `x-auth-tag` on media uploads,
   `BUZZ_AUTH_TAG` for the git credential helper.
 - `tenant_sim` and its git children authenticate only with keys the run
-  generates. Every `BUZZ_*` and `NOSTR_*` variable in the caller's
-  environment is removed before they start.
+  generates. Each starts from a fixed environment (see "Child
+  environments"): no credential of the caller's, under any name, reaches
+  them.
 - Only a repo's owner can push to it. The profile's `git_push` rate is per
   agent, so the repo-owning agents carry the whole population's pushes and
   total push volume matches the profile.
@@ -512,6 +553,8 @@ rounded up.
 python3 -m unittest perf/test_tenant_cogs.py
 # from the perf/ directory:
 cd perf && python3 -m unittest test_tenant_cogs.py test_box_sampler.py test_remote_sampler.py
+# every child's environment, and the checks that compare one:
+cd perf && python3 -m unittest test_child_env.py test_env_checks.py
 ```
 
 The profile is parsed as TOML by both `tenant_sim` and `tenant_cogs.py`, so
@@ -1072,7 +1115,11 @@ drives its own stack, a Compose project `<prefix>-a` or `<prefix>-b`
 (`perf/clock-proof/compose.yml`), through `perf/clock_proof_hook.py`. It
 prints which `python3` ran and checks first that every image is already
 here by its exact reference (Compose runs with `--pull never`; a missing
-image stops the proof) and that both projects are empty. The proof
+image stops the proof) and that both projects are empty. Before that, it
+resolves the Docker endpoint once, as `run` does, and refuses anything but
+a local Unix socket: exit 2, "refused: docker endpoint refused: ...",
+before anything runs. Every docker call of the proof and its hook goes to
+that socket. The proof
 profiles in `perf/clock-proof/profiles` are pinned by `SHA256SUMS`: short
 bands, and rates high enough that a short band has its 20 acks and agents
 take turns. Every check prints PASS or FAIL; the proof exits 1 if any
