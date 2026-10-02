@@ -98,15 +98,19 @@ def run(
     env: dict[str, str] | None = None,
     timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Every command the harness runs. A `docker` command must name a checked
-    endpoint (`docker_cmd`); it then runs with that endpoint as DOCKER_HOST and
-    without DOCKER_CONTEXT, whatever `env` or this process's environment says."""
+    """Every command the harness runs, with a fixed environment (`env` holds
+    only the command's own named values, never this process's). A `docker`
+    command must name a checked endpoint (`docker_cmd`); it then runs with
+    `docker_env`: that endpoint as DOCKER_HOST, whatever `env` or this
+    process's environment says. Any other command runs with `command_env`."""
     if cmd and cmd[0] == "docker":
         if len(cmd) < 3 or cmd[1] != "--host" or not isinstance(cmd[2], DockerEndpoint):
             raise Refused(
                 f"docker command without a checked endpoint: {cmd[:3]}. Nothing was run."
             )
         env = docker_env(cmd[2], env)
+    else:
+        env = command_env(env)
     return subprocess.run(
         cmd,
         check=check,
@@ -117,17 +121,43 @@ def run(
     )
 
 
-def child_env(env: dict[str, str] | None = None) -> dict[str, str]:
-    """Env for tenant_sim: the caller's own Buzz/Nostr credentials removed.
+# --- Child environments -------------------------------------------------------
+# Every child the harness starts gets a fixed environment: the names it needs,
+# each taken or set one by one, and nothing else of this process's. A deny-list
+# (every BUZZ_* and NOSTR_*) let through anything it didn't name, so a
+# credential under any other name reached tenant_sim, git's credential helper,
+# docker and compose. The local proof's clock and hook take theirs from here too.
 
-    tenant_sim authenticates only with the keys it generates. A `BUZZ_*` or
-    `NOSTR_*` value inherited from the operator's shell (for example an
-    agent's `BUZZ_AUTH_TAG`) would otherwise reach the git credential helper.
-    """
-    src = os.environ if env is None else env
-    return {
-        k: v for k, v in src.items() if not (k.startswith("BUZZ_") or k.startswith("NOSTR_"))
-    }
+# The names a child takes from this process: where its programs are, and its
+# home (docker finds its CLI plugins there).
+INHERITED_NAMES = ("PATH", "HOME")
+
+
+def fixed_env(values: Mapping[str, str] | None = None) -> dict[str, str]:
+    """PATH and HOME from this process (each only if set), then `values`."""
+    out = {k: os.environ[k] for k in INHERITED_NAMES if k in os.environ}
+    out.update(values or {})
+    return out
+
+
+def child_env() -> dict[str, str]:
+    """tenant_sim's environment: PATH, HOME, LC_ALL=C. It authenticates only
+    with the keys it generates and reads no variable of its own
+    (`--log-level` replaces RUST_LOG)."""
+    return fixed_env({"LC_ALL": "C"})
+
+
+def command_env(values: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Any other command's (`sysctl`, `sw_vers`, `git rev-parse`, `openssl`):
+    PATH, HOME, LC_ALL=C, then the command's own named `values`."""
+    return fixed_env({"LC_ALL": "C", **(values or {})})
+
+
+def python_env() -> dict[str, str]:
+    """A Python child's (the local proof's clock, its hook, the hook's
+    supervisor and the sampler loop): PATH, HOME, LC_ALL=C and
+    PYTHONDONTWRITEBYTECODE=1."""
+    return fixed_env({"LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"})
 
 
 def raised_limit_env(limit: int) -> dict[str, str]:
@@ -254,12 +284,11 @@ def docker_cmd(endpoint: DockerEndpoint, *args: str) -> list[str]:
 
 
 def docker_env(endpoint: DockerEndpoint, env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """`env` (default: this process's) with DOCKER_HOST set to `endpoint` and
-    DOCKER_CONTEXT removed."""
-    src = os.environ if env is None else env
-    out = {k: v for k, v in src.items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
-    out["DOCKER_HOST"] = str(endpoint)
-    return out
+    """docker's and compose's environment: PATH, HOME, the stack's named
+    values in `env`, and DOCKER_HOST set to `endpoint` (so no DOCKER_HOST or
+    DOCKER_CONTEXT of anyone else's)."""
+    named = {k: v for k, v in (env or {}).items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
+    return fixed_env({**named, "DOCKER_HOST": str(endpoint)})
 
 
 # --- Target guard ------------------------------------------------------------
@@ -975,8 +1004,10 @@ class ComposeAdapter:
         # This process's lock on the project; `up` refuses without it.
         self.lock = lock
         self.files = files
-        # Never inherit rate-limit overrides from the caller's shell.
-        self.env = without_limit_env({**os.environ, **(env or {})})
+        # The stack's named values only (docker_env adds PATH, HOME and the
+        # endpoint), and never a rate-limit override: `up` adds those for
+        # setup alone.
+        self.env = without_limit_env(dict(env or {}))
         # True once this process has run `up` on the (verified empty) project;
         # teardown removes only a stack this process brought up.
         self.owned = False
@@ -1798,13 +1829,12 @@ def cmd_sample(args: argparse.Namespace) -> int:
 
 
 def sim_env(args: argparse.Namespace, profile_path: Path) -> tuple[dict[str, str], str]:
-    """Env for the compose relay: image pin, seeded owner, fresh per-run keys."""
-    env = os.environ.copy()
-    image = args.buzz_image or env.get("BUZZ_IMAGE", "ghcr.io/block/buzz:sha-6e5c462")
+    """The compose relay's named values: image pin, seeded owner, fresh
+    per-run keys. Nothing of this process's environment."""
+    env: dict[str, str] = {}
+    image = args.buzz_image or os.environ.get("BUZZ_IMAGE", "ghcr.io/block/buzz:sha-6e5c462")
     env["BUZZ_IMAGE"] = image
-    print_owner = run(
-        [args.tenant_sim, "--print-owner", "--profile", str(profile_path)], env=child_env()
-    )
+    print_owner = run([args.tenant_sim, "--print-owner", "--profile", str(profile_path)])
     env["SIM_OWNER_PUBKEY"] = print_owner.stdout.strip()
     env["SIM_RELAY_KEY"] = run(["openssl", "rand", "-hex", "32"]).stdout.strip()
     env["SIM_GIT_HMAC"] = run(["openssl", "rand", "-hex", "32"]).stdout.strip()

@@ -76,25 +76,14 @@ fn wait_child_deadline(child: std::process::Child, timeout: Duration) -> Result<
     match rx.recv_timeout(timeout) {
         Ok(out) => out.context("wait child"),
         Err(_) => {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let _ = super::childenv::path_only(&mut Command::new("kill"))
+                .args(["-9", &pid.to_string()])
+                .status();
             let _ = rx.recv_timeout(Duration::from_secs(2));
             Err(anyhow!("command pid {pid} timed out after {timeout:?}"))
         }
     }
 }
-
-/// Proxy variables git or libcurl would read, in both spellings. Cleared
-/// from git's environment; `http.proxy=` also switches proxying off.
-pub const PROXY_VARS: [&str; 8] = [
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-    "NO_PROXY",
-    "no_proxy",
-];
 
 /// Settings that keep git on the one checked address: no redirects, no
 /// proxy, and only the http(s) transports.
@@ -106,30 +95,27 @@ pub const GIT_GUARD_CONFIG: [&str; 5] = [
     "protocol.https.allow=always",
 ];
 
-/// Credential variables the credential helper (or anything it runs) could
-/// pick up from the caller: every `BUZZ_*` and `NOSTR_*` name.
-fn inherited_credentials(vars: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    vars.into_iter()
-        .filter(|name| {
-            name.to_str()
-                .is_some_and(|n| n.starts_with("BUZZ_") || n.starts_with("NOSTR_"))
-        })
-        .collect()
-}
+/// git's `HOME`: a path with nothing at it. No file under a home folder
+/// (`.gitconfig`, `.netrc`, git's `.config`) can reach git or its curl, and
+/// `GIT_CONFIG_GLOBAL` is `/dev/null` besides.
+pub const GIT_HOME: &str = "/nonexistent";
 
-/// `git` that authenticates only as this simulated identity. The caller's
-/// own Buzz/Nostr credentials (for example an agent's `BUZZ_AUTH_TAG`) are
-/// removed, then this identity's key and, for an agent, its own NIP-OA tag
-/// are set. Git follows no redirect and uses no proxy (see
-/// [`GIT_GUARD_CONFIG`]); injected config (`GIT_CONFIG_PARAMETERS`,
-/// `GIT_CONFIG_COUNT`) and proxy variables are removed.
+/// `git` that authenticates only as this simulated identity, with a fixed
+/// environment: `PATH` (the generator's, given as `path`), `HOME`
+/// ([`GIT_HOME`]), `LC_ALL=C`, git's own config switched off
+/// (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`), no prompt
+/// (`GIT_TERMINAL_PROMPT=0`), and this identity's key and, for an agent,
+/// its own NIP-OA tag. Nothing else of the generator's comes through, so no
+/// credential, proxy or injected config of the caller's reaches git or the
+/// credential helper it runs. Git follows no redirect and uses no proxy
+/// (see [`GIT_GUARD_CONFIG`]).
 fn git_command(
     args: &[&str],
     cwd: &Path,
     helper: &Path,
     nsec: &str,
     auth_tag: Option<&str>,
-    inherited: impl IntoIterator<Item = OsString>,
+    path: Option<OsString>,
 ) -> Command {
     let helper = abs_helper(helper);
     let mut cmd = Command::new("git");
@@ -150,19 +136,16 @@ fn git_command(
     for setting in GIT_GUARD_CONFIG {
         cmd.args(["-c", setting]);
     }
-    cmd.args(args)
-        .current_dir(cwd)
+    cmd.args(args).current_dir(cwd).env_clear();
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", GIT_HOME)
+        .env("LC_ALL", "C")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS");
-    for name in PROXY_VARS {
-        cmd.env_remove(name);
-    }
-    for name in inherited_credentials(inherited) {
-        cmd.env_remove(name);
-    }
-    cmd.env("NOSTR_PRIVATE_KEY", nsec);
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("NOSTR_PRIVATE_KEY", nsec);
     if let Some(tag) = auth_tag {
         cmd.env("BUZZ_AUTH_TAG", tag);
     }
@@ -178,8 +161,8 @@ fn git_cmd(
     auth_tag: Option<&str>,
     timeout: Duration,
 ) -> Result<Output> {
-    let inherited = std::env::vars_os().map(|(name, _)| name);
-    let child = git_command(args, cwd, helper, nsec, auth_tag, inherited)
+    let path = std::env::var_os("PATH");
+    let child = git_command(args, cwd, helper, nsec, auth_tag, path)
         .spawn()
         .with_context(|| format!("spawn git {args:?}"))?;
     wait_child_deadline(child, timeout).with_context(|| format!("git {args:?}"))
@@ -366,47 +349,124 @@ mod tests {
             .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
     }
 
+    /// The values git's fixed set holds: the given `PATH`, the empty
+    /// `HOME`, git's config off, no prompt, and the identity's own key and
+    /// tag.
     #[test]
-    fn git_uses_only_the_simulated_identitys_credentials() {
-        let inherited = [
-            "BUZZ_AUTH_TAG",
-            "BUZZ_PRIVATE_KEY",
-            "NOSTR_PRIVATE_KEY",
-            "PATH",
-        ]
-        .map(OsString::from);
+    fn git_sets_its_fixed_values() {
         let agent = git_command(
             &["push"],
             Path::new("."),
             Path::new("/bin/true"),
             "nsec-agent",
             Some("[\"auth\",\"owner\",\"\",\"sig\"]"),
-            inherited.clone(),
+            Some(OsString::from("/usr/bin:/bin")),
         );
-        assert_eq!(
-            env_of(&agent, "BUZZ_AUTH_TAG"),
-            Some(Some("[\"auth\",\"owner\",\"\",\"sig\"]".into()))
-        );
-        assert_eq!(
-            env_of(&agent, "NOSTR_PRIVATE_KEY"),
-            Some(Some("nsec-agent".into()))
-        );
-        // The caller's own key is removed, not passed through.
-        assert_eq!(env_of(&agent, "BUZZ_PRIVATE_KEY"), Some(None));
-        assert_eq!(env_of(&agent, "PATH"), None);
-
+        for (name, want) in [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", GIT_HOME),
+            ("LC_ALL", "C"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("NOSTR_PRIVATE_KEY", "nsec-agent"),
+            ("BUZZ_AUTH_TAG", "[\"auth\",\"owner\",\"\",\"sig\"]"),
+        ] {
+            assert_eq!(env_of(&agent, name), Some(Some(want.into())), "{name}");
+        }
         let human = git_command(
             &["push"],
             Path::new("."),
             Path::new("/bin/true"),
             "nsec-human",
             None,
-            inherited,
+            None,
         );
-        // A human carries no NIP-OA tag, and never the caller's.
-        assert_eq!(env_of(&human, "BUZZ_AUTH_TAG"), Some(None));
+        // A human carries no NIP-OA tag; without a PATH given, none is set.
+        assert_eq!(env_of(&human, "BUZZ_AUTH_TAG"), None);
+        assert_eq!(env_of(&human, "PATH"), None);
     }
 
+    const GIT_ENV_CHILD: &str = "sim::git::tests::git_gets_exactly_its_fixed_set";
+
+    /// A planted-variable row. The parent (a fresh copy of this test
+    /// binary) holds `G613_PLANTED`, its own credentials, a proxy and git's
+    /// injected config, all dummies made now. The real path (`git_ok`)
+    /// runs to a stub `git` first on `PATH`, which records names only. An
+    /// agent's git gets exactly the fixed set, with its own key and tag
+    /// (`match`, never the parent's); a human's the same without a tag.
+    #[test]
+    fn git_gets_exactly_its_fixed_set() {
+        if testsrv::is_child(GIT_ENV_CHILD) {
+            let dir = PathBuf::from(std::env::var_os("G613_ROW_DIR").expect("row dir"));
+            let nsec = std::fs::read_to_string(dir.join("nsec")).expect("nsec");
+            let tag = std::fs::read_to_string(dir.join("tag")).expect("tag");
+            let helper = Path::new("/usr/bin/true");
+            git_ok(&["push"], &dir, helper, &nsec, Some(&tag)).expect("agent's git");
+            git_ok(&["push"], &dir, helper, &nsec, None).expect("human's git");
+            println!("CHILD_OK {GIT_ENV_CHILD}");
+            return;
+        }
+        let dir = testsrv::tempdir();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let (nsec, tag) = (stub::dummy(), stub::dummy());
+        std::fs::write(dir.join("nsec"), &nsec).expect("nsec");
+        std::fs::write(dir.join("tag"), &tag).expect("tag");
+        let out = dir.join("names");
+        stub::write(
+            &bin,
+            "git",
+            &out,
+            &[("NOSTR_PRIVATE_KEY", &nsec), ("BUZZ_AUTH_TAG", &tag)],
+            None,
+        );
+        let mut env = stub::planted();
+        env.push(("G613_ROW_DIR", dir.display().to_string()));
+        let path = std::env::var("PATH").unwrap_or_default();
+        env.push(("PATH", format!("{}:{path}", bin.display())));
+        testsrv::run_child(GIT_ENV_CHILD, &env);
+        let fixed = [
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_TERMINAL_PROMPT",
+            "HOME",
+            "LC_ALL",
+            "NOSTR_PRIVATE_KEY=match",
+            "PATH",
+        ];
+        let mut agent = stub::set(&fixed);
+        agent.insert("BUZZ_AUTH_TAG=match".into());
+        assert_eq!(stub::lines(&out), vec![agent, stub::set(&fixed)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const KILL_ENV_CHILD: &str = "sim::git::tests::kill_gets_only_path";
+
+    /// A planted-variable row for the `kill` a git past its deadline gets:
+    /// the stub records names, then runs the real `/bin/kill`.
+    #[test]
+    fn kill_gets_only_path() {
+        if testsrv::is_child(KILL_ENV_CHILD) {
+            let child = Command::new("sleep").arg("5").spawn().expect("spawn sleep");
+            let err = wait_child_deadline(child, Duration::from_millis(200))
+                .expect_err("past its deadline");
+            assert!(err.to_string().contains("timed out"), "{err:#}");
+            println!("CHILD_OK {KILL_ENV_CHILD}");
+            return;
+        }
+        let dir = testsrv::tempdir();
+        let out = dir.join("names");
+        stub::write(&dir, "kill", &out, &[], Some("/bin/kill"));
+        let mut env = stub::planted();
+        let path = std::env::var("PATH").unwrap_or_default();
+        env.push(("PATH", format!("{}:{path}", dir.display())));
+        testsrv::run_child(KILL_ENV_CHILD, &env);
+        assert_eq!(stub::lines(&out), vec![stub::set(&["PATH"])]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    use crate::sim::childenv::stub;
     use crate::sim::guard::testsrv::{self, Server};
     use crate::sim::guard::{Cidr, TargetGuard};
 
@@ -424,14 +484,14 @@ mod tests {
     const NSEC: &str = "nsec-test";
 
     #[test]
-    fn git_carries_the_guard_settings_and_drops_proxy_and_config_vars() {
+    fn git_carries_the_guard_settings() {
         let cmd = git_command(
             &["push"],
             Path::new("."),
             Path::new("/usr/bin/true"),
             NSEC,
             None,
-            [],
+            None,
         );
         let args: Vec<String> = cmd
             .get_args()
@@ -447,12 +507,6 @@ mod tests {
         assert!(args[..push]
             .iter()
             .any(|a| a == "http.followRedirects=false"));
-        for name in PROXY_VARS
-            .iter()
-            .chain(["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"].iter())
-        {
-            assert_eq!(env_of(&cmd, name), Some(None), "{name} not removed");
-        }
     }
 
     /// A 302 from the allowed remote to a denied address is not followed.

@@ -213,7 +213,9 @@ pub fn spawn(kind: &str, out_dir: &Path, ramp_start: usize) -> Result<Control> {
             if path.exists() {
                 std::fs::remove_file(&path)?;
             }
-            let status = std::process::Command::new("mkfifo").arg(&path).status()?;
+            let status = super::childenv::path_only(&mut std::process::Command::new("mkfifo"))
+                .arg(&path)
+                .status()?;
             if !status.success() {
                 bail!("mkfifo {} failed", path.display());
             }
@@ -507,5 +509,38 @@ mod tests {
         assert!(shared.take("stop", true));
         shared.end(Ended::Lease);
         assert_eq!(control.ended(), Some(Ended::Stop));
+    }
+
+    const MKFIFO_ENV_CHILD: &str = "sim::signal::tests::mkfifo_gets_only_path";
+
+    /// A planted-variable row for the `mkfifo` a fifo band signal runs: the
+    /// stub records names, then runs the real `/usr/bin/mkfifo`.
+    #[test]
+    fn mkfifo_gets_only_path() {
+        use crate::sim::childenv::stub;
+        use crate::sim::guard::testsrv;
+        if testsrv::is_child(MKFIFO_ENV_CHILD) {
+            let dir = std::path::PathBuf::from(std::env::var_os("G613_ROW_DIR").expect("row dir"));
+            let _control = spawn("fifo", &dir, 0).expect("spawn");
+            use std::os::unix::fs::FileTypeExt;
+            let kind = std::fs::metadata(dir.join("band.fifo"))
+                .expect("fifo")
+                .file_type();
+            assert!(kind.is_fifo(), "band.fifo is not a fifo");
+            println!("CHILD_OK {MKFIFO_ENV_CHILD}");
+            return;
+        }
+        let dir = testsrv::tempdir();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let out = dir.join("names");
+        stub::write(&bin, "mkfifo", &out, &[], Some("/usr/bin/mkfifo"));
+        let mut env = stub::planted();
+        env.push(("G613_ROW_DIR", dir.display().to_string()));
+        let path = std::env::var("PATH").unwrap_or_default();
+        env.push(("PATH", format!("{}:{path}", bin.display())));
+        testsrv::run_child(MKFIFO_ENV_CHILD, &env);
+        assert_eq!(stub::lines(&out), vec![stub::set(&["PATH"])]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

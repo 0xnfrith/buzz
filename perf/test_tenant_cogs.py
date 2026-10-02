@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cogs_report
 import tenant_cogs
+from planted_env import assert_names, parent_env
 
 _LOCK_TMP: tempfile.TemporaryDirectory | None = None
 _REAL_LOCK_DIR = tenant_cogs.LOCK_DIR
@@ -1549,7 +1550,9 @@ class DockerEndpointTests(unittest.TestCase):
         hostile = {"DOCKER_HOST": "ssh://root@203.0.113.9", "DOCKER_CONTEXT": "prod"}
         ad = locked_adapter(self, "buzz-harness-endpoint", env={"SIM_RELAY_KEY": "k"})
         execs = tenant_cogs.ExecAdapter(kind="compose", project="buzz-harness-endpoint", endpoint=TEST_EP)
-        with mock.patch.dict(os.environ, hostile), mock.patch.object(
+        # A fixed fake parent with the planted dummies; names compared, never
+        # values (planted_env.assert_names).
+        with mock.patch.dict(os.environ, parent_env(**hostile), clear=True), mock.patch.object(
             tenant_cogs.subprocess, "run", fake_subprocess_run
         ):
             with tenant_cogs.RunSession(ad, keep=False):
@@ -1560,7 +1563,8 @@ class DockerEndpointTests(unittest.TestCase):
         for cmd, env in seen:
             self.assertEqual(cmd[:3], ["docker", "--host", TEST_EP], cmd)
             self.assertEqual(env["DOCKER_HOST"], TEST_EP, cmd)
-            self.assertNotIn("DOCKER_CONTEXT", env, cmd)
+            # The stack's own calls carry its named value; the rest don't.
+            assert_names(self, [k for k in env if k != "SIM_RELAY_KEY"], ["DOCKER_HOST", "HOME", "PATH"])
         self.assertEqual(seen[0][1]["SIM_RELAY_KEY"], "k")
 
 
@@ -1690,17 +1694,10 @@ VARS = tenant_cogs.RATE_LIMIT_VARS
 
 class SetupRateLimitTests(unittest.TestCase):
     def test_tenant_sim_env_drops_caller_credentials(self) -> None:
-        env = {
-            "PATH": "/usr/bin",
-            "BUZZ_AUTH_TAG": '["auth","o","","s"]',
-            "BUZZ_PRIVATE_KEY": "k",
-            "NOSTR_PRIVATE_KEY": "n",
-            "BUZZ_IMAGE": "img",
-        }
-        out = tenant_cogs.child_env(env)
-        self.assertEqual(out, {"PATH": "/usr/bin"})
-        with mock.patch.dict(os.environ, {"BUZZ_AUTH_TAG": "x"}):
-            self.assertNotIn("BUZZ_AUTH_TAG", tenant_cogs.child_env())
+        # A fixed fake parent with the planted dummies; names compared, never
+        # values (planted_env.assert_names).
+        with mock.patch.dict(os.environ, parent_env(BUZZ_IMAGE="img"), clear=True):
+            assert_names(self, tenant_cogs.child_env(), ["HOME", "LC_ALL", "PATH"])
 
     def test_raised_env_covers_every_var(self) -> None:
         env = tenant_cogs.raised_limit_env(500)
@@ -1709,9 +1706,9 @@ class SetupRateLimitTests(unittest.TestCase):
         self.assertEqual(tenant_cogs.raised_limit_env(0), {})
 
     def test_adapter_never_inherits_shell_overrides(self) -> None:
-        with mock.patch.dict(os.environ, {VARS[0]: "7"}):
+        with mock.patch.dict(os.environ, parent_env(**{VARS[0]: "7"}), clear=True):
             ad = tenant_cogs.ComposeAdapter("buzz-harness-t1", env={"BUZZ_IMAGE": "img"}, endpoint=TEST_EP)
-        self.assertNotIn(VARS[0], ad.env)
+        assert_names(self, ad.env, ["BUZZ_IMAGE"])
         self.assertEqual(ad.env["BUZZ_IMAGE"], "img")
 
     def test_up_raises_then_recreate_restores_defaults(self) -> None:
@@ -1724,15 +1721,17 @@ class SetupRateLimitTests(unittest.TestCase):
                 calls.append((cmd, dict(kw.get("env") or {})))
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        ad = locked_adapter(self, "buzz-harness-t1", files=tenant_cogs.COMPOSE_FILES, env={"SIM_RELAY_KEY": "k"})
-        with mock.patch.object(tenant_cogs, "run", fake_run):
-            ad.up(tenant_cogs.raised_limit_env(1000))
-            ad.recreate_relay()
+        with mock.patch.dict(os.environ, parent_env(**{name: "7" for name in VARS}), clear=True):
+            ad = locked_adapter(self, "buzz-harness-t1", files=tenant_cogs.COMPOSE_FILES, env={"SIM_RELAY_KEY": "k"})
+            with mock.patch.object(tenant_cogs, "run", fake_run):
+                ad.up(tenant_cogs.raised_limit_env(1000))
+                ad.recreate_relay()
         (up_cmd, up_env), (re_cmd, re_env) = calls
         self.assertEqual(up_cmd[-2:], ["up", "-d"])
+        assert_names(self, up_env, ["SIM_RELAY_KEY", *VARS])
+        assert_names(self, re_env, ["SIM_RELAY_KEY"])
         for name in VARS:
-            self.assertEqual(up_env[name], "1000")
-            self.assertNotIn(name, re_env)
+            self.assertEqual(up_env[name], "1000", name)
         self.assertEqual(re_cmd[-5:], ["up", "-d", "--no-deps", "--force-recreate", "relay"])
         # Same per-run keys across the restart.
         self.assertEqual(up_env["SIM_RELAY_KEY"], "k")

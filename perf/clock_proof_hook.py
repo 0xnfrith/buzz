@@ -44,6 +44,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+# Each child's fixed environment comes from tenant_cogs.py: the hook runs
+# from perf/, next to it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tenant_cogs  # noqa: E402
+
 RATE_LIMIT_VARS = (
     "BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN",
     "BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC",
@@ -104,9 +109,15 @@ def write_private(path: Path, text: str) -> None:
 # ---- processes ----
 
 
-def supervise(out: Path, argv: list[str]) -> int:
-    """Runs argv, its pid in <out>/pid, its exit in <out>/exit (a signal as
-    its negative number). Started detached by `spawn`."""
+# The child a supervisor starts, and the fixed environment it gets: tenant_sim
+# its own, the sampler loop a Python child's.
+CHILD_ENVS = {"tenant_sim": tenant_cogs.child_env, "python": tenant_cogs.python_env}
+
+
+def supervise(out: Path, kind: str, argv: list[str]) -> int:
+    """Runs argv with the fixed environment for `kind` (CHILD_ENVS), its pid
+    in <out>/pid, its exit in <out>/exit (a signal as its negative number).
+    Started detached by `spawn`."""
     _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     soft = GEN_NOFILE if hard == resource.RLIM_INFINITY else min(GEN_NOFILE, hard)
 
@@ -114,7 +125,7 @@ def supervise(out: Path, argv: list[str]) -> int:
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
     (out / "nofile").write_text(f"{soft}\n")
     with (out / "stdout.log").open("ab") as so, (out / "stderr.log").open("ab") as se:
-        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=so, stderr=se, env=child_env(),
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=so, stderr=se, env=CHILD_ENVS[kind](),
                              preexec_fn=nofile)
         (out / "pid").write_text(f"{p.pid}\n")
         code = p.wait()
@@ -124,16 +135,17 @@ def supervise(out: Path, argv: list[str]) -> int:
     return 0
 
 
-def spawn(cfg: dict[str, Any], out: Path, argv: list[str]) -> None:
-    """Starts argv under a supervisor that outlives this hook (and the
-    clock, if the clock dies: the proof kills the clock's pid alone). Not in
-    a session of its own: some sandboxes reap a Python session leader."""
+def spawn(cfg: dict[str, Any], out: Path, kind: str, argv: list[str]) -> None:
+    """Starts argv (a `kind` of CHILD_ENVS) under a supervisor that outlives
+    this hook (and the clock, if the clock dies: the proof kills the clock's
+    pid alone). Not in a session of its own: some sandboxes reap a Python
+    session leader. The supervisor gets a Python child's fixed environment."""
     out.mkdir(parents=True, exist_ok=True)
     for f in ("pid", "exit"):
         (out / f).unlink(missing_ok=True)
     with open(os.devnull, "rb") as null_in, (out / "supervisor.log").open("ab") as so:
-        subprocess.Popen([cfg["python"], str(Path(__file__).resolve()), "_supervise", str(out), "--", *argv],
-                         stdin=null_in, stdout=so, stderr=so, close_fds=True)
+        subprocess.Popen([cfg["python"], str(Path(__file__).resolve()), "_supervise", str(out), kind, "--", *argv],
+                         stdin=null_in, stdout=so, stderr=so, close_fds=True, env=tenant_cogs.python_env())
     end = time.time() + 10
     while not (out / "pid").exists():
         if (out / "exit").exists() or time.time() > end:
@@ -186,20 +198,15 @@ def stop(out: Path, sig: int = signal.SIGTERM, wait_s: float = 30.0) -> str:
     return state(out)
 
 
-def child_env() -> dict[str, str]:
-    """This environment without Buzz or Nostr credentials and without the
-    rate-limit variables."""
-    return {k: v for k, v in os.environ.items()
-            if not (k.startswith("BUZZ_") or k.startswith("NOSTR_")) and k not in RATE_LIMIT_VARS}
-
-
 # ---- docker ----
 
 
 def docker(cfg: dict[str, Any], *args: str, env: dict[str, str] | None = None, check: bool = True,
            timeout: float = 600) -> subprocess.CompletedProcess[str]:
+    # PATH, HOME, the stack's named values and the proof's checked socket:
+    # tenant_cogs.docker_env.
     p = subprocess.run([cfg["docker"], *args], capture_output=True, text=True, timeout=timeout,
-                       env={**child_env(), **(env or {})})
+                       env=tenant_cogs.docker_env(cfg["docker_host"], env))
     if check and p.returncode != 0:
         raise Fail(f"docker {' '.join(args[:4])}: exit {p.returncode}: {(p.stderr or p.stdout).strip()[-400:]}")
     return p
@@ -273,7 +280,7 @@ def ev_setup(cfg: dict[str, Any], item: str) -> None:
     (root(cfg) / "state").mkdir(parents=True, exist_ok=True)
     (root(cfg) / "state" / "item").write_text(item + "\n")
     owner = subprocess.run([cfg["tenant_sim"], "--print-owner", "--profile", cfg["profiles"][item]],
-                           capture_output=True, text=True, env=child_env(), check=True).stdout.strip()
+                           capture_output=True, text=True, env=tenant_cogs.child_env(), check=True).stdout.strip()
     write_private(root(cfg) / "state" / f"keys-{item}.json", json.dumps({
         "SIM_OWNER_PUBKEY": owner, "SIM_RELAY_KEY": secrets.token_hex(32), "SIM_GIT_HMAC": secrets.token_hex(32)}))
     for gen in cfg["gens"]:
@@ -299,7 +306,7 @@ def ev_gen_start(cfg: dict[str, Any], gen: str, item: str) -> None:
         argv += ["--ramp-max", str(cfg["ramp"]["max"]), "--ramp-start", str(cfg["ramp"]["start"])]
     if cfg.get("seed_days"):
         argv += ["--seed-days", str(cfg["seed_days"]), "--seed-max-seconds", str(cfg.get("seed_max_seconds", 1800))]
-    spawn(cfg, out, argv)
+    spawn(cfg, out, "tenant_sim", argv)
 
 
 def ev_phases(cfg: dict[str, Any], gen: str) -> None:
@@ -352,7 +359,7 @@ def ev_sampler(cfg: dict[str, Any], what: str) -> None:
                 "--fast-every", str(s["fast_every"])]
         for gen in cfg["gens"]:
             argv += ["--live", f"{gen}={gen_dir(cfg, item, gen) / 'live.json'}"]
-        spawn(cfg, out, argv)
+        spawn(cfg, out, "python", argv)
     elif what == "stop":
         st = stop(out)
         if st not in ("exited 143", "exited 0"):
@@ -449,7 +456,10 @@ EVENTS = {
 
 def main(argv: list[str]) -> int:
     if argv[:1] == ["_supervise"]:
-        return supervise(Path(argv[1]), argv[argv.index("--") + 1:])
+        if len(argv) < 4 or argv[2] not in CHILD_ENVS or argv[3] != "--":
+            print(f"_supervise: give OUT, one of {sorted(CHILD_ENVS)}, then -- and the command", file=sys.stderr)
+            return 2
+        return supervise(Path(argv[1]), argv[2], argv[4:])
     if len(argv) < 3 or argv[0] != "--config":
         print("usage: clock_proof_hook.py --config CONFIG.json EVENT [ARGS...]", file=sys.stderr)
         return 2
