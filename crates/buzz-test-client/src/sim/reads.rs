@@ -25,6 +25,7 @@ use nostr::{EventBuilder, Keys, Kind, Tag};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::admission::{self, Limit};
 use super::guard::{HttpClient, Target};
 use super::profile::KindTable;
 use super::stats::ReadFailure;
@@ -120,6 +121,11 @@ pub enum ReadError {
     /// The relay's per-key HTTP rate limit turned it away (429): counted
     /// apart, like a rate-limited send.
     RateLimited,
+    /// A `rate-limited:` text the pinned relay doesn't send: the run voids.
+    UnknownLimit(String),
+    /// The generator ran out of its own files, ports or buffers on connect
+    /// ([`super::guard::is_local_exhaustion`]): its own fault, the run voids.
+    LocalExhausted(String),
 }
 
 /// `Authorization: Nostr <base64 event>`, NIP-98 for `POST url` with
@@ -150,7 +156,10 @@ pub fn nip98_header(keys: &Keys, url: &str, body: &[u8]) -> Result<String> {
 ///   header) is caught here too.
 /// - An answer that isn't 2xx, or one that isn't JSON: `Refused`.
 /// - No answer, a transport error or a timeout: `Unanswered`.
-/// - A 429 the relay's per-key rate limit sends: `RateLimited`, apart.
+/// - A `rate-limited:` answer, by its text ([`admission::classify_limit`]):
+///   the per-key quota is `RateLimited`, apart; the relay full or unable to
+///   admit (a 503) is `Refused`, a relay break; any other text is
+///   `UnknownLimit`.
 pub async fn read(
     http: &HttpClient,
     http_url: &Target,
@@ -158,6 +167,20 @@ pub async fn read(
     auth_tag: Option<&str>,
     r: &Read,
 ) -> std::result::Result<f64, ReadError> {
+    query(http, http_url, keys, auth_tag, r)
+        .await
+        .map(|(ms, _)| ms)
+}
+
+/// [`read`], keeping what the relay answered: its time in ms, and the
+/// JSON it sent back (a `/query` answers with an array of events).
+pub async fn query(
+    http: &HttpClient,
+    http_url: &Target,
+    keys: &Keys,
+    auth_tag: Option<&str>,
+    r: &Read,
+) -> std::result::Result<(f64, Value), ReadError> {
     let client = |err: anyhow::Error| ReadError::Failed {
         at: ReadFailure::Client,
         err,
@@ -177,6 +200,9 @@ pub async fn read(
     let resp = match req.body(body).send().await {
         Ok(resp) => resp,
         Err(e) if e.is_builder() => return Err(client(anyhow!("{} request: {e}", r.what))),
+        Err(e) if super::guard::is_local_exhaustion(&e) => {
+            return Err(ReadError::LocalExhausted(format!("{}: {e:?}", r.what)))
+        }
         Err(e) => {
             return Err(ReadError::Failed {
                 at: ReadFailure::Unanswered,
@@ -195,22 +221,29 @@ pub async fn read(
         }
     };
     let ms = start.elapsed().as_secs_f64() * 1e3;
-    if status.as_u16() == 429 && text.contains("rate-limited") {
-        return Err(ReadError::RateLimited);
-    }
     if !status.is_success() {
+        // The relay's HTTP errors are `{"error": "<text>"}`.
+        let why = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| text.clone());
+        match admission::classify_limit(&why) {
+            Some(Limit::Quota { .. }) => return Err(ReadError::RateLimited),
+            Some(Limit::Unknown { text }) => return Err(ReadError::UnknownLimit(text)),
+            Some(Limit::Shed { .. }) | None => {}
+        }
         return Err(ReadError::Failed {
             at: ReadFailure::Refused,
             err: anyhow!("{} HTTP {status}: {text}", r.what),
         });
     }
-    if serde_json::from_str::<Value>(&text).is_err() {
-        return Err(ReadError::Failed {
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => Ok((ms, v)),
+        Err(_) => Err(ReadError::Failed {
             at: ReadFailure::Refused,
             err: anyhow!("{} answered 2xx with a body that isn't JSON", r.what),
-        });
+        }),
     }
-    Ok(ms)
 }
 
 #[cfg(test)]
@@ -329,6 +362,83 @@ mod tests {
             failed_at(one(&other, Duration::from_secs(5), None).await).0,
             ReadFailure::Refused
         );
+    }
+
+    /// The relay full or unable to admit is refused, a relay break, never
+    /// apart; a `rate-limited:` text the pinned relay doesn't send is
+    /// unknown, whatever its status.
+    #[tokio::test]
+    async fn a_read_the_relay_shed_is_refused_and_an_unknown_limit_is_kept() {
+        for (status, body) in [
+            (
+                503,
+                r#"{"error":"rate-limited: shared admission unavailable"}"#,
+            ),
+            (
+                429,
+                r#"{"error":"rate-limited: too many concurrent requests"}"#,
+            ),
+        ] {
+            let shed = Server::start("127.0.0.1:0", testsrv::status(status, body));
+            let (at, err) = failed_at(one(&shed, Duration::from_secs(5), None).await);
+            assert_eq!(at, ReadFailure::Refused, "{body}: {err}");
+        }
+        let unknown = Server::start(
+            "127.0.0.1:0",
+            testsrv::status(429, r#"{"error":"rate-limited: slow down"}"#),
+        );
+        match one(&unknown, Duration::from_secs(5), None).await {
+            Err(ReadError::UnknownLimit(text)) => assert_eq!(text, "rate-limited: slow down"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const OUT_OF_FILES_CHILD: &str =
+        "sim::reads::tests::a_read_or_upload_out_of_files_is_the_generators_own";
+
+    /// The generator out of open files: a read (a poll's query is one) and
+    /// a media upload each fail on its own side, never reaching the relay,
+    /// and come back as its own fault, not as the relay not answering. Run
+    /// in a child test process whose file limit is low, so nothing else
+    /// here runs out.
+    #[test]
+    fn a_read_or_upload_out_of_files_is_the_generators_own() {
+        if testsrv::is_child(OUT_OF_FILES_CHILD) {
+            let server = Server::start("127.0.0.1:0", testsrv::status(200, "[]"));
+            let base = target(&server.http());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            let http = http_client(Duration::from_secs(5)).expect("client");
+            let keys = Keys::generate();
+            // Take every file this process may still open.
+            let mut held = Vec::new();
+            while let Ok(f) = std::fs::File::open("/dev/null") {
+                held.push(f);
+            }
+            let read = rt.block_on(read(&http, &base, &keys, None, &history()));
+            let upload = rt.block_on(crate::sim::media::upload(
+                &http,
+                &base,
+                &keys,
+                vec![1, 2, 3],
+                None,
+            ));
+            drop(held);
+            assert!(
+                matches!(read, Err(ReadError::LocalExhausted(_))),
+                "{read:?}"
+            );
+            assert_eq!(
+                upload.map(|_| ()).expect_err("no upload").at,
+                crate::sim::stats::MediaFailure::LocalExhausted
+            );
+            assert_eq!(server.accepts(), 0, "a connection reached the server");
+            println!("CHILD_OK {OUT_OF_FILES_CHILD}");
+            return;
+        }
+        testsrv::run_child_with_nofile(OUT_OF_FILES_CHILD, 128);
     }
 
     /// The header verifies with the relay's own NIP-98 check, for the URL

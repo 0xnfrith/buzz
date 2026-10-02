@@ -16,10 +16,12 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use super::admission::{self, Publish};
+use super::feed;
 use super::git::{self, GitRepo};
 use super::guard::{self, Target};
 use super::kinds;
 use super::media;
+use super::mentions;
 use super::profile::{Profile, Rates};
 use super::reads;
 use super::roles::{
@@ -68,6 +70,34 @@ pub struct World {
     pub git_helper: PathBuf,
     pub out_dir: PathBuf,
     pub blink: bool,
+    /// Who mentions whom, and how often ([`mentions::Mentions`]).
+    pub mentions: Arc<mentions::Mentions>,
+    /// Each identity's last accepted `seq`, as it sends: a joiner's
+    /// baseline for each author ([`SeqBoard`]).
+    pub seqs: Arc<SeqBoard>,
+}
+
+/// Every identity's last accepted channel-message `seq`, in this generator
+/// process. All of a relay's identities are in one process, so a joiner
+/// knows exactly what each author had sent before it subscribed: anything
+/// after that it doesn't see is a gap, and anything before is not.
+#[derive(Debug, Default)]
+pub struct SeqBoard {
+    last: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl SeqBoard {
+    /// `identity` had its `seq` accepted.
+    pub fn set(&self, identity: &str, seq: u64) {
+        let mut m = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let e = m.entry(identity.to_string()).or_insert(0);
+        *e = (*e).max(seq);
+    }
+
+    /// Each identity's last accepted `seq` now.
+    pub fn snapshot(&self) -> HashMap<String, u64> {
+        self.last.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 #[derive(Clone)]
@@ -242,6 +272,15 @@ pub fn next_band(rx: &mut watch::Receiver<Band>, current: Band) -> Option<Band> 
     }
 }
 
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -257,9 +296,21 @@ fn filter_channel(kinds: &[u16], channel: &str, limit: u32) -> Filter {
         .limit(limit as usize)
 }
 
-fn filter_p(pubkey: &str) -> Filter {
-    Filter::new().custom_tags(SingleLetterTag::lowercase(Alphabet::P), [pubkey])
+/// The identity's `#p` subscription, from `since` on: the desktop's live
+/// `#p` subscriptions carry a `since` (the time they start), never a
+/// kind-less history query. On a heavy relay that history query walks every
+/// event newest-first; this one is answered at once. Its events are never
+/// counted as backfill.
+fn filter_p(pubkey: &str, since: u64) -> Filter {
+    Filter::new()
+        .custom_tags(SingleLetterTag::lowercase(Alphabet::P), [pubkey])
+        .since(Timestamp::from(since))
 }
+
+/// The desktop's replay window for a live subscription on reconnect
+/// (`desktop/src/shared/api/relayReconnectReplay.ts`): its filter's own
+/// `since`, or the newest event it saw less 5 s, whichever is later.
+const P_REPLAY_SKEW_S: u64 = 5;
 
 /// Warm-up must prove EOSE; reconnects may keep going if a later EOSE is late.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,6 +359,7 @@ async fn subscribe_all(
     stats: &Stats,
     record_join: bool,
     since: Option<u64>,
+    p_since: u64,
     eose: EosePolicy,
 ) -> Result<u64> {
     let mut returned = 0u64;
@@ -333,7 +385,9 @@ async fn subscribe_all(
         }
     }
     let sid = format!("{identity}-p");
-    client.subscribe(&sid, vec![filter_p(pubkey)]).await?;
+    client
+        .subscribe(&sid, vec![filter_p(pubkey, p_since)])
+        .await?;
     let p_result = client
         .collect_until_eose(&sid, Duration::from_secs(8))
         .await;
@@ -383,11 +437,20 @@ struct Session {
     authors: VecDeque<String>,
     /// This agent's turns so far: one in four also counts a thread.
     turns: u64,
+    /// How long a send waits for its OK.
+    ok_timeout: Duration,
     expected: HashMap<String, u64>,
     missing: HashSet<String>,
     last_seen_created_at: u64,
+    /// When the `#p` subscription first started, and the newest event seen
+    /// on it: a reconnect resubscribes from these, as the desktop does.
+    p_since: u64,
+    p_last_seen: Option<u64>,
     git_repo: Option<GitRepo>,
     http: guard::HttpClient,
+    /// A human's home-feed poller's view of the connection
+    /// ([`feed::Link`]); None for an agent, which doesn't poll.
+    feed_link: Option<Arc<feed::Link>>,
 }
 
 impl Session {
@@ -411,8 +474,24 @@ impl Session {
     }
 
     async fn handle_msg(&mut self, band: Band, msg: RelayMessage) {
-        if let RelayMessage::Event { event, .. } = msg {
+        if let RelayMessage::Event {
+            event,
+            subscription_id,
+        } = msg
+        {
             self.last_seen_created_at = self.last_seen_created_at.max(event.created_at.as_secs());
+            if subscription_id == format!("{}-p", self.rec.name) {
+                let t = event.created_at.as_secs();
+                self.p_last_seen = Some(self.p_last_seen.map_or(t, |l| l.max(t)));
+                // A live mention: a human's desktop polls its home feed at
+                // once (C, `feed::poll_on_mention`).
+                if self.feed_link.is_some()
+                    && feed::LIVE_MENTION_KINDS.contains(&event.kind.as_u16())
+                    && event.pubkey.to_hex() != self.rec.pubkey
+                {
+                    feed::poll_on_mention(self.poll_target(), self.stats.clone(), band);
+                }
+            }
             let channel = tag_value(&event, "h").unwrap_or_default();
             self.seen.push_back((event.id.to_hex(), channel.clone()));
             if self.seen.len() > 64 {
@@ -456,7 +535,7 @@ impl Session {
     async fn send(&mut self, client: &mut BuzzTestClient, band: Band, event: nostr::Event) -> bool {
         let kind = event.kind.as_u16();
         let start = Instant::now();
-        let answer = match admission::send_tracked(client, &event, OK_TIMEOUT).await {
+        let answer = match admission::send_tracked(client, &event, self.ok_timeout).await {
             Ok((answer, others)) => {
                 // A subscription's events that came in while this send
                 // waited, handled as they would have been.
@@ -478,6 +557,20 @@ impl Session {
                 );
                 false
             }
+            // The relay full, or unable to admit: its break, not a quota.
+            Ok(Publish::Shed { text }) => {
+                self.stats
+                    .record_send_shed(band.sampled().then(|| band.as_str()), kind);
+                warn!("{} kind {kind} shed by the relay: {text}", self.rec.name);
+                false
+            }
+            // A text the pinned relay doesn't send: the run voids on it.
+            Ok(Publish::UnknownLimit { text }) => {
+                self.stats
+                    .record_limit_unknown(band.sampled().then(|| band.as_str()), kind, &text);
+                warn!("{} kind {kind} got an unknown limit: {text}", self.rec.name);
+                false
+            }
             Ok(Publish::Ok(ok)) => {
                 let ms = start.elapsed().as_secs_f64() * 1e3;
                 if band.sampled() {
@@ -496,12 +589,17 @@ impl Session {
                 }
                 ok.accepted
             }
-            Err(e) => {
-                if band.sampled() {
-                    self.stats
-                        .record_send(band.as_str(), kind, false, &e.to_string(), 0.0);
-                }
-                self.stats.record_client_error("send_failed");
+            // One counter per send: written and never answered is the
+            // relay's; not written at all is the generator's.
+            Err(admission::SendError::Unanswered(e)) => {
+                self.stats
+                    .record_send_unanswered(band.sampled().then(|| band.as_str()), kind);
+                warn!("{} kind {kind} got no answer: {e}", self.rec.name);
+                false
+            }
+            Err(admission::SendError::NotSent(e)) => {
+                self.stats
+                    .record_send_failed(band.sampled().then(|| band.as_str()), kind);
                 warn!("{} kind {kind} send failed: {e}", self.rec.name);
                 false
             }
@@ -528,6 +626,7 @@ impl Session {
         let accepted = self.send(client, band, event).await;
         if accepted {
             self.seq = seq;
+            self.world.seqs.set(&self.rec.name, seq);
         }
         Ok(accepted)
     }
@@ -555,9 +654,10 @@ impl Session {
                 }
                 let name = name.clone();
                 let ch = ch.clone();
+                let mention = self.draw_mention();
                 self.send_channel(client, band, |seq| {
                     let content = kinds::lorem(seq, 200);
-                    kinds::stream_message(&keys, &k, &ch, &name, seq, &content)
+                    kinds::stream_message(&keys, &k, &ch, &name, seq, &content, mention.as_deref())
                 })
                 .await?;
             }
@@ -650,10 +750,26 @@ impl Session {
                     Ok(up) => {
                         self.stats.record_media(up.bytes, up.put_ms);
                         let content = format!("media {}", up.url);
+                        let mention = self.draw_mention();
                         self.send_channel(client, band, |seq| {
-                            kinds::stream_message(&keys, &k, &ch, &name, seq, &content)
+                            kinds::stream_message(
+                                &keys,
+                                &k,
+                                &ch,
+                                &name,
+                                seq,
+                                &content,
+                                mention.as_deref(),
+                            )
                         })
                         .await?;
+                    }
+                    Err(e) if e.at == crate::sim::stats::MediaFailure::LocalExhausted => {
+                        warn!(
+                            "{} media failed on the generator's side: {e}",
+                            self.rec.name
+                        );
+                        self.stats.record_local_exhausted();
                     }
                     Err(e) => {
                         warn!("{} media ({:?}): {e}", self.rec.name, e.at);
@@ -723,6 +839,20 @@ impl Session {
                     .stats
                     .record_read(band.sampled().then(|| band.as_str()), r.what, ms),
                 Err(reads::ReadError::RateLimited) => self.stats.record_read_rate_limited(),
+                Err(reads::ReadError::LocalExhausted(why)) => {
+                    warn!(
+                        "{} read {} failed on the generator's side: {why}",
+                        self.rec.name, r.what
+                    );
+                    self.stats.record_local_exhausted();
+                }
+                Err(reads::ReadError::UnknownLimit(text)) => {
+                    warn!(
+                        "{} read {} got an unknown limit: {text}",
+                        self.rec.name, r.what
+                    );
+                    self.stats.record_read_limit_unknown(&text);
+                }
                 Err(reads::ReadError::Failed { at, err }) => {
                     warn!("{} read {} ({at:?}): {err:#}", self.rec.name, r.what);
                     self.stats.record_read_failed(at);
@@ -760,6 +890,46 @@ impl Session {
         }
     }
 
+    /// Where this identity's home-feed polls go, and as whom.
+    fn poll_target(&self) -> feed::PollTarget {
+        feed::PollTarget {
+            http: self.http.clone(),
+            url: self.world.http_url.clone(),
+            keys: self.keys.clone(),
+            tail: self.world.mentions.is_tail(&self.rec.pubkey),
+        }
+    }
+
+    /// Before subscribing: each author's next expected `seq` is the one
+    /// after its last accepted one now ([`SeqBoard`]). A ramp joiner
+    /// switched on mid-stream counts no gap for what was sent before it
+    /// subscribed, and every one after. An identity on from the start sees
+    /// an empty board: it expects every author from 1.
+    fn take_baseline(&mut self) {
+        for (author, last) in self.world.seqs.snapshot() {
+            self.expected.insert(author, last + 1);
+        }
+    }
+
+    /// Whom this message mentions, if anyone (see [`mentions`]).
+    fn draw_mention(&mut self) -> Option<String> {
+        self.world
+            .mentions
+            .draw_rng(self.role, &self.rec.pubkey, &mut self.rng)
+    }
+
+    /// The `#p` subscription's `since` on a reconnect: the desktop's replay
+    /// (`relayReconnectReplay.ts`, `replayLiveSubscriptions` and
+    /// `buildReconnectReplayFilter`) resends a live subscription from the
+    /// later of its filter's own `since` and the newest event it saw less
+    /// 5 s; with no event seen, from its own `since`.
+    fn p_replay_since(&self) -> u64 {
+        match self.p_last_seen {
+            Some(t) => self.p_since.max(t.saturating_sub(P_REPLAY_SKEW_S)),
+            None => self.p_since,
+        }
+    }
+
     async fn reconnect(
         &mut self,
         reason: &str,
@@ -769,6 +939,9 @@ impl Session {
         since: Option<u64>,
     ) -> Result<Option<BuzzTestClient>> {
         info!("{} reconnect ({reason})", self.rec.name);
+        if let Some(link) = &self.feed_link {
+            link.down();
+        }
         let mut delay = Duration::from_millis(250);
         let cap = Duration::from_secs(5);
         // Every attempt, its backoff and the subscribe after it end when the
@@ -800,6 +973,7 @@ impl Session {
                             &self.stats,
                             record_join,
                             since,
+                            self.p_replay_since(),
                             EosePolicy::Tolerant,
                         ) => n,
                         _ = until_stop(&mut stop) => return Ok(None),
@@ -811,6 +985,9 @@ impl Session {
                             start.elapsed().as_secs_f64() * 1e3,
                             n,
                         );
+                    }
+                    if let Some(link) = &self.feed_link {
+                        link.healed();
                     }
                     return Ok(Some(client));
                 }
@@ -828,8 +1005,75 @@ impl Session {
     }
 }
 
+/// One identity's task: [`identity_task`], with one rule on top. A task
+/// that joined, then ended for any reason but a stop or a lease (an error,
+/// a panic), is recorded in live.json's `identities_ended` at once, and the
+/// sampler voids the run on it: a lost identity under-loads the run and
+/// over-states the relay's ceiling. An identity that never joined is
+/// reported through `ready` instead (a failed warm-up, or a ramp joiner the
+/// relay didn't take).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_identity(
+    rec: IdentityRecord,
+    keys: Keys,
+    oa_owner: Option<Keys>,
+    role: Role,
+    profile: Arc<Profile>,
+    world: Arc<World>,
+    stats: Arc<Stats>,
+    band_rx: watch::Receiver<Band>,
+    git_repo: Option<GitRepo>,
+    rng_salt: u32,
+    ready: mpsc::Sender<Result<(), String>>,
+    ramp: Option<RampSlot>,
+) -> Result<()> {
+    let name = rec.name.clone();
+    let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (stop, record) = (band_rx.clone(), stats.clone());
+    let task = identity_task(
+        rec,
+        keys,
+        oa_owner,
+        role,
+        profile,
+        world,
+        stats,
+        band_rx,
+        git_repo,
+        rng_salt,
+        ready,
+        ramp,
+        joined.clone(),
+    );
+    guard_identity(&name, &joined, &stop, &record, task).await
+}
+
+/// Runs one identity's task and records it in `identities_ended` if it
+/// joined, then failed or panicked while the run wasn't stopping.
+async fn guard_identity(
+    name: &str,
+    joined: &std::sync::atomic::AtomicBool,
+    stop: &watch::Receiver<Band>,
+    stats: &Stats,
+    task: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    use futures_util::FutureExt;
+    let res = match std::panic::AssertUnwindSafe(task).catch_unwind().await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("{name}'s task panicked")),
+    };
+    if let Err(e) = &res {
+        let stopping = *stop.borrow() == Band::Stop;
+        if joined.load(std::sync::atomic::Ordering::SeqCst) && !stopping {
+            warn!("{name} ended on its own: {e:#}");
+            stats.record_identity_ended(name, &format!("{e:#}"));
+        }
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn identity_task(
     rec: IdentityRecord,
     keys: Keys,
     oa_owner: Option<Keys>,
@@ -842,6 +1086,7 @@ pub async fn run_identity(
     rng_salt: u32,
     ready: mpsc::Sender<Result<(), String>>,
     mut ramp: Option<RampSlot>,
+    joined: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     if let Some(slot) = ramp.as_mut() {
         if !wait_switched_on(slot, &mut band_rx).await {
@@ -873,9 +1118,14 @@ pub async fn run_identity(
         seen: VecDeque::new(),
         authors: VecDeque::new(),
         turns: 0,
+        ok_timeout: OK_TIMEOUT,
         expected: HashMap::new(),
         missing: HashSet::new(),
         last_seen_created_at: unix_now(),
+        p_since: unix_now(),
+        p_last_seen: None,
+        // Humans run Buzz Desktop, whose home feed polls; agents don't.
+        feed_link: (role == Role::Human).then(feed::Link::new),
         git_repo,
         http: guard::http_client(Duration::from_secs(30))?,
     };
@@ -901,6 +1151,9 @@ pub async fn run_identity(
         }
     };
     let kinds = sess.sub_kinds();
+    sess.take_baseline();
+    // The `#p` subscription starts now, as the desktop's does.
+    sess.p_since = unix_now();
     let subscribed = tokio::select! {
         r = subscribe_all(
             &mut client,
@@ -912,6 +1165,7 @@ pub async fn run_identity(
             &sess.stats,
             true,
             None,
+            sess.p_since,
             EosePolicy::Required,
         ) => r,
         _ = until_stop(&mut stop) => return Ok(()),
@@ -924,6 +1178,28 @@ pub async fn run_identity(
     if ready.send(Ok(())).await.is_err() {
         return Ok(());
     }
+    joined.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A human's home feed polls from here on, beside this task, until the
+    // run stops; it ends with this task.
+    let _poller = sess.feed_link.clone().map(|link| {
+        link.up();
+        let to = sess.poll_target();
+        let stats = sess.stats.clone();
+        AbortOnDrop(tokio::spawn(feed::schedule(
+            link,
+            band_rx.clone(),
+            sess.stats.clone(),
+            to.tail,
+            feed::POLL_EVERY,
+            feed::HEAL_MIN,
+            move || {
+                let (to, stats) = (to.clone(), stats.clone());
+                async move {
+                    feed::poll(&to, &stats).await;
+                }
+            },
+        )))
+    });
 
     let mut band = *band_rx.borrow();
     let mut band_started = Instant::now();
@@ -1121,6 +1397,8 @@ mod tests {
             git_helper: PathBuf::from("/usr/bin/true"),
             out_dir: std::env::temp_dir(),
             blink: false,
+            mentions: Arc::new(mentions::Mentions::new(&pop)),
+            seqs: Default::default(),
         });
         let (_tx, band_rx) = watch::channel(Band::Steady);
         Session {
@@ -1140,9 +1418,13 @@ mod tests {
             seen: VecDeque::new(),
             authors: VecDeque::new(),
             turns: 0,
+            ok_timeout: OK_TIMEOUT,
             expected: HashMap::new(),
             missing: HashSet::new(),
             last_seen_created_at: unix_now(),
+            p_since: unix_now(),
+            p_last_seen: None,
+            feed_link: None,
             git_repo: None,
             http: guard::http_client(Duration::from_secs(5)).expect("http client"),
         }
@@ -1210,6 +1492,502 @@ mod tests {
         assert_eq!((live.sent, live.accepted), (1, 1), "the turn metric");
         assert_eq!((live.read_refused, live.read_client_failed), (3, 0));
         assert_eq!(refusing.accepts(), 3);
+    }
+
+    /// A session whose relay is `url`.
+    fn session_on(stats: Arc<Stats>, url: &str) -> Session {
+        let mut sess = test_session(stats);
+        let guard = TargetGuard::new(vec![Cidr::parse("127.0.0.0/8").expect("allow")], vec![])
+            .expect("guard");
+        let w = &sess.world;
+        sess.world = Arc::new(World {
+            relay_url: guard.check_url(url, &["ws"]).expect("relay"),
+            http_url: w.http_url.clone(),
+            channels: w.channels.clone(),
+            human_pubkeys: w.human_pubkeys.clone(),
+            repos: vec![],
+            git_helper: w.git_helper.clone(),
+            out_dir: w.out_dir.clone(),
+            blink: false,
+            mentions: w.mentions.clone(),
+            seqs: Default::default(),
+        });
+        sess
+    }
+
+    /// An event that tags `pubkey`, made `created_at`.
+    fn p_event(pubkey: &str, created_at: u64) -> nostr::Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(9), "hi")
+            .tags([Tag::parse(["p", pubkey]).expect("tag")])
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(&Keys::generate())
+            .expect("sign")
+    }
+
+    /// The `#p` filters a relay was sent, by subscription id.
+    fn p_reqs(log: &admission::testrelay::ReqLog, name: &str) -> Vec<serde_json::Value> {
+        log.lock()
+            .expect("log")
+            .iter()
+            .filter(|(sid, _)| *sid == format!("{name}-p"))
+            .map(|(_, f)| f.clone())
+            .collect()
+    }
+
+    /// The warm-up's `#p` subscription is exactly `#p` and `since` (its
+    /// start): no kinds, no limit, no history query. What it returns is
+    /// never counted as backfill. The channel subscriptions are unchanged.
+    #[tokio::test]
+    async fn the_warmup_p_subscription_starts_at_its_since() {
+        let stats = Arc::new(Stats::new());
+        let sess = test_session(stats.clone());
+        let pk = sess.rec.pubkey.clone();
+        let (url, log) = admission::testrelay::req_logging_relay(vec![
+            p_event(&pk, 1_700_000_000),
+            p_event(&pk, 1_700_000_100),
+        ])
+        .await;
+        let mut client = BuzzTestClient::connect(&url, &sess.keys)
+            .await
+            .expect("connect");
+        let returned = subscribe_all(
+            &mut client,
+            &sess.rec.name,
+            &pk,
+            &sess.world.channels,
+            &sess.sub_kinds(),
+            50,
+            &stats,
+            true,
+            None,
+            1_790_000_000,
+            EosePolicy::Required,
+        )
+        .await
+        .expect("subscribed");
+        assert_eq!(
+            returned, 0,
+            "the #p subscription's events counted as backfill"
+        );
+        assert_eq!(
+            p_reqs(&log, &sess.rec.name),
+            vec![serde_json::json!([{"#p": [pk], "since": 1_790_000_000u64}])]
+        );
+        let ch = log
+            .lock()
+            .expect("log")
+            .iter()
+            .find(|(sid, _)| *sid == format!("{}-ch0", sess.rec.name))
+            .map(|(_, f)| f.clone())
+            .expect("channel REQ");
+        assert!(ch[0].get("since").is_none(), "{ch}");
+        assert_eq!(
+            (ch[0]["#h"][0].as_str(), ch[0]["limit"].as_u64()),
+            (Some("chan-a"), Some(50))
+        );
+    }
+
+    /// A reconnect resubscribes `#p` as the desktop's replay does: from the
+    /// subscription's own start, or the newest event seen on it less 5 s,
+    /// whichever is later. An event on a channel subscription doesn't move
+    /// it, nor does one older than the start. Each reconnect tells a human's
+    /// home-feed poller, which polls on it.
+    #[tokio::test]
+    async fn a_reconnect_resubscribes_p_as_the_desktop_replays() {
+        let (url, log) = admission::testrelay::req_logging_relay(vec![]).await;
+        let stats = Arc::new(Stats::new());
+        let mut sess = session_on(stats, &url);
+        let name = sess.rec.name.clone();
+        let pk = sess.rec.pubkey.clone();
+        sess.p_since = 1_790_000_000;
+        // A human: its home-feed poller hears each reconnect.
+        let link = feed::Link::new();
+        link.up();
+        sess.feed_link = Some(link.clone());
+        let on = |sid: &str, t: u64| RelayMessage::Event {
+            subscription_id: sid.to_string(),
+            event: Box::new(p_event(&pk, t)),
+        };
+        // (what came in on which subscription, the since a reconnect sends)
+        let rows: [(Option<(String, u64)>, u64); 4] = [
+            (None, 1_790_000_000),
+            (Some((format!("{name}-ch0"), 1_790_000_900)), 1_790_000_000),
+            (Some((format!("{name}-p"), 1_789_999_000)), 1_790_000_000),
+            (Some((format!("{name}-p"), 1_790_000_500)), 1_790_000_495),
+        ];
+        for (i, (msg, want)) in rows.into_iter().enumerate() {
+            if let Some((sid, t)) = msg {
+                sess.handle_msg(Band::Warmup, on(&sid, t)).await;
+            }
+            let client = sess
+                .reconnect("test", 50, false, false, None)
+                .await
+                .expect("reconnect")
+                .expect("a client");
+            let _ = client.disconnect().await;
+            assert!(
+                *link.connected.borrow(),
+                "row {i}: the poller wasn't told it's back"
+            );
+            tokio::time::timeout(Duration::from_millis(100), link.healed.notified())
+                .await
+                .unwrap_or_else(|_| panic!("row {i}: the poller wasn't told of the reconnect"));
+            let reqs = p_reqs(&log, &name);
+            assert_eq!(reqs.len(), i + 1, "row {i}");
+            assert_eq!(
+                reqs[i],
+                serde_json::json!([{"#p": [pk.clone()], "since": want}]),
+                "row {i}"
+            );
+        }
+    }
+
+    /// A joiner takes each author's last accepted `seq` at its subscribe as
+    /// its baseline: the author then sends 38 and 39, both lost, and the
+    /// joiner first sees 40: it counts both. An identity on from the start
+    /// (an empty board) counts from 1.
+    #[tokio::test]
+    async fn a_joiner_counts_what_was_lost_after_it_subscribed() {
+        let author = "someone";
+        let msg = |n: u64| {
+            let ev = nostr::EventBuilder::new(nostr::Kind::Custom(9), "hi")
+                .tags([
+                    Tag::parse(["h", "chan-a"]).expect("tag"),
+                    Tag::parse(["seq", &format!("{author}-{n}")]).expect("tag"),
+                ])
+                .sign_with_keys(&Keys::generate())
+                .expect("sign");
+            RelayMessage::Event {
+                subscription_id: "x-ch0".into(),
+                event: Box::new(ev),
+            }
+        };
+        let stats = Arc::new(Stats::new());
+        let mut joiner = test_session(stats.clone());
+        joiner.world.seqs.set(author, 37);
+        joiner.take_baseline();
+        // The author's 38 and 39 are accepted, and never reach the joiner.
+        joiner.world.seqs.set(author, 39);
+        joiner.handle_msg(Band::Steady, msg(40)).await;
+        let mut missing: Vec<String> = joiner.missing.iter().cloned().collect();
+        missing.sort();
+        assert_eq!(missing, [format!("{author}-38"), format!("{author}-39")]);
+        // From the start: an empty board, every author from 1.
+        let mut first = test_session(stats);
+        first.take_baseline();
+        first.handle_msg(Band::Steady, msg(3)).await;
+        assert_eq!(first.missing.len(), 2, "1 and 2 are gaps");
+    }
+
+    /// A channel message the relay accepted sets its author's last `seq`
+    /// on the board; one it rejected doesn't.
+    #[tokio::test]
+    async fn an_accepted_message_moves_the_seq_board() {
+        use crate::sim::admission::testrelay::{relay_with, Answer};
+        fn accept(_: u64) -> Answer {
+            Answer::Accept
+        }
+        fn reject(_: u64) -> Answer {
+            Answer::Reject("blocked: test")
+        }
+        for (answer, want) in [(accept as fn(u64) -> Answer, Some(1u64)), (reject, None)] {
+            let relay = relay_with(answer).await;
+            let mut sess = test_session(Arc::new(Stats::new()));
+            let mut client = BuzzTestClient::connect_unauthenticated(&relay.url)
+                .await
+                .expect("connect");
+            let (keys, k, name) = (sess.keys.clone(), sess.profile.kinds, sess.rec.name.clone());
+            sess.send_channel(&mut client, Band::Steady, |seq| {
+                kinds::stream_message(&keys, &k, "chan-a", &name, seq, "hi", None)
+            })
+            .await
+            .expect("send");
+            assert_eq!(sess.world.seqs.snapshot().get(&name).copied(), want);
+        }
+    }
+
+    /// C: each live mention a human gets starts a whole home-feed poll at
+    /// once, beside any in flight (no coalescing). An event on `#p` that
+    /// isn't a message kind, one on a channel subscription, and an agent's
+    /// mention start none.
+    #[tokio::test]
+    async fn a_live_mention_starts_a_poll_at_once() {
+        fn none(_: &serde_json::Value) -> (u16, String) {
+            (200, "[]".into())
+        }
+        // Each answer comes 3 s late, so two polls overlap if both start.
+        let (http, log) = feed::testhttp::logging_server(none, Duration::from_secs(3)).await;
+        let stats = Arc::new(Stats::new());
+        let mut sess = test_session_at(stats.clone(), &http);
+        sess.feed_link = Some(feed::Link::new());
+        let name = sess.rec.name.clone();
+        let me = sess.rec.pubkey.clone();
+        let other = Keys::generate();
+        let ev = |kind: u16| {
+            Box::new(
+                nostr::EventBuilder::new(nostr::Kind::Custom(kind), "hi")
+                    .tags([Tag::parse(["p", &me]).expect("tag")])
+                    .sign_with_keys(&other)
+                    .expect("sign"),
+            )
+        };
+        for (sid, kind) in [
+            (format!("{name}-p"), 9u16),
+            (format!("{name}-p"), 40002),
+            (format!("{name}-p"), 1059),
+            (format!("{name}-ch0"), 9),
+        ] {
+            let event = ev(kind);
+            sess.handle_msg(
+                Band::Steady,
+                RelayMessage::Event {
+                    subscription_id: sid,
+                    event,
+                },
+            )
+            .await;
+        }
+        let mentions_queries = || {
+            log.lock()
+                .expect("log")
+                .iter()
+                .filter(|b| b[0]["limit"] == 50 && b[0]["#p"].is_array())
+                .count()
+        };
+        let started = Instant::now();
+        while mentions_queries() < 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "two polls didn't start at once"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            mentions_queries(),
+            2,
+            "a poll per message-kind mention, no more"
+        );
+        // An agent's desktop doesn't poll: no link, no poll.
+        let mut agent = test_session_at(stats.clone(), &http);
+        agent.feed_link = None;
+        let aname = agent.rec.name.clone();
+        let event = ev(9);
+        agent
+            .handle_msg(
+                Band::Steady,
+                RelayMessage::Event {
+                    subscription_id: format!("{aname}-p"),
+                    event,
+                },
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(mentions_queries(), 2);
+    }
+
+    /// An identity that joined, then failed or panicked while the run
+    /// wasn't stopping, is in live.json's `identities_ended` at once, with
+    /// why. One that never joined (reported through `ready`), one that
+    /// ended on a stop, or one that ended cleanly, is not.
+    #[tokio::test]
+    async fn an_identity_that_ends_on_its_own_is_recorded_at_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        type Task = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+        fn fails(joined: &Arc<AtomicBool>) -> Task {
+            let j = joined.clone();
+            Box::pin(async move {
+                j.store(true, Ordering::SeqCst);
+                Err(anyhow!("kind 9 sign: no key"))
+            })
+        }
+        fn panics(joined: &Arc<AtomicBool>) -> Task {
+            let j = joined.clone();
+            Box::pin(async move {
+                j.store(true, Ordering::SeqCst);
+                panic!("a bug")
+            })
+        }
+        fn never_joins(_: &Arc<AtomicBool>) -> Task {
+            Box::pin(async move { Err(anyhow!("h1 subscribe: no EOSE")) })
+        }
+        fn clean(joined: &Arc<AtomicBool>) -> Task {
+            let j = joined.clone();
+            Box::pin(async move {
+                j.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+        type Row = (
+            &'static str,
+            fn(&Arc<AtomicBool>) -> Task,
+            Band,
+            Option<&'static str>,
+        );
+        let rows: [Row; 5] = [
+            ("failed", fails, Band::Steady, Some("kind 9 sign: no key")),
+            ("panicked", panics, Band::Steady, Some("h7's task panicked")),
+            ("failed on a stop", fails, Band::Stop, None),
+            ("never joined", never_joins, Band::Steady, None),
+            ("ended cleanly", clean, Band::Steady, None),
+        ];
+        for (name, task, band, want) in rows {
+            let stats = Stats::new();
+            let joined = Arc::new(AtomicBool::new(false));
+            let (_tx, stop) = watch::channel(band);
+            let res = guard_identity("h7", &joined, &stop, &stats, task(&joined)).await;
+            assert_eq!(res.is_err(), name != "ended cleanly", "{name}");
+            let ended = stats.live(1).identities_ended;
+            match want {
+                Some(why) => assert_eq!(
+                    ended,
+                    std::collections::BTreeMap::from([("h7".to_string(), why.to_string())]),
+                    "{name}"
+                ),
+                None => assert!(ended.is_empty(), "{name}: {ended:?}"),
+            }
+        }
+    }
+
+    /// One counter per send, never two and never none: accepted, rejected,
+    /// written and never answered (no OK in time, or the socket failing
+    /// after the write), not written at all (the socket already closed),
+    /// and each `rate-limited:` text: the quota apart, the relay full or
+    /// unable to admit shed, any other text unknown.
+    #[tokio::test]
+    async fn each_send_ends_in_exactly_one_counter() {
+        use crate::sim::admission::testrelay::{relay_with, Answer};
+        fn accept(_: u64) -> Answer {
+            Answer::Accept
+        }
+        fn reject(_: u64) -> Answer {
+            Answer::Reject("blocked: test")
+        }
+        fn silent(_: u64) -> Answer {
+            Answer::Silent
+        }
+        fn close(_: u64) -> Answer {
+            Answer::Close
+        }
+        fn quota(_: u64) -> Answer {
+            Answer::Notice("rate-limited: quota exceeded; retry in 7s")
+        }
+        fn full(_: u64) -> Answer {
+            Answer::Notice("rate-limited: too many concurrent requests")
+        }
+        fn no_admission(_: u64) -> Answer {
+            Answer::Notice("rate-limited: shared admission unavailable")
+        }
+        fn unknown(_: u64) -> Answer {
+            Answer::Notice("rate-limited: slow down")
+        }
+        // (accepted, rejected, rate_limited, send_unanswered, send_failed,
+        // relay_shed, limit_unknown)
+        type Row = (
+            &'static str,
+            fn(u64) -> Answer,
+            bool,
+            (u64, u64, u64, u64, u64, u64, u64),
+        );
+        let rows: [Row; 9] = [
+            ("accepted", accept, false, (1, 0, 0, 0, 0, 0, 0)),
+            ("rejected", reject, false, (0, 1, 0, 0, 0, 0, 0)),
+            ("no OK in time", silent, false, (0, 0, 0, 1, 0, 0, 0)),
+            (
+                "the socket fails after the write",
+                close,
+                false,
+                (0, 0, 0, 1, 0, 0, 0),
+            ),
+            (
+                "the socket already closed",
+                accept,
+                true,
+                (0, 0, 0, 0, 1, 0, 0),
+            ),
+            ("the quota", quota, false, (0, 0, 1, 0, 0, 0, 0)),
+            ("the relay full", full, false, (0, 0, 0, 0, 0, 1, 0)),
+            (
+                "the relay's admission store unreachable",
+                no_admission,
+                false,
+                (0, 0, 0, 0, 0, 1, 0),
+            ),
+            ("an unknown limit", unknown, false, (0, 0, 0, 0, 0, 0, 1)),
+        ];
+        for (name, answer, closed_first, want) in rows {
+            let relay = relay_with(answer).await;
+            let stats = Arc::new(Stats::new());
+            let mut sess = test_session(stats.clone());
+            sess.ok_timeout = Duration::from_millis(500);
+            let mut client = BuzzTestClient::connect_unauthenticated(&relay.url)
+                .await
+                .expect("connect");
+            if closed_first {
+                relay.kill();
+                // Read until the close is seen: the socket is then closed on
+                // this side too, and nothing more can be written.
+                let started = Instant::now();
+                loop {
+                    match client.recv_event(Duration::from_millis(200)).await {
+                        Ok(_) => continue,
+                        Err(TestClientError::Timeout) => {
+                            assert!(
+                                started.elapsed() < Duration::from_secs(5),
+                                "{name}: never closed"
+                            );
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            let ev = kinds::presence(&sess.keys, &sess.profile.kinds).expect("event");
+            sess.send(&mut client, Band::Steady, ev).await;
+            let live = stats.live(1);
+            let failed = live.client_errors.get("send_failed").copied().unwrap_or(0);
+            assert_eq!(
+                (
+                    live.accepted,
+                    live.rejected,
+                    live.rate_limited,
+                    live.send_unanswered,
+                    failed,
+                    live.relay_shed,
+                    live.limit_unknown.values().sum::<u64>()
+                ),
+                want,
+                "{name}"
+            );
+            if want.6 > 0 {
+                assert_eq!(
+                    live.limit_unknown,
+                    std::collections::BTreeMap::from([("rate-limited: slow down".to_string(), 1)]),
+                    "{name}: the text is kept"
+                );
+            }
+            assert_eq!(live.sent, 1, "{name}: the send counted once");
+            // The band's line in summary.json, by the names a local run's
+            // acceptance reads (tenant_cogs.py client_from_summary).
+            let summary = stats.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
+            let band = serde_json::to_value(&summary.bands["steady"]).expect("band json");
+            assert_eq!(
+                (
+                    band["sent"].as_u64(),
+                    band["unanswered"].as_u64(),
+                    band["failed"].as_u64(),
+                    band["shed"].as_u64(),
+                    band["limit_unknown"].as_u64()
+                ),
+                (
+                    Some(1),
+                    Some(want.3),
+                    Some(want.4),
+                    Some(want.5),
+                    Some(want.6)
+                ),
+                "{name}"
+            );
+        }
     }
 
     /// A send the relay's per-key rate limiter turns away during a band

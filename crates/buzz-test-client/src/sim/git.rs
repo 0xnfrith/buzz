@@ -28,8 +28,19 @@ impl std::fmt::Display for PushError {
     }
 }
 
+/// A failure at step `at`, unless the generator ran out of its own files,
+/// ports or buffers on the way ([`super::guard::is_local_exhaustion`] on
+/// any of its causes): that is its own fault at any step, the push's own
+/// spawn included (`LocalExhausted`), never the relay's.
 fn failed(at: GitFailure) -> impl Fn(anyhow::Error) -> PushError {
-    move |err| PushError { at, err }
+    move |err| {
+        let at = if err.chain().any(super::guard::is_local_exhaustion) {
+            GitFailure::LocalExhausted
+        } else {
+            at
+        };
+        PushError { at, err }
+    }
 }
 
 #[derive(Clone)]
@@ -165,12 +176,13 @@ fn git_cmd(
     helper: &Path,
     nsec: &str,
     auth_tag: Option<&str>,
+    timeout: Duration,
 ) -> Result<Output> {
     let inherited = std::env::vars_os().map(|(name, _)| name);
     let child = git_command(args, cwd, helper, nsec, auth_tag, inherited)
         .spawn()
         .with_context(|| format!("spawn git {args:?}"))?;
-    wait_child_deadline(child, GIT_TIMEOUT).with_context(|| format!("git {args:?}"))
+    wait_child_deadline(child, timeout).with_context(|| format!("git {args:?}"))
 }
 
 fn git_ok(
@@ -180,7 +192,20 @@ fn git_ok(
     nsec: &str,
     auth_tag: Option<&str>,
 ) -> Result<String> {
-    let out = git_cmd(args, cwd, helper, nsec, auth_tag)?;
+    git_ok_within(args, cwd, helper, nsec, auth_tag, GIT_TIMEOUT)
+}
+
+/// [`git_ok`] with its own deadline: only tests pass one other than
+/// [`GIT_TIMEOUT`].
+fn git_ok_within(
+    args: &[&str],
+    cwd: &Path,
+    helper: &Path,
+    nsec: &str,
+    auth_tag: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let out = git_cmd(args, cwd, helper, nsec, auth_tag, timeout)?;
     if !out.status.success() {
         return Err(anyhow!(
             "git {args:?} failed:\nstdout: {}\nstderr: {}",
@@ -254,8 +279,9 @@ pub async fn clone_repo_async(
 
 /// Commits `bytes` as a new file and pushes it. Writing the file, `add`,
 /// `commit` and `branch` are the generator's own work (`Local`); the push
-/// is the relay's (`Push`). Each blob is a new file, so `commit` always has
-/// a change to commit.
+/// is the relay's (`Push`). At any step, the generator out of its own
+/// files, ports or buffers is its own (`LocalExhausted`). Each blob is a
+/// new file, so `commit` always has a change to commit.
 pub fn push_blob(
     repo: &GitRepo,
     helper: &Path,
@@ -285,16 +311,29 @@ pub fn push_blob(
         tag,
     )
     .map_err(&local)?;
+    let ms = push_main(repo, helper, GIT_TIMEOUT)?;
+    Ok((bytes.len() as u64, ms))
+}
+
+/// The push alone, to the checked URL, within `timeout`: the relay's part
+/// of [`push_blob`] (`Push`). Returns how long it took, in ms. Only tests
+/// pass a timeout other than [`GIT_TIMEOUT`].
+fn push_main(
+    repo: &GitRepo,
+    helper: &Path,
+    timeout: Duration,
+) -> std::result::Result<f64, PushError> {
     let start = Instant::now();
-    git_ok(
+    git_ok_within(
         &["push", "--quiet", repo.url.as_str(), "main"],
         &repo.worktree,
         helper,
         &repo.owner_nsec,
-        tag,
+        repo.owner_auth_tag.as_deref(),
+        timeout,
     )
     .map_err(failed(GitFailure::Push))?;
-    Ok((bytes.len() as u64, start.elapsed().as_secs_f64() * 1e3))
+    Ok(start.elapsed().as_secs_f64() * 1e3)
 }
 
 /// [`push_blob`] on tokio's blocking pool: git runs as child processes for
@@ -602,6 +641,124 @@ mod tests {
         assert_eq!(e.at, GitFailure::Local, "{e}");
         assert!(e.to_string().contains("\"add\""), "{e}");
         assert_eq!(refusing.accepts(), 0, "a failed add still pushed");
+    }
+
+    /// A repo with one commit on `main`, ready to push to `url`: a push
+    /// that fails then fails at the server, never on a missing branch.
+    fn committed_repo(dir: &Path, url: Target) -> GitRepo {
+        let repo = local_repo(dir.join("wt"), url);
+        std::fs::write(repo.worktree.join("blob"), b"x").expect("write");
+        for args in [
+            &["add", "."][..],
+            &["commit", "--quiet", "-m", "one"],
+            &["branch", "-M", "main"],
+        ] {
+            git_ok(args, &repo.worktree, Path::new("/usr/bin/true"), NSEC, None).expect("commit");
+        }
+        repo
+    }
+
+    /// A server that takes each connection, waits for the request's first
+    /// byte, then aborts it: linger 0, so the close is a TCP reset. Returns
+    /// its URL and how many it reset.
+    fn resetting_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let resets = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = resets.clone();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let _ = (&stream).read(&mut [0u8; 1]);
+                stream.set_nonblocking(true).expect("nonblocking");
+                rt.block_on(async {
+                    let s = tokio::net::TcpStream::from_std(stream).expect("from_std");
+                    s.set_zero_linger().expect("linger 0");
+                    count.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (format!("http://{addr}"), resets)
+    }
+
+    /// The relay failing the push stays the relay's (`Push`), a break: a
+    /// refusal, a reset, and no answer within the deadline. Each reached
+    /// the server, so none is the generator's own.
+    #[test]
+    fn a_relay_failure_at_the_push_stays_the_relays() {
+        let helper = Path::new("/usr/bin/true");
+        let dir = testsrv::tempdir();
+        let refusing = Server::start("127.0.0.1:0", testsrv::status(404, ""));
+        let repo = committed_repo(&dir.join("refused"), remote(&refusing));
+        let e = push_main(&repo, helper, GIT_TIMEOUT).expect_err("a push to a 404");
+        assert_eq!(e.at, GitFailure::Push, "refused: {e}");
+        assert!(
+            refusing.accepts() >= 1,
+            "the refused push never reached the server"
+        );
+
+        let (http, resets) = resetting_server();
+        let url = guard()
+            .check_url(&http, &["http"])
+            .and_then(|t| t.join(&format!("/git/{OWNER}/r")))
+            .expect("allowed");
+        let repo = committed_repo(&dir.join("reset"), url);
+        let e = push_main(&repo, helper, GIT_TIMEOUT).expect_err("a reset push");
+        assert_eq!(e.at, GitFailure::Push, "reset: {e}");
+        assert!(e.to_string().contains("reset by peer"), "not a reset: {e}");
+        assert!(resets.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+
+        let silent = Server::start_after(
+            "127.0.0.1:0",
+            testsrv::status(200, ""),
+            Duration::from_secs(10),
+        );
+        let repo = committed_repo(&dir.join("timeout"), remote(&silent));
+        let e = push_main(&repo, helper, Duration::from_secs(1)).expect_err("no answer in 1 s");
+        assert_eq!(e.at, GitFailure::Push, "timed out: {e}");
+        assert!(e.to_string().contains("timed out after 1s"), "{e}");
+        assert!(
+            silent.accepts() >= 1,
+            "the timed-out push never reached the server"
+        );
+    }
+
+    const OUT_OF_FILES_CHILD: &str = "sim::git::tests::a_push_out_of_files_is_the_generators_own";
+
+    /// The generator out of open files: the push's own spawn fails on its
+    /// side and never reaches the relay, and so does a whole `push_blob`
+    /// (at its first step, writing the blob). Each is the generator's own
+    /// (`LocalExhausted`), never the relay's (`Push`). Run in a child test
+    /// process whose file limit is low, so nothing else here runs out.
+    #[test]
+    fn a_push_out_of_files_is_the_generators_own() {
+        if testsrv::is_child(OUT_OF_FILES_CHILD) {
+            let server = Server::start("127.0.0.1:0", testsrv::status(200, ""));
+            let dir = testsrv::tempdir();
+            let repo = committed_repo(&dir, remote(&server));
+            let helper = Path::new("/usr/bin/true");
+            // Take every file this process may still open.
+            let mut held = Vec::new();
+            while let Ok(f) = std::fs::File::open("/dev/null") {
+                held.push(f);
+            }
+            let push = push_main(&repo, helper, GIT_TIMEOUT).expect_err("no push");
+            let whole = push_blob(&repo, helper, b"y", 2).expect_err("no push_blob");
+            drop(held);
+            assert_eq!(push.at, GitFailure::LocalExhausted, "{push}");
+            assert!(push.to_string().contains("spawn git"), "{push}");
+            assert_eq!(whole.at, GitFailure::LocalExhausted, "{whole}");
+            assert_eq!(server.accepts(), 0, "a connection reached the server");
+            println!("CHILD_OK {OUT_OF_FILES_CHILD}");
+            return;
+        }
+        testsrv::run_child_with_nofile(OUT_OF_FILES_CHILD, 128);
     }
 
     /// Runs `work` on a 2-worker runtime, the generator box's 2 vCPUs, with

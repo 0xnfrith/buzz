@@ -1,0 +1,136 @@
+# The band clock's local proof: one relay stack per generator, run as its
+# own Compose project (`g613-clock-<gen>`, from clock_proof_hook.py).
+#
+# Every image is named by an exact reference and must already be on the
+# machine: the proof checks each one first and runs Compose with
+# `--pull never`, and each service says `pull_policy: never` too.
+#
+# MinIO is Docker Hub's arm64 build (minio/minio and minio/mc), not the
+# pinned buzz-minio, which is linux/amd64 only and would run emulated on an
+# arm64 workstation. A proof number is labelled with it.
+#
+# Only the relay has host ports, on 127.0.0.1, one set per stack:
+#   PROOF_PORT         the relay's WebSocket and HTTP port
+#   PROOF_HEALTH_PORT  its health port
+# The relay listens on PROOF_PORT inside the container too, so its own URL
+# (RELAY_URL) is the URL the generator uses: NIP-42 and NIP-98 check it.
+services:
+  postgres:
+    image: postgres:17-alpine
+    pull_policy: never
+    environment:
+      POSTGRES_USER: buzz
+      POSTGRES_PASSWORD: buzz_dev
+      POSTGRES_DB: buzz
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buzz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    pull_policy: never
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: buzz_dev
+      MINIO_ROOT_PASSWORD: buzz_dev_secret
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    pull_policy: never
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 buzz_dev buzz_dev_secret &&
+        mc mb --ignore-existing local/buzz-media &&
+        mc anonymous set none local/buzz-media
+      "
+    restart: "no"
+
+  relay:
+    image: ghcr.io/block/buzz:sha-6e5c462
+    pull_policy: never
+    cpus: ${PROOF_RELAY_CPUS:-2.0}
+    mem_limit: 2g
+    environment:
+      BUZZ_BIND_ADDR: 0.0.0.0:${PROOF_PORT:?missing_PROOF_PORT}
+      BUZZ_HEALTH_PORT: "8088"
+      BUZZ_METRICS_PORT: "9202"
+      RELAY_URL: ws://127.0.0.1:${PROOF_PORT:?missing_PROOF_PORT}
+      DATABASE_URL: postgres://buzz:buzz_dev@postgres:5432/buzz
+      REDIS_URL: redis://redis:6379
+      BUZZ_S3_ENDPOINT: http://minio:9000
+      BUZZ_S3_ADDRESSING_STYLE: path
+      BUZZ_S3_ACCESS_KEY: buzz_dev
+      BUZZ_S3_SECRET_KEY: buzz_dev_secret
+      BUZZ_S3_BUCKET: buzz-media
+      BUZZ_GIT_REPO_PATH: /data/git
+      BUZZ_AUTO_MIGRATE: "true"
+      BUZZ_REQUIRE_AUTH_TOKEN: "true"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
+      RELAY_OWNER_PUBKEY: ${SIM_OWNER_PUBKEY:?missing_SIM_OWNER_PUBKEY}
+      BUZZ_ALLOW_NIP_OA_AUTH: "true"
+      BUZZ_RELAY_PRIVATE_KEY: ${SIM_RELAY_KEY:?missing_SIM_RELAY_KEY}
+      BUZZ_GIT_HOOK_HMAC_SECRET: ${SIM_GIT_HMAC:?missing_SIM_GIT_HMAC}
+      BUZZ_STORAGE_METRICS: "off"
+      # The git object-store conformance probe runs at every relay start, 32
+      # racers against MinIO. Against Docker Hub's arm64 MinIO here it hung
+      # after a transport drop in 3 of 5 recreates (the relay never became
+      # ready), so the proof turns it off: the rows test the clock, not the
+      # relay's start gate.
+      BUZZ_GIT_CONFORMANCE_PROBE: "false"
+      # Pass-through with no value: set only while setup runs at raised
+      # limits. Unset in the hook's environment = absent in the container =
+      # the relay's default limits.
+      BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN:
+      BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC:
+      BUZZ_RATE_LIMIT_AGENT_STANDARD_MESSAGES_PER_MIN:
+    ports:
+      - "127.0.0.1:${PROOF_PORT:?missing_PROOF_PORT}:${PROOF_PORT:?missing_PROOF_PORT}"
+      - "127.0.0.1:${PROOF_HEALTH_PORT:?missing_PROOF_HEALTH_PORT}:8088"
+    volumes:
+      - git-data:/data/git
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8088; printf \"GET /_readiness HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
+volumes:
+  postgres-data:
+  minio-data:
+  git-data:

@@ -153,6 +153,9 @@ struct Args {
 struct SetupStats {
     events: u64,
     rate_limited: u64,
+    /// Setup events the relay shed, full or unable to admit, each waited
+    /// out and resent like a rate limit.
+    relay_shed: u64,
     stop: Option<tokio::sync::watch::Receiver<sim::roles::Band>>,
 }
 
@@ -200,9 +203,10 @@ fn direct_members<'a>(profile: &Profile, pop: &'a Population) -> Vec<&'a Identit
     }
 }
 
-/// Owner-socket publish. A relay rate-limit NOTICE waits out the window and
-/// resends the same event (the relay did not process it); a transport error
-/// reconnects. Both are bounded.
+/// Owner-socket publish. A relay rate-limit NOTICE, the quota or the relay
+/// shedding, waits out the window and resends the same event (the relay did
+/// not process it); a transport error reconnects. Both are bounded. A
+/// `rate-limited:` text the pinned relay doesn't send fails at once.
 async fn send_with_retry(
     client: &mut BuzzTestClient,
     keys: &nostr::Keys,
@@ -223,6 +227,15 @@ async fn send_with_retry(
                 setup.rate_limited += 1;
                 last = anyhow::anyhow!("{what}: still rate-limited after {waits} waits");
                 setup.sleep(retry_in, what).await?;
+            }
+            Ok(Publish::Shed { text }) => {
+                waits += 1;
+                setup.relay_shed += 1;
+                last = anyhow::anyhow!("{what}: still shed after {waits} waits: {text}");
+                setup.sleep(Duration::from_secs(1), what).await?;
+            }
+            Ok(Publish::UnknownLimit { text }) => {
+                bail!("{what}: the relay sent a limit it doesn't send: {text}");
             }
             Err(e) => {
                 last = anyhow::anyhow!("{what}: {e}");
@@ -364,9 +377,13 @@ fn ramp_index(role: Role, i: usize, agents_per_human: usize) -> usize {
 }
 
 /// Linux: the open-file limit must hold a ramp's sockets (a websocket, the
-/// HTTP pool, git) or joiners fail on the generator's side and look like
-/// the relay refusing them. Elsewhere there is no /proc to read; the local
-/// proofs ramp small.
+/// HTTP pool, git) or joiners fail on the generator's side. Such a failure
+/// is counted as the generator's own (`local_exhausted`) and voids the run;
+/// this check keeps a run from getting there. Elsewhere there is no /proc
+/// to read; the local proofs ramp small.
+///
+/// The need is 8 per identity plus 256: twice the worst case worked out in
+/// TENANT_COGS.md ("The generator's open files"), about 2,420 at 660.
 fn check_open_files(ramp: &Ramp) -> Result<()> {
     check_open_files_in(
         std::fs::read_to_string("/proc/self/limits").ok().as_deref(),
@@ -379,7 +396,7 @@ fn check_open_files_in(limits: Option<&str>, ramp: &Ramp) -> Result<()> {
     let Some(limits) = limits else {
         return Ok(());
     };
-    let need = ramp.max as u64 * 4 + 256;
+    let need = ramp.max as u64 * 8 + 256;
     for line in limits.lines() {
         if let Some(rest) = line.strip_prefix("Max open files") {
             let soft = rest.split_whitespace().next().unwrap_or("");
@@ -602,6 +619,12 @@ async fn run(args: Args) -> Result<i32> {
         generate_population(&profile)
     };
     save_population(&out_dir.join("identities.json"), &pop)?;
+    // Who mentions whom, in the run and in the seed (sim/mentions.rs).
+    let mentions = Arc::new(sim::mentions::Mentions::new(&pop));
+    std::fs::write(
+        out_dir.join("mentions.json"),
+        serde_json::to_vec_pretty(&mentions.to_json())?,
+    )?;
 
     sim::phase::set_file(out_dir.join("phases.jsonl"))?;
     let mut control = signal::spawn(
@@ -648,6 +671,7 @@ async fn run(args: Args) -> Result<i32> {
         let report = seed::seed(
             &targets.relay,
             &pop,
+            &mentions,
             &profile.kinds,
             &channels,
             seed_events,
@@ -667,6 +691,7 @@ async fn run(args: Args) -> Result<i32> {
         "provision": {
             "events": setup.events,
             "rate_limited": setup.rate_limited,
+            "relay_shed": setup.relay_shed,
             "seconds": provision_s,
         },
     }));
@@ -713,6 +738,8 @@ async fn run(args: Args) -> Result<i32> {
         git_helper: args.git_credential_helper.clone(),
         out_dir: out_dir.clone(),
         blink: args.blink,
+        mentions: mentions.clone(),
+        seqs: Default::default(),
     });
 
     let profile = Arc::new(profile);
@@ -860,6 +887,13 @@ async fn run(args: Args) -> Result<i32> {
             while let Some(r) = ready_rx.recv().await {
                 match r {
                     Ok(()) => stats.record_joined(),
+                    // A joiner that couldn't connect because the generator ran
+                    // out of files or ports is the generator's fault, never
+                    // the relay refusing it.
+                    Err(e) if sim::guard::text_is_local_exhaustion(&e) => {
+                        warn!("ramp join failed on the generator's side: {e}");
+                        stats.record_local_exhausted();
+                    }
                     Err(e) => {
                         warn!("ramp join: {e}");
                         stats.record_client_error("join_failed");
@@ -1579,6 +1613,85 @@ mod tests {
             assert_eq!(live_of(&out)["sent"], 0, "{name}: a band was measured");
         }
 
+        // The relay's limit texts in setup. A shed is waited out and the
+        // event resent, like the quota, and counted apart in setup-done's
+        // provision; setup fails only when the waits give up. A text the
+        // pinned relay doesn't send fails setup at once.
+        fn shed_9030_once(k: u64) -> Answer {
+            static SHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if k == 9030 && !SHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Answer::Notice("rate-limited: too many concurrent requests")
+            } else {
+                Answer::Accept
+            }
+        }
+        let relay = relay_with(shed_9030_once).await;
+        let (task, out) = start("setup-shed-once", &relay.url, &[]);
+        until(
+            "setup-shed-once: setup-done",
+            Duration::from_secs(60),
+            || read(&out.join("phases.jsonl")).contains("\"setup-done\""),
+        )
+        .await;
+        let done = phases_of(&out)
+            .into_iter()
+            .find(|p| p["phase"] == "setup-done")
+            .expect("setup-done");
+        assert_eq!(
+            (
+                done["provision"]["relay_shed"].as_u64(),
+                done["provision"]["rate_limited"].as_u64()
+            ),
+            (Some(1), Some(0)),
+            "{done}"
+        );
+        until("setup-shed-once: the fifo", Duration::from_secs(20), || {
+            out.join("band.fifo").exists()
+        })
+        .await;
+        send(&out, "stop").await.expect("writer");
+        assert_eq!(
+            ends("setup-shed-once", task, Duration::from_secs(30)).await,
+            0
+        );
+        fn always_shed_9030(k: u64) -> Answer {
+            if k == 9030 {
+                Answer::Notice("rate-limited: shared admission unavailable")
+            } else {
+                Answer::Accept
+            }
+        }
+        fn unknown_9030(k: u64) -> Answer {
+            if k == 9030 {
+                Answer::Notice("rate-limited: slow down")
+            } else {
+                Answer::Accept
+            }
+        }
+        for (name, answer, why, within) in [
+            (
+                "setup-always-shed",
+                always_shed_9030 as fn(u64) -> Answer,
+                "9030 h0: still shed after 21 waits: rate-limited: shared admission unavailable",
+                Duration::from_secs(60),
+            ),
+            (
+                "setup-unknown-limit",
+                unknown_9030,
+                "9030 h0: the relay sent a limit it doesn't send: rate-limited: slow down",
+                Duration::from_secs(15),
+            ),
+        ] {
+            let relay = relay_with(answer).await;
+            let (task, out) = start(name, &relay.url, &[]);
+            assert_eq!(ends(name, task, within).await, 3, "{name}");
+            assert_eq!(
+                phases_of(&out),
+                vec![serde_json::json!({"phase": "setup-failed", "why": why})],
+                "{name}"
+            );
+        }
+
         // A stop while setup waits out a rate limit (the relay names 60 s)
         // ends setup within seconds, with its own line.
         fn rate_limit_9030(k: u64) -> Answer {
@@ -1778,9 +1891,17 @@ mod tests {
         };
         assert_eq!(
             check_open_files_in(Some(&limits("1024")), &ramp).map(|_| ()).expect_err("low").to_string(),
-            "the open-file limit is 1024; a ramp to 660 identities needs at least 2896 (raise LimitNOFILE)"
+            "the open-file limit is 1024; a ramp to 660 identities needs at least 5536 (raise LimitNOFILE)"
         );
         assert!(check_open_files_in(Some(&limits("65536")), &ramp).is_ok());
+        assert!(
+            check_open_files_in(Some(&limits("4096")), &ramp).is_err(),
+            "4096 is under the need"
+        );
+        assert!(
+            check_open_files_in(Some(&limits("16384")), &ramp).is_ok(),
+            "the unit's limit"
+        );
         assert!(check_open_files_in(Some(&limits("unlimited")), &ramp).is_ok());
         assert!(
             check_open_files_in(None, &ramp).is_ok(),

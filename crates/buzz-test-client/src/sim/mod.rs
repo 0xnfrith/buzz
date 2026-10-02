@@ -2,11 +2,13 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod admission;
+pub mod feed;
 pub mod git;
 pub mod guard;
 pub mod identity;
 pub mod kinds;
 pub mod media;
+pub mod mentions;
 pub mod phase;
 pub mod profile;
 pub mod reads;

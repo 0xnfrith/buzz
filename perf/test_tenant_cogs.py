@@ -434,6 +434,7 @@ class SchemaTests(unittest.TestCase):
             "identities": {"humans": 10, "agents": 20},
             "lost_after_backfill": 0,
             "media": {"uploads": 3, "rejected": 0},
+            "reads": {"reads": 0, "failed": 0},
             "git": {"pushes": 1, "failed": 0},
         }
         self.assertEqual(tenant_cogs.acceptance_errors(line, summary, 0), [])
@@ -450,6 +451,27 @@ class SchemaTests(unittest.TestCase):
         line = self.fixture()
         line["bands"]["steady"]["client"]["rate_limited"] = 5
         self.assertEqual(tenant_cogs.acceptance_errors(line, self.summary_ok(), 0), [])
+
+    def test_sends_unanswered_or_not_sent_fail_acceptance(self) -> None:
+        """A send the relay never answered, one that failed before it was
+        written, one the relay shed, and one answered with an unknown limit,
+        each fail a local run: none is a reject, so the rejected gate alone
+        would pass them."""
+        rows = [
+            ({"unanswered": 0, "failed": 0}, []),
+            ({"unanswered": 3, "failed": 0}, ["steady client unanswered=3"]),
+            ({"unanswered": 0, "failed": 2}, ["steady client failed=2"]),
+            # Shed by the relay, or a limit text the pinned relay doesn't
+            # send: neither is the quota, which alone is apart.
+            ({"shed": 4}, ["steady client shed=4"]),
+            ({"limit_unknown": 1}, ["steady client limit_unknown=1"]),
+        ]
+        for counts, want in rows:
+            with self.subTest(counts=counts):
+                summary = {"bands": {"steady": {"sent": 10, "accepted": 10 - sum(counts.values()), "rejected": 0, **counts}}}
+                line = self.fixture()
+                line["bands"]["steady"]["client"] = tenant_cogs.client_from_summary(summary, "steady")
+                self.assertEqual(tenant_cogs.acceptance_errors(line, self.summary_ok(), 0), want)
 
     def test_a_run_seeds_its_days_and_reads_what_the_seed_did(self) -> None:
         """--seed-days goes to tenant_sim; the run waits for seed-start,
@@ -480,10 +502,32 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(tenant_cogs.seed_errors(seed),
                          ["seed: 150000 of 207335 events acknowledged (rejected 0, errors 3)"])
 
+    def test_reads_gate_acceptance(self) -> None:
+        """A local run fails acceptance on any failed read, and when agents
+        took turns but no read was answered; a summary without reads is
+        refused."""
+        line = self.fixture()
+        rows = [
+            ({"reads": 40, "failed": 0}, {"44200": 12}, []),
+            ({"reads": 39, "failed": 1}, {"44200": 12}, ["reads.failed=1"]),
+            ({"reads": 0, "failed": 0}, {"44200": 12}, ["agents took 12 turns but no read was answered"]),
+            ({"reads": 0, "failed": 0}, {}, []),
+            (None, {}, ["reads missing from the summary"]),
+        ]
+        for reads, kinds, want in rows:
+            with self.subTest(reads=reads, kinds=kinds):
+                summary = {**self.summary_ok(), "sent_by_kind": kinds}
+                if reads is None:
+                    summary.pop("reads")
+                else:
+                    summary["reads"] = reads
+                self.assertEqual(tenant_cogs.acceptance_errors(line, summary, 0), want)
+
     def summary_ok(self) -> dict:
         return {
             "identities": {"humans": 10, "agents": 20},
             "media": {"uploads": 3, "rejected": 0},
+            "reads": {"reads": 0, "failed": 0},
             "git": {"pushes": 2, "failed": 0},
         }
 
@@ -522,6 +566,7 @@ class SchemaTests(unittest.TestCase):
         summary = {
             "identities": {"humans": 10, "agents": 20},
             "media": {"uploads": 3, "rejected": 0},
+            "reads": {"reads": 0, "failed": 0},
             "git": {"pushes": 1, "failed": 0},
         }
         line = self.fixture()
@@ -553,6 +598,7 @@ class SchemaTests(unittest.TestCase):
         summary = {
             "identities": {"humans": 10, "agents": 20},
             "media": {"uploads": 3, "rejected": 0},
+            "reads": {"reads": 0, "failed": 0},
             "git": {"pushes": 1, "failed": 0},
         }
         line = self.fixture()

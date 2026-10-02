@@ -36,6 +36,9 @@ pub fn percentiles(mut xs: Vec<f64>) -> Percentiles {
 /// of events acknowledged within 500 ms", so 500 is a bound: the share
 /// within it is exact, not interpolated.
 pub const ACK_MS_BOUNDS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+/// The home-feed poll's time bounds, in ms, for live.json's `poll_ms_le`:
+/// a poll is up to four queries, each up to 30 s.
+pub const POLL_MS_BOUNDS: [u64; 10] = [50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 120000];
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BandClient {
@@ -48,6 +51,17 @@ pub struct BandClient {
     /// counted apart from `rejected`, neither a break nor the generator's
     /// error.
     pub rate_limited: u64,
+    /// Sends written that got no OK in time, or whose socket failed before
+    /// it: the relay not answering.
+    pub unanswered: u64,
+    /// Sends that failed before anything was written: the generator's own.
+    pub failed: u64,
+    /// Sends the relay shed, full or unable to admit (see
+    /// `admission::Limit::Shed`): a relay break.
+    pub shed: u64,
+    /// Sends answered with a `rate-limited:` text the pinned relay doesn't
+    /// send: the run voids.
+    pub limit_unknown: u64,
     pub received: u64,
     /// Sends in this band by event kind; acceptance checks the floor with it.
     pub sent_by_kind: BTreeMap<String, u64>,
@@ -56,6 +70,10 @@ pub struct BandClient {
     /// Agent per-turn reads that the relay answered, and how long each took.
     pub reads: u64,
     pub read_ms: Percentiles,
+    /// Humans' home-feed polls begun in this band, and how long each took,
+    /// whole (its two to four queries).
+    pub polls: u64,
+    pub poll_ms: Percentiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storm_backfill_ms: Option<Percentiles>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,11 +120,24 @@ pub struct Summary {
     pub media: MediaStats,
     pub git: GitStats,
     pub reads: ReadStats,
+    /// Humans' home-feed polls in any band, never-mentioned humans apart
+    /// from the rest: a never-mentioned human's poll walks every event.
+    pub polls: PollStats,
     pub join_backfill_ms: Percentiles,
     pub gaps_detected: u64,
     pub lost_after_backfill: u64,
     pub rejects_by_message: BTreeMap<String, u64>,
     pub blink: Option<serde_json::Value>,
+}
+
+/// Home-feed polls and their whole times, by whether the human polling is
+/// ever mentioned (`mentions.rs`'s tail).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PollStats {
+    pub never_mentioned: u64,
+    pub never_mentioned_ms: Percentiles,
+    pub mentioned: u64,
+    pub mentioned_ms: Percentiles,
 }
 
 #[derive(Default)]
@@ -116,12 +147,18 @@ struct BandAcc {
     accepted: u64,
     rejected: u64,
     rate_limited: u64,
+    unanswered: u64,
+    failed: u64,
+    shed: u64,
+    limit_unknown: u64,
     received: u64,
     sent_by_kind: BTreeMap<String, u64>,
     ok_ms: Vec<f64>,
     fanout_ms: Vec<f64>,
     reads: u64,
     read_ms: Vec<f64>,
+    polls: u64,
+    poll_ms: Vec<f64>,
     storm_backfill_ms: Vec<f64>,
     storm_events_returned: u64,
 }
@@ -142,6 +179,23 @@ struct Inner {
     git_failed: u64,
     git_failed_by: BTreeMap<GitFailure, u64>,
     git_push_ms: Vec<f64>,
+    /// Sends the relay never answered, in any band.
+    send_unanswered: u64,
+    /// Sends the relay shed, in any band.
+    relay_shed: u64,
+    /// Unknown `rate-limited:` texts, sends and reads, by text.
+    limit_unknown: BTreeMap<String, u64>,
+    /// Identities whose task ended on its own, by name: why.
+    identities_ended: BTreeMap<String, String>,
+    /// Connects that failed on the generator's side: out of files or ports.
+    local_exhausted: u64,
+    /// Home-feed polls, in any band, by time: one count per bound in
+    /// POLL_MS_BOUNDS and one past the last.
+    polls: u64,
+    poll_ms_buckets: [u64; POLL_MS_BOUNDS.len() + 1],
+    /// Every poll's time, by whether its human is never mentioned.
+    poll_ms_tail: Vec<f64>,
+    poll_ms_mentioned: Vec<f64>,
     /// Accepted sends by ack time, one count per bound in ACK_MS_BOUNDS
     /// and one past the last; cumulative in live.json.
     ack_ms_buckets: [u64; ACK_MS_BOUNDS.len() + 1],
@@ -172,6 +226,9 @@ pub enum MediaFailure {
     Refused,
     /// No answer: a transport error or a timeout.
     Unanswered,
+    /// The generator ran out of its own files or ports on connect: its own
+    /// fault, counted in `local_exhausted`, not here.
+    LocalExhausted,
 }
 
 /// Where an agent's read failed. Only `Client` is the generator's own
@@ -186,13 +243,17 @@ pub enum ReadFailure {
     Unanswered,
 }
 
-/// Where a git push failed. Only `Local` is the generator's own failure.
+/// Where a git push failed. Only `Push` is the relay's failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GitFailure {
     /// Writing the blob, `git add`, `commit` or `branch`.
     Local,
     /// The push to the relay: refused, failed, or past git's timeout.
     Push,
+    /// The generator ran out of its own files, ports or buffers at any
+    /// step, the push's own spawn included: its own fault, counted in
+    /// `local_exhausted`, not here.
+    LocalExhausted,
 }
 
 /// The live counters `tenant_sim` rewrites into `<out-dir>/live.json` while
@@ -229,6 +290,30 @@ pub struct Live {
     pub read_refused: u64,
     pub read_unanswered: u64,
     pub read_rate_limited: u64,
+    /// Sends written that got no OK in time, or whose socket failed before
+    /// it, in any band: the relay not answering (a relay break). A send
+    /// that failed before anything was written is `send_failed` in
+    /// `client_errors`, the generator's own.
+    pub send_unanswered: u64,
+    /// Sends the relay shed in any band, full (its relay-wide handler limit)
+    /// or unable to reach its admission store: a relay break. The relay's
+    /// per-key quota is apart, in `rate_limited`.
+    pub relay_shed: u64,
+    /// `rate-limited:` texts the pinned relay doesn't send, sends and
+    /// reads, by text: any voids the run (the relay's pin moved).
+    pub limit_unknown: BTreeMap<String, u64>,
+    /// Identities whose task ended on its own, not on a stop or a lease,
+    /// by name: why. Any voids the run: a lost identity under-loads it.
+    pub identities_ended: BTreeMap<String, String>,
+    /// Connects that failed on the generator's own side (out of open files,
+    /// local ports or socket buffers: EMFILE and its kin): never the relay's.
+    /// Any voids the run.
+    pub local_exhausted: u64,
+    /// Humans' home-feed polls, in any band, and their times, cumulative
+    /// like `ack_ms_le`: `"1000": n` is every poll done within 1 s. A
+    /// poll's failed queries are in the read failures.
+    pub polls: u64,
+    pub poll_ms_le: BTreeMap<String, u64>,
     /// Accepted sends (in sampled bands) acknowledged within each bound,
     /// in ms, cumulative like a Prometheus histogram: `"500": n` is every
     /// ack within 500 ms; `"+Inf"` is every ack.
@@ -281,6 +366,20 @@ pub fn spawn_live_writer(
     })
 }
 
+/// A histogram's buckets as cumulative counts by bound, `"+Inf"` last.
+fn cumulative(buckets: &[u64], bounds: &[u64]) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    let mut total = 0;
+    for (i, n) in buckets.iter().enumerate() {
+        total += n;
+        let key = bounds
+            .get(i)
+            .map_or_else(|| "+Inf".to_string(), |b| b.to_string());
+        out.insert(key, total);
+    }
+    out
+}
+
 fn count<K: Ord>(m: &BTreeMap<K, u64>, k: K) -> u64 {
     m.get(&k).copied().unwrap_or(0)
 }
@@ -327,12 +426,86 @@ impl Stats {
         });
     }
 
-    /// A send the relay's per-key rate limiter turned away.
+    /// A send written that got no answer (`band`: a sampled band's name).
+    pub fn record_send_unanswered(&self, band: Option<&str>, kind: u16) {
+        self.with(|s| {
+            s.send_unanswered += 1;
+            if let Some(band) = band {
+                *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.sent += 1;
+                b.unanswered += 1;
+                *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        });
+    }
+
+    /// A send that failed before anything was written: the generator's own
+    /// error (`send_failed` in client_errors).
+    pub fn record_send_failed(&self, band: Option<&str>, kind: u16) {
+        self.with(|s| {
+            *s.client_errors
+                .entry("send_failed".to_string())
+                .or_default() += 1;
+            if let Some(band) = band {
+                *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.sent += 1;
+                b.failed += 1;
+                *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        });
+    }
+
+    /// A send the relay shed (`band`: a sampled band's name).
+    pub fn record_send_shed(&self, band: Option<&str>, kind: u16) {
+        self.with(|s| {
+            s.relay_shed += 1;
+            if let Some(band) = band {
+                *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.sent += 1;
+                b.shed += 1;
+                *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        });
+    }
+
+    /// A send answered with an unknown `rate-limited:` text.
+    pub fn record_limit_unknown(&self, band: Option<&str>, kind: u16, text: &str) {
+        self.with(|s| {
+            *s.limit_unknown.entry(text.to_string()).or_default() += 1;
+            if let Some(band) = band {
+                *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.sent += 1;
+                b.limit_unknown += 1;
+                *b.sent_by_kind.entry(kind.to_string()).or_default() += 1;
+            }
+        });
+    }
+
+    /// A read answered with an unknown `rate-limited:` text.
+    pub fn record_read_limit_unknown(&self, text: &str) {
+        self.with(|s| *s.limit_unknown.entry(text.to_string()).or_default() += 1);
+    }
+
+    /// An identity's task ended on its own (not on a stop or a lease): the
+    /// first reason kept per identity.
+    pub fn record_identity_ended(&self, name: &str, why: &str) {
+        self.with(|s| {
+            s.identities_ended
+                .entry(name.to_string())
+                .or_insert_with(|| why.to_string());
+        });
+    }
+
     /// An identity connected and subscribed.
     pub fn record_joined(&self) {
         self.with(|s| s.joined += 1);
     }
 
+    /// A send the relay's per-key rate limiter turned away.
     pub fn record_rate_limited(&self, band: &str, kind: u16) {
         self.with(|s| {
             *s.sent_by_kind.entry(kind.to_string()).or_default() += 1;
@@ -409,8 +582,37 @@ impl Stats {
         self.with(|s| *s.read_failed_by.entry(why).or_default() += 1);
     }
 
+    /// A connect that failed on the generator's own side.
+    pub fn record_local_exhausted(&self) {
+        self.with(|s| s.local_exhausted += 1);
+    }
+
     pub fn record_read_rate_limited(&self) {
         self.with(|s| s.reads_rate_limited += 1);
+    }
+
+    /// A home-feed poll that took `ms`, whole, begun in `band` (a sampled
+    /// band's name; others count in the totals only), by a human who is
+    /// never mentioned (`tail`) or not.
+    pub fn record_poll(&self, band: Option<&str>, ms: f64, tail: bool) {
+        self.with(|s| {
+            s.polls += 1;
+            if tail {
+                s.poll_ms_tail.push(ms);
+            } else {
+                s.poll_ms_mentioned.push(ms);
+            }
+            let i = POLL_MS_BOUNDS
+                .iter()
+                .position(|&le| ms <= le as f64)
+                .unwrap_or(POLL_MS_BOUNDS.len());
+            s.poll_ms_buckets[i] += 1;
+            if let Some(band) = band {
+                let b = s.bands.entry(band.to_string()).or_default();
+                b.polls += 1;
+                b.poll_ms.push(ms);
+            }
+        });
     }
 
     pub fn record_git(&self, bytes: u64, push_ms: f64) {
@@ -422,8 +624,13 @@ impl Stats {
     }
 
     /// A failed push. summary.json's git `failed` still counts every
-    /// failure, wherever it failed; live.json splits them.
+    /// failure, wherever it failed; live.json splits them. One where the
+    /// generator ran out of its own files or ports counts in
+    /// `local_exhausted` alone, as media's does.
     pub fn record_git_failed(&self, why: GitFailure) {
+        if why == GitFailure::LocalExhausted {
+            return self.record_local_exhausted();
+        }
         self.with(|s| {
             s.git_failed += 1;
             *s.git_failed_by.entry(why).or_default() += 1;
@@ -476,6 +683,13 @@ impl Stats {
                 read_refused: count(&s.read_failed_by, ReadFailure::Refused),
                 read_unanswered: count(&s.read_failed_by, ReadFailure::Unanswered),
                 read_rate_limited: s.reads_rate_limited,
+                send_unanswered: s.send_unanswered,
+                relay_shed: s.relay_shed,
+                limit_unknown: s.limit_unknown.clone(),
+                identities_ended: s.identities_ended.clone(),
+                local_exhausted: s.local_exhausted,
+                polls: s.polls,
+                poll_ms_le: cumulative(&s.poll_ms_buckets, &POLL_MS_BOUNDS),
                 ack_ms_le: {
                     let mut out = BTreeMap::new();
                     let mut total = 0;
@@ -514,12 +728,18 @@ impl Stats {
                     accepted: acc.accepted,
                     rejected: acc.rejected,
                     rate_limited: acc.rate_limited,
+                    unanswered: acc.unanswered,
+                    failed: acc.failed,
+                    shed: acc.shed,
+                    limit_unknown: acc.limit_unknown,
                     received: acc.received,
                     sent_by_kind: acc.sent_by_kind.clone(),
                     ok_ms: percentiles(acc.ok_ms.clone()),
                     fanout_ms: percentiles(acc.fanout_ms.clone()),
                     reads: acc.reads,
                     read_ms: percentiles(acc.read_ms.clone()),
+                    polls: acc.polls,
+                    poll_ms: percentiles(acc.poll_ms.clone()),
                     storm_backfill_ms: None,
                     storm_events_returned: None,
                 };
@@ -550,6 +770,12 @@ impl Stats {
                     bytes: s.git_bytes,
                     push_ms: percentiles(s.git_push_ms.clone()),
                     failed: s.git_failed,
+                },
+                polls: PollStats {
+                    never_mentioned: s.poll_ms_tail.len() as u64,
+                    never_mentioned_ms: percentiles(s.poll_ms_tail.clone()),
+                    mentioned: s.poll_ms_mentioned.len() as u64,
+                    mentioned_ms: percentiles(s.poll_ms_mentioned.clone()),
                 },
                 reads: ReadStats {
                     reads: s.reads,
@@ -611,6 +837,13 @@ mod tests {
             "read_refused",
             "read_unanswered",
             "read_rate_limited",
+            "send_unanswered",
+            "relay_shed",
+            "limit_unknown",
+            "identities_ended",
+            "local_exhausted",
+            "polls",
+            "poll_ms_le",
             "ack_ms_le",
             "lost",
             "joined",
@@ -706,6 +939,50 @@ mod tests {
         let summary = st.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
         assert_eq!((summary.media.uploads, summary.media.rejected), (1, 6));
         assert_eq!((summary.git.pushes, summary.git.failed), (1, 3));
+    }
+
+    /// A push the generator ran out of files or ports for counts in
+    /// `local_exhausted` alone: never in live.json's git totals, nor in
+    /// summary.json's git `failed`.
+    #[test]
+    fn a_git_push_out_of_files_counts_as_local_exhausted() {
+        let st = Stats::new();
+        st.record_git_failed(GitFailure::LocalExhausted);
+        let live = st.live(7);
+        assert_eq!(
+            (
+                live.local_exhausted,
+                live.git_local_failed,
+                live.git_push_failed
+            ),
+            (1, 0, 0)
+        );
+        let summary = st.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
+        assert_eq!(summary.git.failed, 0);
+    }
+
+    /// Poll times: never-mentioned humans' apart from the rest, over every
+    /// band; each band's own, and live.json's histogram, over both.
+    #[test]
+    fn poll_times_are_split_by_whether_the_human_is_mentioned() {
+        let st = Stats::new();
+        st.record_poll(Some("steady"), 1400.0, true);
+        st.record_poll(Some("steady"), 1500.0, true);
+        st.record_poll(Some("steady"), 90.0, false);
+        st.record_poll(None, 80.0, false);
+        let summary = st.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
+        assert_eq!(
+            (summary.polls.never_mentioned, summary.polls.mentioned),
+            (2, 2)
+        );
+        assert_eq!(summary.polls.never_mentioned_ms.max, 1500.0);
+        assert_eq!(summary.polls.mentioned_ms.max, 90.0);
+        assert_eq!(summary.bands["steady"].polls, 3);
+        let live = st.live(1);
+        assert_eq!(
+            (live.polls, live.poll_ms_le["100"], live.poll_ms_le["2500"]),
+            (4, 2, 4)
+        );
     }
 
     #[test]

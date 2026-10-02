@@ -21,6 +21,8 @@ guard"); the default URLs use `127.0.0.1`. k3s runs are disabled for now (see
 | `perf/tenant_cogs.py` | orchestrator + cgroup/Postgres/MinIO/`/metrics` sampler |
 | `perf/cogs_report.py` | bands → proposed Helm values, density, diff, anchor |
 | `docker-compose.harness.relay.yml` | overlay that runs the relay as a 2-CPU container on top of `docker-compose.harness.yml` |
+| `perf/band_clock.py` | the band clock (`tenant_cogs.py clock`): drives every `tenant_sim` of a run through one hook command; stdlib only |
+| `perf/clock-proof.sh`, `perf/clock_proof.py`, `perf/clock_proof_hook.py`, `perf/clock-proof/` | the clock's local proof: two relay stacks on this machine, and its hook |
 
 ## One-time build
 
@@ -284,6 +286,44 @@ not start the relay and cannot restart it.
 - Reactions target the newest received channel event, never a DM or turn
   metric from the `#p` stream.
 
+### The `#p` subscription
+
+Each identity subscribes to the events that tag it (`#p`), from a `since`,
+as Buzz Desktop's live `#p` subscriptions do: never a history query.
+
+- **At warm-up** the filter is `{"#p": [<pubkey>], "since": <its start>}`:
+  no kinds, no limit. Its events are never counted as backfill. Warm-up
+  still requires its EOSE within 8 s.
+- **On a reconnect** (the peak band's storm, a dropped connection, a blink)
+  it is resent as the desktop's reconnect replay resends a live
+  subscription (`desktop/src/shared/api/relayReconnectReplay.ts`:
+  `replayLiveSubscriptions`, line 148, and `buildReconnectReplayFilter`,
+  line 66): from the later of the subscription's own `since` and the newest
+  event seen on it less 5 s (`RECONNECT_REPLAY_SKEW_SECS`, line 12); with
+  no event seen, from its own `since` (line 72). That short catch-up window
+  is real load, and the storm carries it. The channel subscriptions and the
+  gap recheck are unchanged.
+
+**A finding: a kind-less `#p` history query is expensive at volume.** Before
+this, the `#p` subscription had no `since`. Measured on a workstation (arm64,
+the relay at `sha-6e5c462` capped at 2 CPUs and 2 GB, Postgres uncapped, 16
+cores), after the heavy profile's 90-day seed (757,803 events):
+
+| Query | Postgres time |
+|---|---|
+| `{"#p": [<pubkey>]}`, one identity, the relay idle | 1.4 to 1.55 s, for 61 events |
+| `{"kinds": [9, 40002], "#p": [<pubkey>], "limit": 50}`, the relay idle | 1.4 s |
+| `{"#p": [<pubkey>]}` from 100 identities at once (the warm-up) | about 18 s each (median 17.8 s), Postgres on 13 of 16 cores; every other query 5 ms or less |
+| `{"kinds": [39002], "#p": [<pubkey>]}` | 5.6 ms |
+| `{"#p": [<pubkey>], "since": <now>}` | 0.1 ms |
+
+The plan walks every event in the community newest-first, all 763,965, and
+looks each up in `event_mentions`, because the planner expects 323,042
+matches where there are 61. Past the 8 s window, warm-up failed. Two things
+on that rig made it worse: every seed event is stamped at seed time, so a
+`since` an hour back walks them all too (1.39 s); and every event was in one
+partition, `events_p_future`.
+
 ## The ramp
 
 The ramp finds how many people and agents a relay carries before it breaks
@@ -306,6 +346,14 @@ provisioned while a band is measured.
 - **A step is not a band.** The band's clock (and its duty cycles) runs on;
   at each step every identity rechecks for lost events since the step
   before, which costs nothing when none is missing.
+- **A joiner's baseline:** every channel message carries its author's
+  `seq`, and an identity counts a gap in it as a lost event. A joiner
+  switched on mid-stream expects, from each author, everything after the
+  author's last accepted `seq` at the moment it subscribes: all of a
+  relay's identities run in one generator process, which keeps that number
+  for each (`SeqBoard`). So nothing sent before it subscribed is a gap, and
+  everything after is. Without it, a joiner counted each author's earlier
+  messages as lost.
 - **A sizing ramp, as planned:** the team profile on a fresh stack
   seeded with the team's 90 days (`--seed-days 90`), from its 30 identities,
   15 more (5 teams) every 300 s, at steady-band rates with no storm, up to
@@ -471,8 +519,10 @@ band lengths in `[bands]` are the lengths the orchestrator runs.
 
 A successful `run` exits 0 only when the floor shows 30 connections and is
 idle (the per-kind counts cover every client send, every one is presence or
-typing, kinds 20001/20002, and the relay stores nothing), sampled bands have zero unexpected rejects, media uploads succeeded with zero
-rejects, git pushed with zero failures, each sampled band (floor, steady,
+typing, kinds 20001/20002, and the relay stores nothing), sampled bands have zero unexpected rejects, no send the relay
+didn't answer and none that failed before it was written, media uploads succeeded with zero
+rejects, git pushed with zero failures, no agent read failed and, when agents
+took turns, at least one read was answered, each sampled band (floor, steady,
 peak) has at least 3 samples carrying the relay's working set, and
 `lost_after_backfill` is 0. Whether the bands are distinct (the relay's
 working set rising floor p50 < steady p50 < peak max) is reported as
@@ -585,10 +635,25 @@ python3 perf/tenant_cogs.py remote-sample \
     or branch that failed (`git_local_failed`), or an agent's read that
     failed before it went out (`read_client_failed`). A missing or unreadable
     `--live-file` is a void too, never "no errors", and so is a file
-    without `rejected`, `rate_limited`, `media_client_failed`, `media_refused`,
+    without `rejected`, `rate_limited`, `send_unanswered`, `relay_shed`,
+    `limit_unknown`, `identities_ended`, `local_exhausted`, `polls`,
+    `poll_ms_le`, `media_client_failed`, `media_refused`,
     `media_unanswered`, `git_local_failed`, `git_push_failed`,
     `read_client_failed`, `read_refused`, `read_unanswered` or
     `read_rate_limited`: a total missing is never read as 0.
+  - **An identity that ended on its own:** an identity's task that joined,
+    then ended for any reason but a stop or a lease (an error, such as an
+    event it couldn't sign, or a panic), is in `identities_ended` at once,
+    with why, and voids the run naming it (a note after the break). A
+    silently lost identity under-loads the run and over-states the
+    relay's ceiling. One that never joined is a failed warm-up, or a ramp
+    joiner the relay didn't take (`join_failed`, a break).
+  - **The generator out of its own files or ports:** `local_exhausted`
+    rose (a connect that failed on its side: EMFILE and its kin), a void
+    with its own line (a note after the break).
+  - **A limit the pinned relay doesn't send:** a `rate-limited:` text
+    other than the relay's three (below), in `limit_unknown` by text,
+    voids the run at any time, naming the text: the relay's pin moved.
   - `tenant_sim`'s live counters stop being live: `t_unix` missing or not
     a whole number of seconds, more than 10 s old or 10 s ahead of the
     clock when the loop reads it, or lower than the last one read; or its
@@ -606,7 +671,10 @@ python3 perf/tenant_cogs.py remote-sample \
     - **memory:** the relay box's MemAvailable under 10% of MemTotal, on
       any fast sample;
     - **lost or rejected:** events found lost after a recheck (`lost`);
-      relay rejects (not rate limits); media uploads, git pushes or agent
+      relay rejects (not rate limits); sends the relay didn't answer
+      (`send_unanswered`: written, then no OK in 30 s or the socket failed
+      before it); sends the relay shed (`relay_shed`: full, or unable to
+      reach its admission store); media uploads, git pushes or agent
       reads the relay refused or didn't answer (`media_refused`,
       `media_unanswered`, `git_push_failed`, `read_refused`,
       `read_unanswered`; a timeout included);
@@ -617,8 +685,13 @@ python3 perf/tenant_cogs.py remote-sample \
 
     At its limit a relay usually fails by timing out, so a timeout is the
     relay's; a stalled generator still shows in its CPU, its memory and a
-    stale live file. Rate limits are counted apart: never a break. A
-    generator event after the break is a note, not a void, written once.
+    stale live file. **`send_unanswered` is trusted as the relay's only
+    because the generator box's CPU and memory void exists:** without that
+    void, a generator too busy to read its sockets would look like a relay
+    that stopped answering. A send that failed before anything was written
+    (encoding, a socket already closed) is `send_failed`, the generator's
+    own error. The relay's per-key quota is counted apart: never a break.
+    A generator event after the break is a note, not a void, written once.
   - **Whose break.** A relay's break is its box's own signals, those in the
     live file bound to it, or those in a live file bound to no relay
     (`--live-file`), whichever came first; another relay's doesn't count
@@ -646,7 +719,9 @@ python3 perf/tenant_cogs.py remote-sample \
   second signal while the summaries or `void.json` are written is ignored.
 
 `tenant_sim` rewrites `<out-dir>/live.json` every 2 s for this: totals of
-sent, accepted, rejected, rate-limited and received, its own errors by kind
+sent, accepted, rejected, rate-limited, unanswered (`send_unanswered`),
+shed (`relay_shed`) and received, unknown limits by text (`limit_unknown`),
+identities that ended on their own (`identities_ended`), its own errors by kind
 (`send_failed`, `recv_error`, `reconnect_failed`, `backfill_failed`,
 `connection_dropped`), and media and git failures by where they failed,
 stamped `t_unix`. If a rewrite fails, `tenant_sim` logs it and carries on;
@@ -659,8 +734,36 @@ never calls it stale, so the loop may outlive `tenant_sim`. One that ended
 on a lease or an eof lost its driver, and the loop voids on it. A crash
 writes neither, goes stale, and voids as before.
 
+Each send ends in exactly one of accepted, rejected, rate-limited,
+`relay_shed`, `limit_unknown`, `send_unanswered` or `send_failed`. A
+`NOTICE` that isn't `rate-limited:` doesn't end a send: it is handled like
+any other message, and the send keeps waiting for its `OK`.
+
+**The relay's `rate-limited:` texts,** told apart by their exact prefix. The
+relay this harness pins sends three (`crates/buzz-relay/src` at its commit):
+
+| Text | Where | What it means | Counts as |
+|---|---|---|---|
+| `rate-limited: quota exceeded; retry in Ns` | `connection.rs`; HTTP 429 in `api/bridge.rs` | this key's own quota | `rate_limited` (reads: `read_rate_limited`), apart |
+| `rate-limited: too many concurrent requests` | `connection.rs`, for an EVENT, REQ or COUNT | the relay's one relay-wide handler limit (`BUZZ_MAX_CONCURRENT_HANDLERS`) is full: not per key or per connection | `relay_shed`, a relay break |
+| `rate-limited: shared admission unavailable` | `connection.rs`; HTTP 503 in `api/bridge.rs` | the relay can't reach its own admission store | `relay_shed` (reads: `read_refused`), a relay break |
+| any other `rate-limited:` text | none | the pin moved | `limit_unknown`, a void naming the text |
+
+In setup, the quota and a shed are each waited out and the event resent,
+counted in `setup-done`'s `provision.rate_limited` and
+`provision.relay_shed`: setup fails only when the retries give up. An
+unknown text fails setup at once. The seed resends both, counted in its
+report's `rate_limited` and `shed`.
+
 | Failure | live.json total | Counts as |
 |---|---|---|
+| Send: encoding, or a socket already closed, before anything is written | `send_failed` | the generator's error |
+| Send: written, then no OK within 30 s | `send_unanswered` | a relay break |
+| Send: written, then the socket fails before the OK | `send_unanswered` | a relay break |
+| Send: the quota's NOTICE (`rate-limited: quota exceeded`) | `rate_limited` | apart: neither |
+| Send: the relay full or unable to admit (`rate-limited: too many concurrent requests`, `rate-limited: shared admission unavailable`) | `relay_shed` | a relay break |
+| Send: any other `rate-limited:` text | `limit_unknown` | a void |
+| Send: an `OK` that rejects | `rejected` | a relay break |
 | Media: encoding the image or signing the auth, before the request goes out | `media_client_failed` | the generator's error |
 | Media: an answer that isn't 2xx | `media_refused` | a relay break |
 | Media: a transport error or a timeout, no answer | `media_unanswered` | a relay break |
@@ -669,7 +772,154 @@ writes neither, goes stale, and voids as before.
 | Agent read: building or signing the request, before it goes out | `read_client_failed` | the generator's error |
 | Agent read: an answer that isn't 2xx, or isn't JSON | `read_refused` | a relay break |
 | Agent read: a transport error or a timeout, no answer | `read_unanswered` | a relay break |
-| Agent read: a 429 from the relay's per-key rate limit | `read_rate_limited` | apart: neither |
+| Agent read: the quota (`rate-limited: quota exceeded`, a 429) | `read_rate_limited` | apart: neither |
+| Agent read: the relay full or unable to admit | `read_refused` | a relay break |
+| Agent read: any other `rate-limited:` text | `limit_unknown` | a void |
+
+## The humans' home-feed poll
+
+Each human runs Buzz Desktop, whose home feed polls the relay in the
+background (`desktop/src/features/home/hooks.ts:10-23`). `tenant_sim` sends
+that poll for each human, from the moment it joins.
+
+**One poll is the desktop's `get_feed`** (`desktop/src-tauri/src/commands/messages.rs`):
+up to four `POST /query` calls with NIP-98, one after another, with the
+desktop's exact filters (`sim/feed.rs` cites each line):
+
+| Query | Filter | Sent |
+|---|---|---|
+| mentions | `{"kinds": [9, 40002, 1, 45001, 45003, 1618, 1619, 1621, 1630, 1631, 1632, 1633], "#p": [me], "limit": 50}`, no `since` | always |
+| approvals | `{"kinds": [46010, 46011, 46012], "#p": [me], "limit": 20}` | always |
+| edits | `{"kinds": [40003], "#e": [<the mentions' ids>]}` | only if mentions came back |
+| profiles | `{"kinds": [0], "authors": [<the mentions' authors, each once>]}` | only if mentions came back |
+
+**When:** at connect; every 30 s while connected (`refetchInterval`), a
+tick that comes while a poll is in flight skipped, never queued; and on a
+reconnect (the peak storm, a drop, a blink), at once, at most once every
+15 s (`desktop/src/shared/api/useRelayAutoHeal.ts:16`), the 30 s ticks
+starting again from it. None while disconnected. Polls go on in every band,
+the pause included, as an open desktop does, until the run stops.
+
+**Counting:** a query the relay refused, or didn't answer within 30 s, is
+the relay's break, through the read counters (`read_refused`,
+`read_unanswered`); the quota is apart (`read_rate_limited`). A failed query
+doesn't end the poll: the desktop turns it into an empty answer and goes on.
+A slow poll that is answered is not a break: there is no latency target.
+**The 30 s is stricter than the desktop,** whose HTTP client has no timeout
+(`desktop/src-tauri/src/app_state.rs:198-202`) and which shows a failed poll
+as an empty feed.
+
+**Recorded:** `polls` and `poll_ms_le` (whole polls, cumulative, in ms) in
+`live.json`; each band's `polls` and `poll_ms` (p50, p95, p99, max) in
+`summary.json`; and in `bands.jsonl`'s client line, each window's `polls`
+and `poll_ms_p50_le`, `poll_ms_p95_le` and `poll_ms_max_le`: the smallest of
+the histogram's bounds that holds half, 95% and all of them.
+
+**C, a poll on each live mention:** a human's desktop refetches its home
+feed on each live mention (`desktop/src/app/AppShell.tsx:231-233`, wired at
+`:380`). `tenant_sim` starts a whole poll at once for each message-kind event
+(9, 40002, 45001, 45003: the desktop's `HOME_MENTION_EVENT_KINDS`) that
+reaches a human's `#p` subscription from someone else, beside any poll in
+flight: the desktop's command already sent keeps running, so the relay sees
+no coalescing.
+
+**C is not bounded,** because the desktop doesn't bound it: a burst of
+mentions to one human is that many polls in flight at once. What keeps the
+generator from running out of files is its open-file headroom, below.
+
+**Poll times by mentions:** `summary.json`'s `polls` splits every poll into
+never-mentioned humans and the rest (counts, p50, p95, p99, max). A
+never-mentioned human's mentions query walks every event; a mentioned one's
+can stop at its 50th.
+
+**Not modelled: the unread observer.** The desktop also polls the channels
+of its *inactive* communities (`desktop/src/features/communities/useCommunityUnread.ts`,
+`communityUnreadObserver.ts:264-270`). The population is one community per
+relay, so a human here has no inactive community and the observer sends
+nothing. A person in several communities on one box would add it.
+
+## The generator's open files
+
+A connect that fails on the generator's own side (out of open files,
+local ports or socket buffers: EMFILE, ENFILE, EADDRNOTAVAIL, ENOBUFS)
+never reached the relay. `tenant_sim` counts it in `local_exhausted`, apart
+from the relay's failures, for reads, polls, media uploads, ramp joins and
+git pushes (at any step, the push's own spawn included), and the loop
+voids the run on it with its own line. That is the safety net; the
+headroom keeps a run from reaching it.
+
+**A known limit, inside git's own process.** `tenant_sim` sees only git's
+exit and its output. Git starts with its own file table, so its own
+EMFILE isn't a real case, but the box's file table (ENFILE) and its local
+ports (EADDRNOTAVAIL) are shared: either can fail git's connect inside the
+child. Git then exits 128 with `Failed to connect`, and the push counts as
+the relay's failure, a break. The generator's own reads and polls, which
+far outnumber its pushes, would count `local_exhausted` in the same run,
+but one that comes after the break is only a note.
+
+**The peak, a ramp at 660 on the team profile** (`profiles/10h-20a.toml`:
+a human and 2 agents a team, so 220 humans and 440 agents), at peak rates
+(humans x3, agents x4) for the worst case, with the mention model above:
+
+| Holder | Open at once | From |
+|---|---|---|
+| Websockets | 660 | one per identity |
+| Periodic polls | 220 | one per human, never two |
+| C polls, rank 1 (22.9% of tags) | 119 to 478 | tagged messages 17.4/s (below) x 22.9% = 3.98/s, held 30 s (one query) to 120 s (four queries that each wait 30 s) |
+| C polls, rank 4, a human (10.5%) | 55 to 219 | 1.83/s, the same |
+| C polls, the middle's 188 humans (7.9% over 565 identities) | 14 to 55 | 0.46/s, the same |
+| Agents' reads | 440 | one at a time per agent |
+| Media uploads | 35 | 2,090 an hour at peak, up to 30 s each, two paths |
+| Git pushes | 264 | 1,760 an hour at peak, up to 90 s each: about 44 `git` processes, about 6 files each |
+| The process itself | 64 | stdio, logs, the live writer, the fifo, the runtime |
+| **Total** | **1,871 to 2,435** | |
+
+Tagged messages at peak: humans (12 messages + 0.5 media) x 3 x 220 =
+8,250 an hour x 85% = 7,013; agents (40 + 1) x 4 x 440 = 72,160 an hour x
+77% = 55,563; together 62,576 an hour, 17.4 a second. Idle pooled HTTP
+connections are the same connections between requests, so they add
+nothing past the in-flight peak.
+
+- **`tenant_sim` refuses to start** below 8 per identity plus 256 (5,536 at
+  660): over twice the worst case (`check_open_files`, Linux).
+- **The generator units** set `LimitNOFILE=16384`: three times that need,
+  and the local proof's `tenant_sim` runs under the same soft limit.
+
+## Mentions in messages
+
+A channel message (kind 9, a plain message or a media one) can tag one
+identity, `["p", <pubkey>]`, as an `@mention` or a reply does; so can the
+seed's messages, at the same shares and with the same skew, so the history
+carries them too. Both numbers come from one measurement, named in every
+use: **the operator's own relay: 24 channels, 30 days, an agent-heavy
+workspace** (1,540 kind-9 messages, 1,271 `p` tags, 15 authors, 14
+distinct recipients; counts only). About half of the
+agents' tags there are reply tags with no `@` in the text; for what a
+mention costs the relay, both count. `sim/mentions.rs` holds the model, and
+each run writes it to `<out-dir>/mentions.json`.
+
+- **How many messages carry a tag:** 85% of a human's, 77% of an agent's.
+- **Who gets them,** the measured rank curve mapped onto the population,
+  in team order (each human, then that human's agents):
+  - **the tail:** the last `ceil(2/15)` of the humans and of the agents are
+    never mentioned ("2 of the 15 authors were never tagged"): 4 of
+    `25h-75a`'s 25 humans and 10 of its 75 agents;
+  - **the head:** ranks 1 to 6 get 22.9, 22.7, 18.7, 10.5, 9.0 and 8.3%
+    of the tags; rank 1 is the first human, ranks 2 to 6 the next
+    identities in team order;
+  - **the middle:** everyone else shares the last 7.9% evenly;
+  - ranks the population is too small for are left out and the rest
+    renormalized; no one mentions themselves.
+
+**Why skewed, and why a tail:** a home-feed poll's mentions query reads
+newest-first and stops at its 50th match, so its cost depends on how often
+*that* person is mentioned. A person with fewer than 50 mentions in the
+history makes it walk every event (1.4 s at the heavy seed's volume, above),
+every 30 s. An even spread would give every human a cheap poll and size a
+box too small. On `25h-75a`'s seed the middle gets about 600 tags each in
+90 days, over 50: the never-mentioned humans are the whole tail. **The
+caveat:** the source is one agent-heavy workspace; a human-heavy customer
+may mention differently.
 
 ## Agent per-turn reads
 
@@ -716,6 +966,138 @@ blocking pool, never on a runtime worker: each git command can take up to
 90 s, and the generator box's 2 vCPUs give the runtime 2 workers. Two slow
 pushes on them would stall every task, the live counters' writer
 included, and the loop would void the run as stale at the relay's limit.
+
+## The band clock (`tenant_cogs.py clock`)
+
+One clock drives every `tenant_sim` of a run: each profile's bands in turn,
+then a ramp. `tenant_cogs.py clock` runs `perf/band_clock.py`, which is one
+stdlib-only file so a wrapper can pin it by its sha256.
+
+```bash
+python3 perf/tenant_cogs.py clock --gen a --gen b \
+  --profile perf/profiles/10h-20a.toml \
+  --ramp perf/profiles/10h-20a.toml --ramp-start 30 --ramp-step 15 --ramp-every 300 --ramp-max 660 \
+  --out <dir> --setup-must-not-rate-limit -- <hook command...>
+```
+
+**It knows nothing about where the relays or generators run.** Everything it
+does to the world goes through the hook: a command, run with an event and
+its arguments appended, no shell, its output capped at 16 MiB and its time
+at 1800 s.
+
+| Event | Arguments | The hook... |
+|---|---|---|
+| `setup` | item | readies every relay for the item (a profile's name, or `ramp`): a fresh stack, at the raised setup limits |
+| `gen-start` | gen, item | starts that generator for the item, `--pause-after-setup`, its band signal on a fifo |
+| `phases` | gen | prints that generator's phase lines (`phases.jsonl`) |
+| `fleet` | | restarts every relay at its fleet limits, and fails if a raised limit is still set |
+| `send` | gen, line | sends one band-signal line to that generator |
+| `sampler` | `start` or `stop` | starts or stops the sampler loop (`remote-sample`), one `--live` per relay |
+| `band` | name | tells the sampler the band's name (its `--band-file`) |
+| `boundary` | band | checks the run at a measured band's end (for example, an egress proof) |
+| `rules` | | checks the run's isolation |
+| `status` | | prints JSON: `void` (the loop's `void.json`), `breaks` (its `breaks.json`), `sampler` and `gens` (`active` or how each ended) |
+| `end` | | the run is over: stops whatever still runs. Always called |
+
+**The order of an item:**
+
+1. `setup`, then `gen-start` for each generator, then a barrier: every
+   generator's `setup-done`. A `setup-failed` line, or no `setup-done`
+   within `--setup-timeout` (3600 s), stops the run (exit 5).
+2. With `--setup-must-not-rate-limit`, a `setup-done` whose
+   `provision.rate_limited` isn't 0 stops the run (exit 6): the setup
+   limits are raised, so a rate limit there means the setup is wrong. So
+   does one whose `provision.relay_shed` isn't 0, with its own line: the
+   relay shed setup's events, full or unable to admit.
+3. `fleet`, then `continue` to each generator, then a barrier on `ready`
+   (`--ready-timeout`, 300 s), then `sampler start`.
+
+**Both barriers read `status` every `--cadence`:** a generator that stops
+before its `setup-done` or its `ready` stops the run at once (exit 5, `the
+generator for <g> stopped before its <phase>: <how it ended>`), not when
+the barrier's timeout runs out.
+4. Each band: its line to every generator with a lease of its length plus
+   `--lease-slack` (120 s), the sampler told, the band held. After each
+   measured band (`floor`, `steady`, `peak`) every generator pauses (`band
+   pause`, lease `--pause-lease`, 900 s), then the rules and `boundary`
+   run. **A boundary that fails stops the run.**
+5. `stop` to each generator, wait until each has ended
+   (`--stop-timeout`), `sampler stop`.
+
+**While it holds a band** it reads `status` every `--cadence` (5 s) and runs
+`rules` every `--rules-every` (60 s) and at each boundary. It stops the run
+on a void (exit 3, `void: <the loop's reason>`), on a sampler or a
+generator that ended on its own (exit 3), and on any hook event that exits
+nonzero (exit 4, `the hook failed at <event>: exit <n>: <its last line>`).
+**It never decides "the relay broke" itself:** it reads each relay's
+break from `status`, as the sampler loop wrote it.
+
+**The ramp** (`--ramp`, a profile's TOML; its warmup runs first): every
+generator to `band steady`, then `ramp <k>` steps from `--ramp-start`, adding
+`--ramp-step` every `--ramp-every` seconds up to `--ramp-max`, within
+`--ramp-budget` (4 h). A step is the band `ramp-<n>` to the sampler, so its
+ack test is judged on it. **A step's breaks are read as the next step
+begins** (the sampler judges a step when the band changes), and each is put
+on the step its break names. A generator whose relay broke is stopped
+without waiting for it to end, so one slow to stop (its relay frozen) holds
+no other generator's next step past its lease; the item's end waits for
+every generator it stopped. The ramp ends when every relay broke, at the
+max, past its budget, or on a void. After the last step it pauses and waits `--judge-wait` (15 s, three
+of the sampler's 5 s ticks) before it reads the last step's result.
+
+**What it writes:** `<out>/clock.json`, rewritten whole after each item and at
+the end: the generators, each item (its provision, the bands it ran, and a
+ramp's steps and each relay's `held_k`, `broke_k`, `broke_step`, `why` and
+`band`, or `held_k` and `ended`: "held at the max" or "the ramp's time ran
+out"), the exit and the line that stopped it. **A ramp stopped by a void or
+a failed hook keeps its steps and each break found before it;** a relay
+that hadn't broken has no result (`held_k` stays null): the void voids it.
+
+**Exits:** 0 done; 2 refused (bad arguments, a profile that can't be read);
+3 void; 4 a hook failed; 5 setup failed or timed out; 6 setup was
+rate-limited with `--setup-must-not-rate-limit`; 130 and 143 on INT and TERM.
+**`end` always runs,** whatever stopped the run; an `end` that fails turns
+exit 0 into 4 and is in `clock.json`.
+
+**If the clock itself dies,** nothing runs `end`. The generators stop on
+their own when their leases run out (`"ended": "lease"`), and the loop voids
+on that. Whatever runs the clock must then run `end`, or its own teardown.
+
+## The clock's local proof (`clock-proof.sh`)
+
+`perf/clock-proof.sh --out <dir>` builds `tenant_sim` and
+`git-credential-nostr`, then runs `perf/clock_proof.py`: the real clock,
+`tenant_sim`, sampler loop and relays, on this machine. Each generator
+drives its own stack, a Compose project `<prefix>-a` or `<prefix>-b`
+(`perf/clock-proof/compose.yml`), through `perf/clock_proof_hook.py`. It
+prints which `python3` ran and checks first that every image is already
+here by its exact reference (Compose runs with `--pull never`; a missing
+image stops the proof) and that both projects are empty. The proof
+profiles in `perf/clock-proof/profiles` are pinned by `SHA256SUMS`: short
+bands, and rates high enough that a short band has its 20 acks and agents
+take turns. Every check prints PASS or FAIL; the proof exits 1 if any
+failed. Whatever happens in a row, the hook's `end` runs after it, and the
+proof checks nothing is left by label.
+
+| Row | What it forces | What must happen |
+|---|---|---|
+| `reads` | nothing: two generators through every band | exit 0; both sent every band in order, paused after each measured one; the rules every minute and at each boundary; fleet read back no raised limit; **every agent read and every human's home-feed poll answered, none refused or dropped; the humans polled** |
+| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and breaks it after at least one held step, by one of the loop's named relay-break classes (every `*_BREAK` reason in `remote_sampler.py`: rejects, the ack test, the relay box's no relay container, OOM kill and low MemAvailable, dropped connections, failed joins and lost events; and every relay failure total: media refused or unanswered, a failed git push, reads refused or unanswered, sends unanswered, shed. All are read from `remote_sampler.py`, so the proof keeps no second copy, and a row checks that every `relay_break` call there takes one of them. A void, a generator fault or anything else fails the row), printed; a holds to the max. The ack test alone is held by the loop's own rows (`test_remote_sampler.py`) |
+| `ramp-freeze` | relay b frozen (`docker pause`) at the second step | exit 0; b broke at step 2 because its sends went unanswered (`send_unanswered`, none `send_failed`): a break, never a void; a holds to the max |
+| `ramp-starved` | relay b cut to 0.01 CPU (`docker update --cpus`) at the second step | exit 0; b broke at step 2 because it shed sends (`relay_shed`, none `limit_unknown`): a break, never counted apart; a holds to the max; the texts b got, counted |
+| `boundary` | the floor's boundary check fails | exit 4 on that line; no band after it; `end` ran |
+| `void` | generator a stopped (SIGSTOP) in the steady band | the loop voids on a's stale live file; exit 3 on that line |
+| `crash-gen` | generator b killed (SIGKILL) in the steady band | exit 3: "the generator for b stopped on its own: exited -9" |
+| `crash-clock` | the clock killed (SIGKILL) in the steady band | each generator's lease runs out (exit 5, `ended: lease`); the loop voids on a lost driver and exits 3; nothing ran `end` until the proof did |
+| `heavy-seed` | one generator, `25h-75a`'s 90-day seed (757,803 events) at raised limits, with mentions | every event acknowledged, and the seed's time; the never-mentioned tail is 4 humans and 10 agents; its humans' poll times, apart from the mentioned humans' |
+
+**What only a rented run can show:** the relays on their own boxes and the
+generator on another, so the generator box's CPU and memory void is real
+(here the generators share the machine with the relays, and nothing samples
+it); the relay box's own signals over ssh (memory, OOM kills, a missing
+relay container); real network latency; and a relay's limit found by load
+alone, at its real size. The local relays are capped by Docker, and Docker
+Hub's arm64 MinIO stands in for the pinned one (amd64 only).
 
 ## What is not in this tree
 

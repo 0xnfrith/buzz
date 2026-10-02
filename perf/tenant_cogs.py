@@ -1581,12 +1581,25 @@ def client_from_summary(summary: dict[str, Any], band: str) -> dict[str, Any] | 
         # Turned away by the relay's per-key rate limits: counted apart from
         # rejected, never an acceptance error.
         "rate_limited": b.get("rate_limited", 0),
+        # Written and never answered (the relay's), and not written at all
+        # (the generator's): each fails acceptance.
+        "unanswered": b.get("unanswered", 0),
+        "failed": b.get("failed", 0),
+        # Shed by the relay (full, or its admission store out of reach),
+        # and answered with a limit the pinned relay doesn't send: each
+        # fails acceptance. Only the per-key quota is apart.
+        "shed": b.get("shed", 0),
+        "limit_unknown": b.get("limit_unknown", 0),
         "received": b.get("received", 0),
         "ok_ms": b.get("ok_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
         "fanout_ms": b.get("fanout_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
         # Agent per-turn reads the relay answered in this band, and their time.
         "reads": b.get("reads", 0),
         "read_ms": b.get("read_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
+        # Humans' home-feed polls begun in the band, and their whole times.
+        # A poll's failed queries are in the read failures.
+        "polls": b.get("polls", 0),
+        "poll_ms": b.get("poll_ms") or {"p50": 0, "p95": 0, "p99": 0, "max": 0},
     }
     # Left out when tenant_sim did not report it, so the floor gate fails closed.
     if "sent_by_kind" in b:
@@ -2222,6 +2235,10 @@ def acceptance_errors(
             errs.append(f"{name} relay events_rejected={rejected}")
         if client_rej:
             errs.append(f"{name} client rejected={client_rej}")
+        for k in ("unanswered", "failed", "shed", "limit_unknown"):
+            n = int((band.get("client") or {}).get(k) or 0)
+            if n:
+                errs.append(f"{name} client {k}={n}")
     lost = int(summary.get("lost_after_backfill") or line.get("totals", {}).get("lost_after_backfill") or 0)
     if lost:
         errs.append(f"lost_after_backfill={lost}")
@@ -2230,6 +2247,16 @@ def acceptance_errors(
         errs.append(f"media.rejected={media.get('rejected')}")
     if int(media.get("uploads") or 0) <= 0:
         errs.append("media.uploads == 0")
+    # Agent reads: none may fail, and agents that took turns must have read.
+    reads = summary.get("reads")
+    turns = int((summary.get("sent_by_kind") or {}).get("44200") or 0)
+    if not isinstance(reads, dict):
+        errs.append("reads missing from the summary")
+    else:
+        if int(reads.get("failed") or 0):
+            errs.append(f"reads.failed={reads.get('failed')}")
+        if turns and int(reads.get("reads") or 0) <= 0:
+            errs.append(f"agents took {turns} turns but no read was answered")
     git = summary.get("git") or {}
     if int(git.get("failed") or 0):
         errs.append(f"git.failed={git.get('failed')}")
@@ -2359,6 +2386,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    # The band clock is its own file, stdlib only, so a wrapper can pin it
+    # by its sha256; `clock` runs it with the rest of the arguments.
+    if argv[:1] == ["clock"]:
+        import band_clock
+
+        return band_clock.main(argv[1:])
     args = build_parser().parse_args(argv)
     commands = {
         "fingerprint": cmd_fingerprint,
