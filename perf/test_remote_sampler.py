@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import remote_sampler as rs
 import tenant_cogs
-from planted_env import assert_names, parent_env
+from planted_env import assert_names, parent_env, test_env
 
 H1, H2 = "a" * 64, "b" * 64
 
@@ -149,7 +149,7 @@ class Guard(unittest.TestCase):
                 p = subprocess.run([sys.executable, *flags, str(Path(__file__).with_name("tenant_cogs.py")), "remote-sample",
                                     "--out-dir", str(self.out), "--allow-cidr", "10.77.0.0/24", "--deny-list", str(self.deny),
                                     "--box", "relay1=10.77.0.3", "--ssh-key", str(self.key), "--known-hosts", str(self.kh)],
-                                   cwd="/", capture_output=True, text=True, timeout=60)
+                                   cwd="/", capture_output=True, text=True, timeout=60, env=test_env())
                 self.assertEqual((p.returncode, p.stdout, p.stderr),
                                  (2, "", "refused: --expected-hashes is required with --box. Nothing was run.\n"))
 
@@ -1458,7 +1458,8 @@ class Signals(unittest.TestCase):
                 deny.write_text("")
                 p = subprocess.Popen([sys.executable, str(Path(__file__).with_name("tenant_cogs.py")), "remote-sample",
                                       "--allow-cidr", "10.77.0.0/24", "--deny-list", str(deny), "--self", "gen",
-                                      "--out-dir", d, "--fast-every", "0.2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                      "--out-dir", d, "--fast-every", "0.2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     env=test_env())
                 ring = Path(d) / "samples" / "gen" / "ring-000000.jsonl"
                 deadline = time.time() + 20
                 while not ring.exists() and time.time() < deadline:

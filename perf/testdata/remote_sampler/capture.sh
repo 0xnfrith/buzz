@@ -10,6 +10,20 @@
 # is removed by that exact name on any exit. It changes nothing else.
 set -euo pipefail
 
+# Run again, once, from a fixed environment (perf/TENANT_COGS.md, "Child
+# environments"): PATH, HOME, TMPDIR and LC_ALL=C, and the names below, each
+# only when set. Nothing else of the caller's reaches docker. The DOCKER_*
+# names select the daemon the containers run on; dropping one would silently
+# switch to another.
+if [[ -z "${HARNESS_ENV_FIXED:-}" ]]; then
+  fixed=(LC_ALL=C HARNESS_ENV_FIXED=1)
+  for name in PATH HOME TMPDIR DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG; do
+    [[ -z "${!name+x}" ]] || fixed+=("$name=${!name}")
+  done
+  exec /usr/bin/env -i "${fixed[@]}" /bin/bash "$0" "$@"
+fi
+unset HARNESS_ENV_FIXED
+
 UBUNTU=${1:?usage: capture.sh <ubuntu image with nft> <postgres image>}
 POSTGRES=${2:?usage: capture.sh <ubuntu image with nft> <postgres image>}
 HERE=$(cd "$(dirname "$0")" && pwd)

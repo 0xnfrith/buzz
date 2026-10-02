@@ -4,6 +4,7 @@ Tests only: nothing here ships to a generator box.
 - PLANTED_ENV: the parent's planted variables, dummies made at import, so a
   check's failure message can be scanned for them.
 - parent_env: a fixed fake parent environment to patch os.environ to.
+- test_env: the fixed environment every test's own child gets.
 - assert_names: compares variable names, never values, so a failure prints
   names only.
 - write_stub: the perl stub that records the names a child was started with.
@@ -11,6 +12,7 @@ Tests only: nothing here ships to a generator box.
 
 from __future__ import annotations
 
+import os
 import secrets
 import unittest
 from pathlib import Path
@@ -24,6 +26,20 @@ PLANTED_ENV = {k: secrets.token_hex(16) for k in (PLANTED, "BUZZ_PRIVATE_KEY", "
 def parent_env(**named: str) -> dict[str, str]:
     """A fixed fake parent: PATH, HOME, the planted dummies, then `named`."""
     return {"PATH": "/usr/bin:/bin", "HOME": "/home/fake", **PLANTED_ENV, **named}
+
+
+def test_env(**named: str) -> dict[str, str]:
+    """The environment of a child a test starts: PATH, HOME and TMPDIR from
+    this process (each only when set), LC_ALL=C, then `named`. Nothing else
+    of this process's comes through, so no credential of whoever runs the
+    tests reaches a child, whatever its name."""
+    out = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR") if k in os.environ}
+    out["LC_ALL"] = "C"
+    out.update(named)
+    return out
+
+
+test_env.__test__ = False  # a helper, not a test, whatever runner imports it
 
 
 def assert_names(case: unittest.TestCase, env: Mapping[str, str] | Iterable[str], want: Iterable[str]) -> None:

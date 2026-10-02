@@ -121,3 +121,223 @@ pub(crate) mod stub {
         names.iter().map(|s| s.to_string()).collect()
     }
 }
+
+/// Rows for the children the tests themselves start: they get
+/// `testsrv::test_command`'s fixed set, and nothing else.
+#[cfg(test)]
+mod tests {
+    use super::stub;
+    use crate::sim::guard::testsrv;
+    use std::path::{Path, PathBuf};
+
+    const TEST_COMMAND_CHILD: &str = "sim::childenv::tests::test_command_gets_exactly_its_set";
+
+    /// A planted-variable row for `test_command`. The parent (a fresh copy
+    /// of this test binary) holds `G613_PLANTED`, its own credentials, a
+    /// proxy and git's injected config, `HOME` and `TMPDIR` of its own, and
+    /// a stub folder first on `PATH`; all dummies made now. The command it
+    /// starts gets `PATH`, `HOME`, `TMPDIR` and `LC_ALL=C` and nothing
+    /// else, and the values are the right ones (`match`, never printed;
+    /// `PATH` is right because the stub was found through it). Then each
+    /// of the three is unset in the parent in turn, and the command gets
+    /// the rest.
+    #[test]
+    fn test_command_gets_exactly_its_set() {
+        if testsrv::is_child(TEST_COMMAND_CHILD) {
+            let dir = PathBuf::from(std::env::var_os("G613_ROW_DIR").expect("row dir"));
+            let probe = dir.join("bin").join("probe");
+            for unset in [None, Some("TMPDIR"), Some("HOME"), Some("PATH")] {
+                if let Some(name) = unset {
+                    std::env::remove_var(name);
+                }
+                let status = testsrv::test_command(&probe).status().expect("probe");
+                assert!(status.success(), "probe failed with {unset:?} unset");
+            }
+            println!("CHILD_OK {TEST_COMMAND_CHILD}");
+            return;
+        }
+        let dir = testsrv::tempdir();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let out = dir.join("names");
+        let (home, tmp) = (stub::dummy(), stub::dummy());
+        stub::write(
+            &bin,
+            "probe",
+            &out,
+            &[("HOME", &home), ("TMPDIR", &tmp), ("LC_ALL", "C")],
+            None,
+        );
+        let mut env = stub::planted();
+        env.push(("G613_ROW_DIR", dir.display().to_string()));
+        env.push(("HOME", home));
+        env.push(("TMPDIR", tmp));
+        let path = std::env::var("PATH").unwrap_or_default();
+        env.push(("PATH", format!("{}:{path}", bin.display())));
+        testsrv::run_child(TEST_COMMAND_CHILD, &env);
+        assert_eq!(
+            stub::lines(&out),
+            vec![
+                stub::set(&["HOME=match", "LC_ALL=match", "PATH", "TMPDIR=match"]),
+                stub::set(&["HOME=match", "LC_ALL=match", "PATH"]),
+                stub::set(&["LC_ALL=match", "PATH"]),
+                stub::set(&["LC_ALL=match"]),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The scan's text patterns, built from pieces so that this file never
+    /// holds one itself.
+    fn spawn() -> String {
+        ["Command", "::new("].concat()
+    }
+
+    /// The end of the `{ }` body that starts at or after `at`.
+    fn body_end(src: &str, at: usize) -> usize {
+        let open = at + src[at..].find('{').expect("a body");
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src.len()
+    }
+
+    /// (how many calls to `test_command` the test code of `src` makes, one
+    /// message per spawn in it that could hand its child the parent's
+    /// environment). Test code is what follows the file's first `cfg(test)`
+    /// or `#[test]`. A spawn is fine inside `test_command` itself, or when
+    /// `env_clear` is in the same statement (up to the next `;`). A message
+    /// is `file:line` and the call's name, never a value.
+    fn test_spawn_problems(name: &str, src: &str) -> (usize, Vec<String>) {
+        let starts = [["cfg(", "test)"].concat(), ["#[", "test]"].concat()];
+        let Some(from) = starts.iter().filter_map(|s| src.find(s.as_str())).min() else {
+            return (0, Vec::new());
+        };
+        let spawn = spawn();
+        let is_comment = |at: usize| {
+            let line = src[..at].rfind('\n').map_or(0, |i| i + 1);
+            src[line..at].trim_start().starts_with("//")
+        };
+        let helper = src
+            .find("fn test_command(")
+            .map(|at| (at, body_end(src, at)));
+        let through = src[from..]
+            .match_indices("test_command(")
+            .filter(|(i, _)| !is_comment(from + i) && !src[..from + i].ends_with("fn "))
+            .count();
+        let (mut bad, mut at) = (Vec::new(), from);
+        while let Some(pos) = src[at..].find(spawn.as_str()) {
+            let here = at + pos;
+            at = here + spawn.len();
+            if is_comment(here) || helper.is_some_and(|(s, e)| (s..e).contains(&here)) {
+                continue;
+            }
+            let statement = src[here..].split(';').next().unwrap_or_default();
+            if !statement.contains("env_clear") {
+                bad.push(format!(
+                    "{name}:{}: {} is neither built by test_command nor followed by env_clear",
+                    src[..here].matches('\n').count() + 1,
+                    &spawn[..spawn.len() - 1]
+                ));
+            }
+        }
+        (through, bad)
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read the source folder") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// No drift, for the tests' own children: in every source file of this
+    /// crate's `src/`, every spawn after the file's first `cfg(test)` goes
+    /// through `testsrv::test_command` or is followed in its statement by
+    /// `env_clear`. A heuristic over the text, not a proof:
+    /// - it reads `src/` only: `tests/e2e_git.rs` (a test crate of its own,
+    ///   which needs a relay) is not read;
+    /// - code before a file's first `cfg(test)` or `#[test]` is not read.
+    ///   That is production code, held by the planted-variable rows of git,
+    ///   kill and mkfifo; the one test helper that spawns outside a
+    ///   `cfg(test)` module, if one were added, would escape;
+    /// - it sees `Command::new` only: not `Command::from`, a `use ... as`
+    ///   rename, `libc` or a spawn through another crate;
+    /// - an `env_clear` in a later statement (`let mut c = ...; c.env_clear();`)
+    ///   is not seen, so that form fails: use `test_command`;
+    /// - a comment is a line that starts with `//`; a spawn after code on a
+    ///   line that does is read.
+    ///
+    /// Today `testsrv` is the one helper module, inside `cfg(test)`.
+    #[test]
+    fn every_test_spawn_has_a_fixed_environment() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        files.sort();
+        let (mut through, mut bad) = (0, Vec::new());
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read a source file");
+            let name = path.strip_prefix(&src).unwrap().display().to_string();
+            let (n, problems) = test_spawn_problems(&name, &text);
+            through += n;
+            bad.extend(problems);
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+        // run_child and its nofile form, and four in git.rs.
+        assert!(
+            through >= 6,
+            "the scan found only {through} calls to test_command: too few to mean anything"
+        );
+    }
+
+    /// The scan, on snippets: the right spawns pass, each way of inheriting
+    /// is named, and the limits it documents are real.
+    #[test]
+    fn the_scan_can_fail() {
+        let test_code = |body: &str| {
+            format!("{}\nmod t {{\n{body}\n}}\n", ["#[cfg(", "test)]"].concat())
+                .replace("NEW(", &spawn())
+        };
+        for (body, through, bad) in [
+            ("fn f() { let c = test_command(\"x\"); }", 1, 0),
+            ("fn f() { let c = NEW(\"x\").env_clear().spawn(); }", 0, 0),
+            (
+                "fn f() {\n    let c = NEW(\"x\")\n        .env_clear()\n        .spawn();\n}",
+                0,
+                0,
+            ),
+            ("pub fn test_command(p: &str) -> Command { NEW(p) }", 0, 0),
+            ("// NEW(\"x\") in a comment", 0, 0),
+            ("fn f() { let c = NEW(\"x\").spawn(); }", 0, 1),
+            ("fn f() { std::process::NEW(\"x\").status(); }", 0, 1),
+            ("fn f() { let c = NEW(\"x\"); c.env_clear(); }", 0, 1),
+            ("fn f() { let a = NEW(\"x\"); let b = NEW(\"y\"); }", 0, 2),
+        ] {
+            let (n, problems) = test_spawn_problems("s.rs", &test_code(body));
+            assert_eq!((n, problems.len()), (through, bad), "{body}: {problems:?}");
+            for p in problems {
+                assert!(p.starts_with("s.rs:"), "{p}");
+            }
+        }
+        // Not read: code before the first cfg(test), and a file with none.
+        let before = test_code("").replace("#[cfg(", "fn p() { NEW(\"kill\"); }\n#[cfg(");
+        assert_eq!(test_spawn_problems("s.rs", &before), (0, Vec::new()));
+        let none = "fn p() { NEW(\"kill\"); }".replace("NEW(", &spawn());
+        assert_eq!(test_spawn_problems("s.rs", &none), (0, Vec::new()));
+    }
+}

@@ -17,6 +17,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import band_clock as bc
+from planted_env import test_env
 
 PROFILE = """[profile]
 name = "{name}"
@@ -439,16 +440,17 @@ class Cli(unittest.TestCase):
             ]
             for argv, want in rows:
                 with self.subTest(argv=argv):
-                    r = subprocess.run([sys.executable, str(Path(bc.__file__)), *argv], capture_output=True, text=True)
+                    r = subprocess.run([sys.executable, str(Path(bc.__file__)), *argv], capture_output=True, text=True,
+                                       env=test_env())
                     self.assertEqual((r.returncode, r.stderr.strip().splitlines()[-1]), (2, want))
             r = subprocess.run([sys.executable, str(Path(bc.__file__)), "--out", d, "--gen", "a", "--profile", str(bad), "--", "true"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, env=test_env())
             self.assertEqual(r.returncode, 2)
             self.assertTrue(r.stderr.startswith(f"refused: profile {bad}: KeyError('bands')"), r.stderr)
 
     def test_tenant_cogs_clock_runs_the_clock(self) -> None:
         r = subprocess.run([sys.executable, str(Path(bc.__file__).with_name("tenant_cogs.py")), "clock", "--gen", "a"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=test_env())
         self.assertEqual((r.returncode, r.stderr.strip()), (2, "refused: give the hook command after --"))
 
     def test_a_real_hook_command(self) -> None:
@@ -471,7 +473,8 @@ class Cli(unittest.TestCase):
                                       "gens": {{"a": "exited 0" if "send a stop" in open({str(log)!r}).read() else "active"}}}}))
                 """))
             r = subprocess.run([sys.executable, str(Path(bc.__file__)), "--out", str(d / "out"), "--gen", "a", "--profile", p,
-                                "--cadence", "0.01", "--", sys.executable, str(hook)], capture_output=True, text=True, timeout=60)
+                                "--cadence", "0.01", "--", sys.executable, str(hook)], capture_output=True, text=True, timeout=60,
+                               env=test_env())
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             events = log.read_text().splitlines()
             self.assertEqual([e for e in events if e.split()[0] not in ("status", "phases", "rules")][:4],

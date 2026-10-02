@@ -131,6 +131,8 @@ def run(
 # The names a child takes from this process: where its programs are, and its
 # home (docker finds its CLI plugins there).
 INHERITED_NAMES = ("PATH", "HOME")
+# What picks the lock folder (`default_lock_dir`): a Python child keeps it.
+LOCK_NAMES = ("XDG_CACHE_HOME",)
 
 
 def fixed_env(values: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -155,9 +157,14 @@ def command_env(values: Mapping[str, str] | None = None) -> dict[str, str]:
 
 def python_env() -> dict[str, str]:
     """A Python child's (the local proof's clock, its hook, the hook's
-    supervisor and the sampler loop): PATH, HOME, LC_ALL=C and
-    PYTHONDONTWRITEBYTECODE=1."""
-    return fixed_env({"LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"})
+    supervisor and the sampler loop): PATH, HOME, XDG_CACHE_HOME (only when
+    set, as it is), LC_ALL=C and PYTHONDONTWRITEBYTECODE=1. XDG_CACHE_HOME
+    is kept because `default_lock_dir` reads it, and a child that starts
+    tenant_cogs.py (the hook does) must resolve the same lock folder as a
+    start from a shell: the lock is per Compose project, and two folders
+    would let two starts of one project both run."""
+    kept = {k: os.environ[k] for k in LOCK_NAMES if k in os.environ}
+    return fixed_env({**kept, "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"})
 
 
 def raised_limit_env(limit: int) -> dict[str, str]:
