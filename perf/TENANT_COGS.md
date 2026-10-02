@@ -132,7 +132,8 @@ each taken from the harness's own environment or set one by one, and nothing
 else. No credential of the caller's reaches a child, whatever its name.
 `tenant_cogs.py` builds the Python side's sets (`child_env`, `docker_env`,
 `python_env`, `command_env`); the local proof and its hook take theirs from
-there. `sim/childenv.rs` and `sim/git.rs` build the generator's.
+there. `sim/childenv.rs` and `sim/git.rs` build the generator's. The tests'
+own children and the three scripts get fixed sets too (below).
 
 | Child | Started by | Its environment |
 |---|---|---|
@@ -143,12 +144,38 @@ there. `sim/childenv.rs` and `sim/git.rs` build the generator's.
 | a Python child: the proof's clock, the hook's `end`, the hook's supervisor, the sampler loop | the proof, the hook | `PATH`, `HOME`, `LC_ALL=C`, `PYTHONDONTWRITEBYTECODE=1` |
 | `sysctl`, `sw_vers`, `git rev-parse`, `openssl` | `run()` | `PATH`, `HOME`, `LC_ALL=C` and the command's own named values |
 | `ssh` | the sampler loop | `PATH=/usr/bin:/bin`, `HOME`, `LC_ALL=C` (`remote_sampler.ssh_env`) |
+| a child a Python test starts | `perf/test_*.py` | `planted_env.test_env`: `PATH`, `HOME`, `TMPDIR` (each only when the test process has it), `LC_ALL=C`, then the values the test names (a proxy variable, a hostile `DOCKER_HOST`) |
+| a child a Rust test starts | `crates/buzz-test-client/src` tests | `testsrv::test_command`: `env_clear`, then the same four; a row adds the values it names with `.env` after it (the child marker, a planted dummy, its own `PATH`) |
+| what a script starts: `cargo`, `python3`, `docker`, and what they start | `perf/clock-proof.sh`, `perf/build-linux.sh`, `perf/testdata/remote_sampler/capture.sh` | the script's set, below |
 
 - **The clock's hook.** The clock (`band_clock.py`) runs the hook with its
   own environment, so the clock gets its fixed set where it starts, and the
   hook gets the same. On macOS, Python adds `__CF_USER_TEXT_ENCODING`
   (CoreFoundation's text encoding, never a credential) to its own
   environment, so that one name reaches the hook there too.
+- **The scripts.** Each of the three runs itself again once, as its first
+  act, under `/usr/bin/env -i /bin/bash "$0" "$@"`. The set is `PATH`,
+  `HOME` and `TMPDIR` (each only when set), `LC_ALL=C`, a marker
+  (`HARNESS_ENV_FIXED=1`, unset straight away so no child sees it), and the
+  optional names the script keeps when the caller set them. Each is kept
+  because dropping it would silently switch the script to another daemon,
+  registry, toolchain or interpreter:
+  - `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` (all three scripts):
+    the daemon docker talks to. The endpoint check in `build-linux.sh` and
+    in the proof reads the same three, to refuse a remote daemon;
+  - `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN` (`clock-proof.sh` only,
+    the one that runs cargo on the host; `build-linux.sh` runs cargo inside
+    the container, with the values its `docker run` names): the registry and
+    the toolchain that build the binaries;
+  - `PYTHON` (`clock-proof.sh` only): the interpreter that runs the proof.
+
+  Everything else of the caller's is dropped, a proxy, `CARGO_TARGET_DIR`,
+  `RUSTFLAGS` or `XDG_CACHE_HOME` included. The script then runs under
+  `/bin/bash` (3.2 on macOS), not the first `bash` on `PATH`. A marker
+  already in the caller's environment skips the re-run, so it is not a guard
+  against a caller who sets it. Bash adds `PWD`, `SHLVL` and `_` to each
+  child it starts (and `OLDPWD` once a script has changed folder; an exec'd
+  last command gets no `_`); the rows pin these names and add exactly them.
 - **k3s, a known limit.** The k3s paths (`kubectl`, and `ssh` in
   `fingerprint_k3s`) get `run()`'s set, so they would lose `KUBECONFIG` and
   `SSH_AUTH_SOCK`. k3s is disabled (below); turning it back on needs those
@@ -164,6 +191,33 @@ there. `sim/childenv.rs` and `sim/git.rs` build the generator's.
   compare an environment compare names, never values, and a row runs each
   with its code made to leak: it must fail without printing a planted value
   (`test_env_checks.py`).
+- **The tests' and scripts' rows.** `TestEnvRows` (`test_child_env.py`) and
+  `sim/childenv.rs`'s `test_command_gets_exactly_its_set` run the helper from
+  a parent that holds the planted names, to a perl stub: the names equal the
+  set exactly, with `PATH`, `HOME` and `TMPDIR` each set and unset.
+  `test_script_env.py` runs each script in place to stubs that fail it early,
+  with an exit code each row asserts; the names equal the script's set plus
+  what bash adds, with every optional name unset, each alone set and all set.
+  None of these rows needs Docker or a network.
+- **The static rows are a heuristic, not a proof.** Each fails, with
+  `file:line` and the call, on a test spawn that inherits.
+  `EveryTestSpawnHasAFixedEnv` parses `perf/test_*.py`: every call of
+  `subprocess.run`, `Popen`, `call`, `check_call` or `check_output` (through
+  the module, an alias, a `.subprocess` attribute or a name imported from it)
+  must pass `env=` built by `test_env`, or a name assigned only from it in
+  the same function, with nothing that reads `os.environ` written into it.
+  It does not see `os.system`, `os.popen`, `os.spawn*`, asyncio's
+  `create_subprocess_*`, `multiprocessing`, or a spawn made through a name
+  it cannot follow; `**kwargs` that may carry `env` count as no env.
+  `every_test_spawn_has_a_fixed_environment` reads the text of
+  `crates/buzz-test-client/src` and fails on any `Command::new` after a
+  file's first `cfg(test)` that is not inside `test_command` and not followed
+  in its statement by `env_clear`. It does not read `tests/e2e_git.rs`, code
+  before a file's first `cfg(test)` or `#[test]` (production code, held by
+  the rows above; today `testsrv` is the one helper module and it is inside
+  `cfg(test)`), a spawn other than `Command::new`, or an `env_clear` in a
+  later statement (that form fails: use `test_command`). Each has a row that
+  runs the scan on snippets, so it is known to fail.
 
 ## Substrate: local compose (relative numbers)
 
