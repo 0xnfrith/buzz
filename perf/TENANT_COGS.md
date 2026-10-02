@@ -843,9 +843,19 @@ nothing. A person in several communities on one box would add it.
 A connect that fails on the generator's own side (out of open files,
 local ports or socket buffers: EMFILE, ENFILE, EADDRNOTAVAIL, ENOBUFS)
 never reached the relay. `tenant_sim` counts it in `local_exhausted`, apart
-from the relay's failures, for reads, polls, media uploads and ramp joins,
-and the loop voids the run on it with its own line. That is the safety
-net; the headroom keeps a run from reaching it.
+from the relay's failures, for reads, polls, media uploads, ramp joins and
+git pushes (at any step, the push's own spawn included), and the loop
+voids the run on it with its own line. That is the safety net; the
+headroom keeps a run from reaching it.
+
+**A known limit, inside git's own process.** `tenant_sim` sees only git's
+exit and its output. Git starts with its own file table, so its own
+EMFILE isn't a real case, but the box's file table (ENFILE) and its local
+ports (EADDRNOTAVAIL) are shared: either can fail git's connect inside the
+child. Git then exits 128 with `Failed to connect`, and the push counts as
+the relay's failure, a break. The generator's own reads and polls, which
+far outnumber its pushes, would count `local_exhausted` in the same run,
+but one that comes after the break is only a note.
 
 **The peak, a ramp at 660 on the team profile** (`profiles/10h-20a.toml`:
 a human and 2 agents a team, so 220 humans and 440 agents), at peak rates

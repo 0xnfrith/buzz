@@ -243,13 +243,17 @@ pub enum ReadFailure {
     Unanswered,
 }
 
-/// Where a git push failed. Only `Local` is the generator's own failure.
+/// Where a git push failed. Only `Push` is the relay's failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GitFailure {
     /// Writing the blob, `git add`, `commit` or `branch`.
     Local,
     /// The push to the relay: refused, failed, or past git's timeout.
     Push,
+    /// The generator ran out of its own files, ports or buffers at any
+    /// step, the push's own spawn included: its own fault, counted in
+    /// `local_exhausted`, not here.
+    LocalExhausted,
 }
 
 /// The live counters `tenant_sim` rewrites into `<out-dir>/live.json` while
@@ -620,8 +624,13 @@ impl Stats {
     }
 
     /// A failed push. summary.json's git `failed` still counts every
-    /// failure, wherever it failed; live.json splits them.
+    /// failure, wherever it failed; live.json splits them. One where the
+    /// generator ran out of its own files or ports counts in
+    /// `local_exhausted` alone, as media's does.
     pub fn record_git_failed(&self, why: GitFailure) {
+        if why == GitFailure::LocalExhausted {
+            return self.record_local_exhausted();
+        }
         self.with(|s| {
             s.git_failed += 1;
             *s.git_failed_by.entry(why).or_default() += 1;
@@ -930,6 +939,26 @@ mod tests {
         let summary = st.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
         assert_eq!((summary.media.uploads, summary.media.rejected), (1, 6));
         assert_eq!((summary.git.pushes, summary.git.failed), (1, 3));
+    }
+
+    /// A push the generator ran out of files or ports for counts in
+    /// `local_exhausted` alone: never in live.json's git totals, nor in
+    /// summary.json's git `failed`.
+    #[test]
+    fn a_git_push_out_of_files_counts_as_local_exhausted() {
+        let st = Stats::new();
+        st.record_git_failed(GitFailure::LocalExhausted);
+        let live = st.live(7);
+        assert_eq!(
+            (
+                live.local_exhausted,
+                live.git_local_failed,
+                live.git_push_failed
+            ),
+            (1, 0, 0)
+        );
+        let summary = st.summarize("p", 1, "ws://x", 1, 1, &HashMap::new());
+        assert_eq!(summary.git.failed, 0);
     }
 
     /// Poll times: never-mentioned humans' apart from the rest, over every
