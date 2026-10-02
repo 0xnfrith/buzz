@@ -448,7 +448,10 @@ mod tests {
     #[test]
     fn kill_gets_only_path() {
         if testsrv::is_child(KILL_ENV_CHILD) {
-            let child = Command::new("sleep").arg("5").spawn().expect("spawn sleep");
+            let child = testsrv::test_command("sleep")
+                .arg("5")
+                .spawn()
+                .expect("spawn sleep");
             let err = wait_child_deadline(child, Duration::from_millis(200))
                 .expect_err("past its deadline");
             assert!(err.to_string().contains("timed out"), "{err:#}");
@@ -975,7 +978,10 @@ mod tests {
 
     #[test]
     fn wait_child_deadline_kills_silent_child() {
-        let child = Command::new("sleep").arg("2").spawn().expect("spawn sleep");
+        let child = testsrv::test_command("sleep")
+            .arg("2")
+            .spawn()
+            .expect("spawn sleep");
         let start = Instant::now();
         let err = wait_child_deadline(child, Duration::from_millis(100)).unwrap_err();
         let elapsed = start.elapsed();
@@ -991,7 +997,7 @@ mod tests {
 
     #[test]
     fn wait_child_deadline_allows_fast_child() {
-        let child = Command::new("true").spawn().expect("spawn true");
+        let child = testsrv::test_command("true").spawn().expect("spawn true");
         let out = wait_child_deadline(child, Duration::from_secs(2)).expect("true");
         assert!(out.status.success());
     }

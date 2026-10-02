@@ -549,6 +549,22 @@ pub(crate) mod testsrv {
         )
     }
 
+    /// A `Command` for a child a test starts: nothing of this process's
+    /// environment but `PATH`, `HOME` and `TMPDIR` (each only when set) and
+    /// `LC_ALL=C`. A row adds the values it names with `.env`, after this, so
+    /// no credential of whoever runs the tests reaches a child, whatever its
+    /// name.
+    pub fn test_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut cmd = Command::new(program);
+        cmd.env_clear().env("LC_ALL", "C");
+        for name in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+        cmd
+    }
+
     /// Env var telling a re-executed test binary which test is the child.
     pub const CHILD_VAR: &str = "TENANT_SIM_GUARD_CHILD";
 
@@ -558,16 +574,15 @@ pub(crate) mod testsrv {
     }
 
     /// Run `test` (its libtest path) in a fresh copy of this test binary with
-    /// `env` added, and require that it passed and printed `CHILD_OK <test>`.
+    /// [`test_command`]'s set and `env` added, and require that it passed and
+    /// printed `CHILD_OK <test>`.
     /// Without the sentinel a filter that matched nothing would look like a
     /// pass.
     pub fn run_child(test: &str, env: &[(&str, String)]) {
         let exe = std::env::current_exe().expect("current_exe");
-        let mut cmd = Command::new(exe);
+        let mut cmd = test_command(exe);
         cmd.args([test, "--exact", "--nocapture", "--test-threads=1"])
-            .env(CHILD_VAR, test)
-            .env_remove("NO_PROXY")
-            .env_remove("no_proxy");
+            .env(CHILD_VAR, test);
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -586,7 +601,7 @@ pub(crate) mod testsrv {
     /// files without starving this process or its other tests.
     pub fn run_child_with_nofile(test: &str, nofile: u32) {
         let exe = std::env::current_exe().expect("current_exe");
-        let out = Command::new("/bin/sh")
+        let out = test_command("/bin/sh")
             .args([
                 "-c",
                 &format!("ulimit -n {nofile} && exec \"$0\" \"$@\""),
