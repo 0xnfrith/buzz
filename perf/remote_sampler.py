@@ -130,11 +130,21 @@ RELAY_FAILURE_TOTALS = {
     # not a quota. The per-key quota is apart, in rate_limited.
     "relay_shed": "the relay shed {n} sends: full, or unable to reach its admission store",
 }
+# Every other relay break the loop names is a *_BREAK reason here. Each
+# relay_break call takes one of these or a RELAY_FAILURE_TOTALS reason, and
+# clock_proof.py builds the breaks its ramp row accepts from them all.
 # The relay rejecting events, and a band or ramp step failing the service
-# level's ack test: relay breaks too. clock_proof.py builds the breaks its
-# ramp row accepts from these two and RELAY_FAILURE_TOTALS.
+# level's ack test.
 REJECTS_BREAK = "the relay rejected {n} events"
 ACK_TEST_BREAK = "{band}: {within} of {acks} acks within {ms} ms ({pct:.1f}%), under {share:g}%"
+# The relay box's own, read over ssh; key is "<role> (<ip>)".
+NO_RELAY_CONTAINER_BREAK = "{key}: no relay container"
+OOM_KILLED_BREAK = "{key}: the relay was OOM-killed"
+MEM_AVAILABLE_BREAK = "{key}: MemAvailable was {pct:.1f}% of MemTotal, under {limit:g}%"
+# The live counters' others.
+DROPPED_BREAK = "the relay dropped connections"
+JOIN_FAILED_BREAK = "{n} identities couldn't join the relay"
+LOST_BREAK = "the relay lost {n} events"
 # tenant_sim rewrites live.json every 2 s. Older than this (five writes
 # missed), or this far ahead of the clock, the file is no longer live.
 LIVE_MAX_AGE_S = 10.0
@@ -501,17 +511,17 @@ class Monitor:
         # relay is gone: only a listing that worked can show a relay break.
         listed = not any(str(e).startswith("docker ps:") for e in sample.get("errors") or [])
         if relay is None and sample.get("containers") is not None and "containers_absent" not in sample and listed:
-            self.relay_break(t, f"{key}: no relay container", box.role, "box")
+            self.relay_break(t, NO_RELAY_CONTAINER_BREAK.format(key=key), box.role, "box")
         elif relay is not None and relay.get("oom_kill") is not None:
             base = self._relay_oom0.setdefault(box.ip, relay["oom_kill"])
             if relay["oom_kill"] > base:
-                self.relay_break(t, f"{key}: the relay was OOM-killed", box.role, "box")
+                self.relay_break(t, OOM_KILLED_BREAK.format(key=key), box.role, "box")
         # The service level: at least 10% of the box's memory free.
         mem = (sample.get("box") or {}).get("mem") or {}
         if _num(mem.get("MemTotal")) and _num(mem.get("MemAvailable")) and mem["MemTotal"] > 0:
             if mem["MemAvailable"] * 100.0 < self.relay_mem_min_pct * mem["MemTotal"]:
                 share = 100.0 * mem["MemAvailable"] / mem["MemTotal"]
-                self.relay_break(t, f"{key}: MemAvailable was {share:.1f}% of MemTotal, under {self.relay_mem_min_pct:g}%",
+                self.relay_break(t, MEM_AVAILABLE_BREAK.format(key=key, pct=share, limit=self.relay_mem_min_pct),
                                  box.role, "box")
         return self._settle(out, defer)
 
@@ -643,11 +653,11 @@ class Monitor:
                 if live[k] > last[k]:
                     self.relay_break(t, why.format(n=live[k] - last[k]), role)
             if ce.get("connection_dropped", 0) > c0.get("connection_dropped", 0):
-                self.relay_break(t, "the relay dropped connections", role)
+                self.relay_break(t, DROPPED_BREAK, role)
             if ce.get("join_failed", 0) > c0.get("join_failed", 0):
-                self.relay_break(t, f"{ce['join_failed'] - c0.get('join_failed', 0)} identities couldn't join the relay", role)
+                self.relay_break(t, JOIN_FAILED_BREAK.format(n=ce["join_failed"] - c0.get("join_failed", 0)), role)
             if live["lost"] > last["lost"]:
-                self.relay_break(t, f"the relay lost {live['lost'] - last['lost']} events", role)
+                self.relay_break(t, LOST_BREAK.format(n=live["lost"] - last["lost"]), role)
         self._lives[role] = live
         return self._settle(out, defer)
 

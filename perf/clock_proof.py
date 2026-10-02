@@ -11,7 +11,7 @@ and the proof exits 1 if any failed.
 | Row | What it forces | What must happen |
 |---|---|---|
 | `reads` | nothing: two generators through every band of a short profile | exit 0; both driven in lockstep; agents' reads and humans' home-feed polls all answered, none refused (the hard row) |
-| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and breaks it after at least one step held, by a named relay-break class (the ack test, rejects or any of the loop's relay failure totals, read from `remote_sampler.py`), printed; a held to the max |
+| `ramp` | relay b at 0.03 CPU from `fleet` on | exit 0; the ramp's load reaches b's limit and breaks it after at least one step held, by a named relay-break class (any of the loop's `*_BREAK` reasons or relay failure totals, read from `remote_sampler.py`), printed; a held to the max |
 | `ramp-freeze` | relay b frozen (`docker pause`) at the ramp's second step | exit 0; b broke at step 2 because its sends went unanswered, a break and never a void; a held to the max |
 | `ramp-starved` | relay b cut to 0.01 CPU at the ramp's second step | exit 0; b broke at step 2 because it shed sends (`rate-limited: too many concurrent requests` or `shared admission unavailable`), a break and never counted apart; a held to the max; the texts b got, counted |
 | `boundary` | the floor's boundary check fails | exit 4 on that line; `end` still ran and removed both stacks |
@@ -244,8 +244,8 @@ class Proof:
     def row_ramp(self) -> None:
         """Relay b runs at 0.03 CPU from fleet on: the ramp's rising load
         reaches its limit and breaks it after at least one held step, by one
-        of the loop's named relay-break classes (the ack test, rejects or a
-        relay failure total: BREAK_CLASSES), whichever comes first."""
+        of the loop's named relay-break classes (BREAK_CLASSES: each of its
+        *_BREAK reasons and relay failure totals), whichever comes first."""
         row = "ramp"
         root, cfg = self.config(row, ["a", "b"], ramp={"max": 30, "start": 6}, fleet_cpus={"b": "0.03"})
         argv = self.clock_argv(root, cfg, ["a", "b"], ["--ramp", str(PROOF / "profiles/proof-ramp.toml"), "--ramp-start", "6",
@@ -435,6 +435,10 @@ BREAK_FIELDS = {
     "band": "(?:" + "|".join(remote_sampler.MEASURED_BANDS) + "|" + remote_sampler.RAMP_STEP.pattern + ")",
     "ms": re.escape(remote_sampler.SLO_ACK_MS),
     "share": re.escape(f"{remote_sampler.SLO_ACK_SHARE:g}"),
+    # A box's "<role> (<ip>)" (remote_sampler.check_inputs: an identifier of
+    # at most 32 characters, a literal IPv4 or IPv6 address).
+    "key": r"\w{1,32} \([0-9A-Fa-f.:]+\)",
+    "limit": r"\d+(?:\.\d+)?",
 }
 
 
@@ -450,13 +454,17 @@ def reason_pattern(fmt: str) -> re.Pattern[str]:
 
 
 # The loop's named relay-break classes a ramp row accepts, read from the loop
-# itself (remote_sampler.py writes the reasons): every relay failure total,
-# rejects and the ack test. Anything else, a void or an unknown reason, fails.
-BREAK_CLASSES = (
-    *((k, reason_pattern(why)) for k, why in remote_sampler.RELAY_FAILURE_TOTALS.items()),
-    ("rejects", reason_pattern(remote_sampler.REJECTS_BREAK)),
-    ("ack test", reason_pattern(remote_sampler.ACK_TEST_BREAK)),
-)
+# itself (remote_sampler.py writes the reasons): each *_BREAK reason, named
+# for its constant (REJECTS_BREAK is "rejects"), and each relay failure
+# total. Anything else, a void or an unknown reason, fails.
+LOOP_BREAK_NAMES = tuple(name for name, why in vars(remote_sampler).items()
+                         if name.endswith("_BREAK") and isinstance(why, str))
+LOOP_BREAKS = {
+    **{name.removesuffix("_BREAK").lower().replace("_", " "): getattr(remote_sampler, name)
+       for name in LOOP_BREAK_NAMES},
+    **remote_sampler.RELAY_FAILURE_TOTALS,
+}
+BREAK_CLASSES = tuple((k, reason_pattern(why)) for k, why in LOOP_BREAKS.items())
 
 
 def break_class(why: Any) -> str | None:
