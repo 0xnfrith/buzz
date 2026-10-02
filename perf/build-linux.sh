@@ -12,6 +12,22 @@
 # clean build.
 set -euo pipefail
 
+# Run again, once, from a fixed environment (perf/TENANT_COGS.md, "Child
+# environments"): PATH, HOME, TMPDIR and LC_ALL=C, and the names below, each
+# only when set. Nothing else of the caller's reaches the endpoint check or
+# docker. The DOCKER_* names select the daemon the endpoint check reads and
+# docker talks to; dropping one would silently switch to another. (Cargo runs
+# inside the container, with the values docker run names, so no CARGO_* name
+# is kept.)
+if [[ -z "${HARNESS_ENV_FIXED:-}" ]]; then
+  fixed=(LC_ALL=C HARNESS_ENV_FIXED=1)
+  for name in PATH HOME TMPDIR DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG; do
+    [[ -z "${!name+x}" ]] || fixed+=("$name=${!name}")
+  done
+  exec /usr/bin/env -i "${fixed[@]}" /bin/bash "$0" "$@"
+fi
+unset HARNESS_ENV_FIXED
+
 # rust:1.95.0-alpine (rust-toolchain.toml pins 1.95.0), linux/amd64 manifest.
 IMAGE="rust:1.95.0-alpine@sha256:e98196986adced5602f6e21c54babdbf2a8700400c7a78868324a3630e0c5d15"
 TARGET="x86_64-unknown-linux-musl"
