@@ -215,17 +215,23 @@ class ProofRows(Planted):
 
     def test_refuses_a_remote_docker(self) -> None:
         """The proof refuses any Docker endpoint but a local socket, before
-        anything runs: exit 2 on its own line."""
+        anything runs: exit 2 on its own line. The preflight, the first thing
+        that would run, is stubbed to stop the proof at once (exit 1), so a
+        proof that no longer refuses fails this row in a moment, on the exit
+        code, and never starts a clock (that took minutes where the binaries
+        were built)."""
         self.stub("docker")
         os.environ["DOCKER_HOST"] = "tcp://203.0.113.9:2375"
         del os.environ["DOCKER_CONTEXT"]
         err = self.dir / "err"
-        with open(err, "w") as fh, mock.patch.object(sys, "stderr", fh):
+        with open(err, "w") as fh, mock.patch.object(sys, "stderr", fh), mock.patch.object(
+                clock_proof.Proof, "preflight", autospec=True, return_value=False) as preflight:
             code = clock_proof.main(["--out", str(self.dir / "out"), "--rows", "reads"])
         self.assertEqual(code, 2)
         self.assertEqual(err.read_text(),
                          "refused: docker endpoint refused: DOCKER_HOST selects 'tcp://203.0.113.9:2375'; "
                          "only a local Unix socket is allowed. Nothing was changed.\n")
+        preflight.assert_not_called()
         self.assertEqual(self.lines(), [])
 
 
